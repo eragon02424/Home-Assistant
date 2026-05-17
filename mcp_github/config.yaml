@@ -1,0 +1,19 @@
+name: "MCP GitHub"
+description: "Official GitHub MCP Server for AI assistant integration via Model Context Protocol."
+version: "1.0.2"
+slug: "mcp_github"
+init: false
+arch:
+  - amd64
+startup: services
+boot: auto
+ports:
+  8766/tcp: 8766
+map:
+  - config:rw
+options:
+  github_token: ""
+  port: 8766
+schema:
+  github_token: str
+  port: int

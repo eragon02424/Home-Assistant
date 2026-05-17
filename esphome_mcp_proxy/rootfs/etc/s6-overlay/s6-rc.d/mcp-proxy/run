@@ -1,0 +1,6 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# Starts the MCP Proxy addon.
+# with-contenv ensures SUPERVISOR_TOKEN and all other supervisor-injected
+# environment variables are present before python3 is invoked.
+exec python3 /start.py
