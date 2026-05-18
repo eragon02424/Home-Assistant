@@ -14,8 +14,8 @@ Implements the subset of OAuth 2.1 required by the MCP spec:
   discover the auth server from a 401 on the webhook URL)
 
 Single-tenant by design: one client_id / client_secret pair, configured in
-the addon. The consent screen displays the requesting redirect_uri so the
-user can verify they're authorizing the connector they meant to.
+the addon. Auto-approves the consent screen — the client_id, client_secret
+and webhook URL are already the access gate.
 
 Tokens are signed (HMAC-SHA256) with a per-install secret persisted at
 /config/.mcp_proxy_oauth_secret. They contain enough state to validate
@@ -33,7 +33,6 @@ import logging
 import re
 import secrets
 import time
-from html import escape
 from pathlib import Path
 from typing import TypedDict
 from urllib.parse import urlparse
@@ -44,40 +43,26 @@ from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
 
-OAUTH_BASE = "/api/mcp_proxy/oauth"  # slot appended dynamically per view
-# Authorize/token endpoints live at the root rather than under
-# OAUTH_BASE because Claude.ai (and apparently other MCP clients)
-# construct the authorize URL as `<host>/authorize` from the resource
-# host root — they do not use the `authorization_endpoint` field of
-# our authorization-server metadata document. Registering at the root
-# is the only way to actually catch the redirect.
-# Base paths — slot number appended per provider instance
+OAUTH_BASE = "/api/mcp_proxy/oauth"
 AUTHORIZE_BASE = "/authorize"
 TOKEN_BASE = "/token"
 SECRET_FILE = Path("/config/.mcp_proxy_oauth_secret")
 
-ACCESS_TOKEN_TTL = 60 * 60          # 1 hour
+ACCESS_TOKEN_TTL = 60 * 60
 
-# Global registry: client_id → OAuthProvider
-# Populated when each provider registers its views.
 _PROVIDER_REGISTRY: dict[str, "OAuthProvider"] = {}
-REFRESH_TOKEN_TTL = 30 * 24 * 60 * 60  # 30 days
-AUTH_CODE_TTL = 5 * 60              # 5 minutes
+REFRESH_TOKEN_TTL = 30 * 24 * 60 * 60
+AUTH_CODE_TTL = 5 * 60
 TOKEN_KIND_ACCESS = "access"
 TOKEN_KIND_REFRESH = "refresh"
 
-# RFC 7636 §4.1: code_verifier is 43-128 chars from the unreserved URL set.
 PKCE_VERIFIER_MIN = 43
 PKCE_VERIFIER_MAX = 128
-# SHA-256 → 32 bytes → 43 base64url chars (no padding).
 PKCE_S256_CHALLENGE_LEN = 43
 _PKCE_VERIFIER_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
 _PKCE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
-# Pending-code dict cap.
 MAX_PENDING_CODES = 1000
-
-# Minimum client_id length
 MIN_CLIENT_ID_LEN = 16
 
 
@@ -104,9 +89,7 @@ def load_or_create_secret() -> bytes:
             return data
         _LOGGER.warning(
             "MCP Proxy OAuth: existing signing key at %s is shorter than "
-            "32 bytes (got %d). Regenerating — ALL previously issued "
-            "OAuth tokens are now invalid; MCP clients will need to "
-            "re-authorize.",
+            "32 bytes (got %d). Regenerating.",
             SECRET_FILE,
             len(data),
         )
@@ -118,7 +101,7 @@ def load_or_create_secret() -> bytes:
     except OSError as e:
         _LOGGER.warning(
             "MCP Proxy OAuth: could not chmod 0600 the signing key file "
-            "at %s (%s: %s). The key may have wider permissions than intended.",
+            "at %s (%s: %s).",
             SECRET_FILE,
             type(e).__name__,
             e,
@@ -127,7 +110,6 @@ def load_or_create_secret() -> bytes:
 
 
 def _is_valid_redirect_uri(redirect_uri: str) -> bool:
-    """Spec-floor validation for OAuth redirect_uri."""
     if not redirect_uri:
         return False
     try:
@@ -144,7 +126,6 @@ def _is_valid_redirect_uri(redirect_uri: str) -> bool:
 def _build_base_url(
     request: web.Request, public_base_url: str | None = None
 ) -> str:
-    """Build the public base URL used in OAuth metadata and redirects."""
     if public_base_url:
         return public_base_url.rstrip("/")
     host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host", "")
@@ -202,8 +183,6 @@ class OAuthProvider:
         return _build_base_url(request, self._public_base_url)
 
     def register_views(self) -> None:
-        """Register the OAuth endpoints with HA's HTTP layer."""
-        # Register this provider in the global registry by client_id
         _PROVIDER_REGISTRY[self._client_id] = self
         for view in (
             ProtectedResourceMetadataView(self),
@@ -274,15 +253,9 @@ class OAuthProvider:
         return self.validate_access_token(token)
 
     def issue_code(self, redirect_uri: str, code_challenge: str) -> str | None:
-        """Issue a one-shot authorization code."""
         now = time.time()
         self._codes = {k: v for k, v in self._codes.items() if v["expires"] > now}
         if len(self._codes) >= MAX_PENDING_CODES:
-            _LOGGER.warning(
-                "MCP Proxy OAuth: pending-code store at cap (%d); refusing "
-                "new issuance until existing codes expire or are consumed.",
-                MAX_PENDING_CODES,
-            )
             return None
         code = secrets.token_urlsafe(32)
         self._codes[code] = {
@@ -321,14 +294,7 @@ class OAuthProvider:
         )
 
 
-# ---------------------------------------------------------------------------
-# Views
-# ---------------------------------------------------------------------------
-
-
 class ProtectedResourceMetadataView(HomeAssistantView):
-    """RFC 9728 Protected Resource Metadata."""
-
     requires_auth = False
     cors_allowed = True
 
@@ -347,15 +313,13 @@ class ProtectedResourceMetadataView(HomeAssistantView):
                 ],
                 "bearer_methods_supported": ["header"],
                 "resource_documentation": (
-                    "https://github.com/homeassistant-ai/ha-mcp"
+                    "https://github.com/eragon02424/Home-Assistant"
                 ),
             }
         )
 
 
 class AuthorizationServerMetadataView(HomeAssistantView):
-    """RFC 8414 Authorization Server Metadata."""
-
     requires_auth = False
     cors_allowed = True
 
@@ -387,13 +351,12 @@ class AuthorizationServerMetadataView(HomeAssistantView):
 
 
 class AuthorizeView(HomeAssistantView):
-    """OAuth /authorize endpoint with a minimal consent page."""
+    """OAuth /authorize endpoint — auto-approves without a consent screen."""
 
     requires_auth = False
 
     def __init__(self, provider: "OAuthProvider") -> None:
         self._provider = provider
-        # /authorize is global — client_id in request identifies the slot
         self.url = f"{AUTHORIZE_BASE}"
         self.name = f"mcp_proxy:oauth:slot{provider.slot}:authorize"
 
@@ -415,7 +378,6 @@ class AuthorizeView(HomeAssistantView):
         code_challenge_method = params.get("code_challenge_method", "")
         response_type = params.get("response_type", "")
 
-        # Route to the correct provider based on client_id
         provider = _PROVIDER_REGISTRY.get(client_id)
         if provider is not None:
             self._provider = provider
@@ -430,43 +392,26 @@ class AuthorizeView(HomeAssistantView):
         if err is not None:
             return err
 
-        html = f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Authorize MCP Connector</title>
-  <style>
-    body {{ font-family: system-ui, sans-serif; max-width: 36rem; margin: 4rem auto; padding: 0 1rem; }}
-    code {{ background: #f4f4f4; padding: 2px 6px; border-radius: 3px; word-break: break-all; }}
-    button {{ padding: 0.5rem 1rem; font-size: 1rem; margin-right: 0.5rem; }}
-    .approve {{ background: #2563eb; color: white; border: none; }}
-    .deny {{ background: #e5e7eb; color: #111; border: none; }}
-  </style>
-</head>
-<body>
-  <h1>Authorize MCP Proxy</h1>
-  <p>An MCP client is requesting access to your MCP server.</p>
-  <p>It will redirect to:<br><code>{escape(redirect_uri)}</code></p>
-  <p>Only allow this if you started this connection yourself.</p>
-  <form method="POST" action="{AUTHORIZE_BASE}">
-    <input type="hidden" name="client_id" value="{escape(client_id)}">
-    <input type="hidden" name="redirect_uri" value="{escape(redirect_uri)}">
-    <input type="hidden" name="state" value="{escape(state)}">
-    <input type="hidden" name="code_challenge" value="{escape(code_challenge)}">
-    <button class="approve" type="submit" name="action" value="approve">Allow</button>
-    <button class="deny" type="submit" name="action" value="deny">Deny</button>
-  </form>
-</body>
-</html>"""
-        return web.Response(text=html, content_type="text/html")
+        # Auto-approve: issue code immediately without showing consent screen
+        code = self._provider.issue_code(redirect_uri, code_challenge)
+        if code is None:
+            return self._redirect_with(
+                redirect_uri, error="temporarily_unavailable", state=state
+            )
+        _LOGGER.debug("MCP Proxy OAuth: auto-approved authorize request for client %s", self._provider.client_id_masked())
+        return self._redirect_with(redirect_uri, code=code, state=state)
 
     async def post(self, request: web.Request) -> web.Response:
+        """POST kept for backwards compatibility — also auto-approves."""
         data = await request.post()
-        action = str(data.get("action", ""))
         client_id = str(data.get("client_id", ""))
         redirect_uri = str(data.get("redirect_uri", ""))
         state = str(data.get("state", ""))
         code_challenge = str(data.get("code_challenge", ""))
+
+        provider = _PROVIDER_REGISTRY.get(client_id)
+        if provider is not None:
+            self._provider = provider
 
         err = self._validate_authorize_params(
             response_type="code",
@@ -477,13 +422,6 @@ class AuthorizeView(HomeAssistantView):
         )
         if err is not None:
             return err
-
-        if action == "deny":
-            return self._redirect_with(
-                redirect_uri, error="access_denied", state=state
-            )
-        if action != "approve":
-            return web.Response(status=400, text="invalid action")
 
         code = self._provider.issue_code(redirect_uri, code_challenge)
         if code is None:
@@ -521,14 +459,11 @@ class AuthorizeView(HomeAssistantView):
 
 
 class TokenView(HomeAssistantView):
-    """OAuth /token endpoint: authorization_code + refresh_token grants."""
-
     requires_auth = False
     cors_allowed = True
 
     def __init__(self, provider: "OAuthProvider") -> None:
         self._provider = provider
-        # /token is global — client_id in request identifies the slot
         self.url = f"{TOKEN_BASE}"
         self.name = f"mcp_proxy:oauth:slot{provider.slot}:token"
 
@@ -536,7 +471,6 @@ class TokenView(HomeAssistantView):
     def _extract_client_creds(
         request: web.Request, form: dict
     ) -> tuple[str | None, str | None]:
-        """Pull client_id/secret from Basic auth header OR form body."""
         header = request.headers.get("Authorization", "")
         if header.lower().startswith("basic "):
             try:
@@ -555,7 +489,6 @@ class TokenView(HomeAssistantView):
         form = dict(await request.post())
         client_id, client_secret = self._extract_client_creds(request, form)
 
-        # Route to the correct provider based on client_id
         provider = _PROVIDER_REGISTRY.get(client_id or "")
         if provider is not None:
             self._provider = provider
@@ -607,16 +540,9 @@ class TokenView(HomeAssistantView):
         )
 
 
-# ---------------------------------------------------------------------------
-# Helper used by the webhook handler to build the 401 challenge response
-# ---------------------------------------------------------------------------
-
-
 def build_unauthorized_response(
     request: web.Request, provider: OAuthProvider
 ) -> web.Response:
-    """Build the 401 + WWW-Authenticate response that MCP clients use to
-    discover the OAuth endpoints."""
     base = provider.base_url_for(request)
     metadata_url = f"{base}{OAUTH_BASE}/slot{provider.slot}/protected-resource"
     return web.Response(

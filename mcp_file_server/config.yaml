@@ -1,6 +1,6 @@
 name: "MCP File Server"
 description: "MCP Server for reading and writing files on the host filesystem via whitelist"
-version: "1.3.0"
+version: "1.4.0"
 slug: "mcp_file_server"
 init: false
 arch:
@@ -9,24 +9,18 @@ arch:
   - armhf
   - armv7
   - i386
-
 startup: services
 boot: auto
-
 ports:
   8765/tcp: 8765
-
 options:
   allowed_paths:
     - /config
-
 schema:
   allowed_paths:
     - str
-
 map:
   - type: config
     path: /config
     read_only: false
-
 full_access: true
