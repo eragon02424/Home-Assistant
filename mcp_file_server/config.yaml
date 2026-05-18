@@ -1,6 +1,6 @@
 name: "MCP File Server"
 description: "MCP Server for reading and writing files on the host filesystem via whitelist"
-version: "1.5.0"
+version: "1.6.0"
 slug: "mcp_file_server"
 init: false
 arch:
