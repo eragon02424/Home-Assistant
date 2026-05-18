@@ -2,7 +2,7 @@
   "domain": "mcp_proxy",
   "name": "MCP Proxy",
   "documentation": "https://github.com/eragon02424/Home-Assistant",
-  "version": "3.2.3",
+  "version": "3.2.4",
   "codeowners": [],
   "config_flow": true,
   "dependencies": ["webhook"],
