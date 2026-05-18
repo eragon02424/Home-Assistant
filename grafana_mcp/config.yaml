@@ -1,6 +1,6 @@
-name: "Grafana MCP Server"
+name: "MCP Grafana"
 description: "Official Grafana MCP Server for AI assistant integration via Model Context Protocol."
-version: "1.0.1"
+version: "1.0.2"
 slug: "grafana_mcp"
 init: false
 arch:
@@ -13,7 +13,7 @@ map:
 ports:
   8080/tcp: 8080
 ports_description:
-  8080/tcp: "Grafana MCP Server (StreamableHTTP)"
+  8080/tcp: "MCP Grafana (StreamableHTTP)"
 options:
   grafana_url: "http://localhost:3000"
   grafana_token: ""
