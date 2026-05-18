@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
-"""ESPHome MCP Proxy — addon startup script.
+"""MCP Proxy — addon startup script.
 
 This addon installs the mcp_proxy webhook custom integration into HA Core
-and proxies remote MCP requests to the MCP Server addon running on
-port 8099.
+and proxies remote MCP requests to the configured MCP Server addons.
 
-Compared to the original mcp_proxy/start.py, the changes are:
-  1. No ha-mcp addon auto-discovery — target is always 127.0.0.1:8099
-     (or the user-supplied mcp_server_url in options.json)
-  2. Domain is mcp_proxy everywhere (config file, integration path, etc.)
-  3. enable_oauth defaults to True — OAuth is required
-  4. Marker/secret/creds files use .mcp_proxy_ prefix
-
-Everything else (install logic, config-entry management, HA restart detection,
-keep-alive loop, OAuth credential persistence, Nabu Casa URL detection) is
-identical to the original.
+Features:
+  1. Up to 10 configurable MCP server slots
+  2. OAuth 2.1 protected webhooks (Nabu Casa / reverse proxy compatible)
+  3. Auto-installs and updates the mcp_proxy custom integration
+  4. Per-slot OAuth credentials and webhook IDs persisted across restarts
 """
 
 from __future__ import annotations
@@ -45,7 +39,7 @@ if TYPE_CHECKING:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Logging
+Logging
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _log(level: str, message: str, stream: "TextIO | None" = None) -> None:
@@ -62,7 +56,7 @@ def log_error(message: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Supervisor API helpers  (unchanged from original)
+Supervisor API helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _supervisor_get(path: str) -> dict | None:
@@ -163,7 +157,7 @@ def _ha_core_api(method: str, path: str, data: dict | None = None) -> dict | lis
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Nabu Casa URL detection  (unchanged from original)
+Nabu Casa URL detection
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_nabu_casa_url() -> str | None:
@@ -193,7 +187,7 @@ def _resolve_remote_url(remote_url: str) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OAuth credential persistence  (mcp_proxy prefix)
+OAuth credential persistence
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _regenerate_oauth_creds(data_dir: Path) -> None:
@@ -257,7 +251,7 @@ def _resolve_oauth_creds(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Webhook ID persistence  (unchanged from original)
+Webhook ID persistence
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_or_create_webhook_id(data_dir: Path) -> str:
@@ -279,7 +273,7 @@ def _get_or_create_webhook_id(data_dir: Path) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Integration install/update  (domain = mcp_proxy)
+Integration install/update
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _install_integration() -> IntegrationInstall:
@@ -326,11 +320,10 @@ def _install_integration() -> IntegrationInstall:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config entry management  (domain = mcp_proxy)
+Config entry management
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ensure_config_entry(retries: int = 12, delay: int = 10) -> bool:
-    # Initial wait so the Supervisor API is ready after container start
     time.sleep(5)
     for attempt in range(1, retries + 1):
         entries = _ha_core_api("GET", "/config/config_entries/entry")
@@ -401,7 +394,7 @@ def _reload_config_entry() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Wait for HA restart  (unchanged from original)
+Wait for HA restart
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ha_core_api_quiet(method: str, path: str) -> list | dict | None:
@@ -452,11 +445,10 @@ def _wait_for_ha_restart(poll_interval: int = 10, timeout: int = 600) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Health check
+Health check
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _health_check(target_url: str) -> bool:
-    """TCP connect to ESPHome MCP server to check reachability."""
     try:
         parsed = urlparse(target_url)
         host = parsed.hostname or "127.0.0.1"
@@ -468,22 +460,15 @@ def _health_check(target_url: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Addon auto-discovery via Supervisor API
+Addon auto-discovery via Supervisor API
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _discover_addon_url(slug: str) -> str | None:
-    """Discover the internal URL of an addon by its slug.
-
-    Uses the Supervisor API to get the addon's network port mapping,
-    then builds the URL using the stable addon_<slug> hostname.
-    Falls back to None if discovery fails.
-    """
     data = _supervisor_get(f"/addons/{slug}/info")
     if not data:
         log_error(f"Could not get addon info for slug '{slug}' from Supervisor API")
         return None
 
-    # Find the first exposed port from network config
     network = data.get("network") or {}
     port: int | None = None
     for container_port, host_port in network.items():
@@ -495,11 +480,9 @@ def _discover_addon_url(slug: str) -> str | None:
                 continue
 
     if port is None:
-        # Try common MCP ports
         port = 8099
         log_info(f"No network port found for '{slug}', assuming port {port}")
 
-    # The stable internal hostname for addons is addon_<slug>
     hostname = f"addon_{slug}"
     url = f"http://{hostname}:{port}/mcp"
     log_info(f"Discovered addon '{slug}' at {url}")
@@ -507,37 +490,25 @@ def _discover_addon_url(slug: str) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OAuth probe  (checks that the NEW integration code with OAuth is loaded)
+OAuth probe
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _probe_oauth_active() -> bool:
-    """Probe the OAuth protected-resource metadata endpoint.
-
-    Returns True only if HA serves /api/mcp_proxy/oauth/protected-resource,
-    which means the OAuth-enforcing integration code is loaded.
-    """
     result = _ha_core_api("GET", "/api/mcp_proxy/oauth/slot1/protected-resource")
     active = isinstance(result, dict) and "authorization_servers" in result
     if active:
-        log_info("OAuth probe: /api/mcp_proxy/oauth/protected-resource is reachable — OAuth ACTIVE")
+        log_info("OAuth probe: active")
     else:
-        log_error(
-            "OAuth probe: /api/mcp_proxy/oauth/protected-resource NOT reachable. "
-            f"Response was: {result!r}"
-        )
+        log_error(f"OAuth probe: NOT reachable. Response was: {result!r}")
     return active
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main
+Main
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def _load_servers(config: dict) -> list[dict]:
-    """Parse server slots from addon config.
-    Returns active server dicts with: slot, url, token.
-    Only slots where enabled=True AND url is non-empty are included.
-    """
     servers = []
     for i in range(1, 11):
         enabled = bool(config.get(f"server_{i}_enabled", False))
@@ -551,7 +522,6 @@ def _load_servers(config: dict) -> list[dict]:
 
 
 def _get_or_create_webhook_id_for_slot(data_dir: Path, slot: int) -> str:
-    """Persist a unique webhook ID per server slot."""
     wh_file = data_dir / f"mcp_proxy_webhook_slot_{slot}.txt"
     if wh_file.exists():
         try:
@@ -570,7 +540,6 @@ def _get_or_create_webhook_id_for_slot(data_dir: Path, slot: int) -> str:
 
 
 def _resolve_oauth_creds_for_slot(data_dir: Path, slot: int) -> tuple[str, str]:
-    """Persist OAuth credentials per server slot."""
     creds_file = data_dir / f"mcp_proxy_oauth_creds_slot_{slot}.json"
     stored: dict = {}
     if creds_file.exists():
@@ -623,7 +592,6 @@ def main() -> int:
         except (OSError, json.JSONDecodeError) as e:
             log_error(f"Failed to read config ({type(e).__name__}): {e}")
 
-    # ── Parse active server slots ─────────────────────────────────────────────
     servers = _load_servers(config)
     if not servers:
         log_error(
@@ -635,7 +603,6 @@ def main() -> int:
     log_info(f"Active server slots: {[s['slot'] for s in servers]}")
     resolved_remote = _resolve_remote_url(remote_url)
 
-    # ── Per-slot setup ────────────────────────────────────────────────────────
     proxy_servers = []
     for server in servers:
         slot = server["slot"]
@@ -671,7 +638,6 @@ def main() -> int:
         log_error("No server slots could be configured. Check addon log for errors.")
         return 1
 
-    # ── Write combined proxy config for the mcp_proxy integration ─────────────
     proxy_config: dict = {
         "servers": [
             {
@@ -698,16 +664,10 @@ def main() -> int:
         log_error(f"Failed to write proxy config: {e}")
         return 1
 
-    # ── Install integration ───────────────────────────────────────────────────
     first_install, version_changed = _install_integration()
 
     if version_changed:
-        log_info("")
-        log_info("*" * 60)
-        log_info("  INTEGRATION UPDATED — restart Home Assistant to load")
-        log_info("  the new mcp_proxy code.")
-        log_info("*" * 60)
-        log_info("")
+        log_info("Integration updated — HA restart required to load new code")
         _ha_core_api(
             "POST", "/services/persistent_notification/create",
             {
@@ -727,12 +687,6 @@ def main() -> int:
                 "notification_id": "mcp_proxy_restart",
             },
         )
-        log_info("")
-        log_info("*" * 60)
-        log_info("  RESTART HOME ASSISTANT to complete setup.")
-        log_info("  Settings > System > Restart")
-        log_info("*" * 60)
-        log_info("")
         _wait_for_ha_restart()
         if not _ensure_config_entry():
             log_error("Could not create config entry after HA restart. Webhook is NOT active.")
@@ -747,7 +701,6 @@ def main() -> int:
             _reload_config_entry()
             _ha_core_api("POST", "/services/persistent_notification/dismiss", {"notification_id": "mcp_proxy_restart"})
 
-    # ── OAuth probe ───────────────────────────────────────────────────────────
     oauth_restart_marker = Path("/config/.mcp_proxy_oauth_restart_required")
     log_info("Waiting 10s for HA to finish loading OAuth views...")
     time.sleep(10)
@@ -759,11 +712,10 @@ def main() -> int:
             pass
     else:
         log_error(
-            "OAuth probe failed — integration may not have loaded correctly. "
-            "Check HA logs for mcp_proxy errors. If OAuth is not working, restart Home Assistant."
+            "OAuth probe failed — check HA logs for mcp_proxy errors. "
+            "If OAuth is not working, restart Home Assistant."
         )
 
-    # ── Log final URLs ────────────────────────────────────────────────────────
     log_info("")
     log_info("=" * 70)
     for s in proxy_servers:
@@ -779,7 +731,6 @@ def main() -> int:
     log_info("=" * 70)
     log_info("")
 
-    # ── Keep-alive loop ───────────────────────────────────────────────────────
     log_info("Entering keep-alive loop (health check every 60s)...")
     consecutive_failures: dict[int, int] = {s["slot"]: 0 for s in proxy_servers}
     while True:
