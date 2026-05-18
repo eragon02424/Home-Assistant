@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-Logging
+# Logging
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _log(level: str, message: str, stream: "TextIO | None" = None) -> None:
@@ -56,7 +56,7 @@ def log_error(message: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-Supervisor API helpers
+# Supervisor API helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _supervisor_get(path: str) -> dict | None:
@@ -157,7 +157,7 @@ def _ha_core_api(method: str, path: str, data: dict | None = None) -> dict | lis
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-Nabu Casa URL detection
+# Nabu Casa URL detection
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_nabu_casa_url() -> str | None:
@@ -187,7 +187,7 @@ def _resolve_remote_url(remote_url: str) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-OAuth credential persistence
+# OAuth credential persistence
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _regenerate_oauth_creds(data_dir: Path) -> None:
@@ -251,7 +251,7 @@ def _resolve_oauth_creds(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-Webhook ID persistence
+# Webhook ID persistence
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_or_create_webhook_id(data_dir: Path) -> str:
@@ -273,7 +273,7 @@ def _get_or_create_webhook_id(data_dir: Path) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-Integration install/update
+# Integration install/update
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _install_integration() -> IntegrationInstall:
@@ -312,7 +312,7 @@ def _install_integration() -> IntegrationInstall:
         if dst.exists():
             shutil.rmtree(dst)
         shutil.copytree(src, dst)
-        log_info(f"Installed mcp_proxy integration (v{sv} → /config/custom_components/mcp_proxy/)")
+        log_info(f"Installed mcp_proxy integration (v{sv} -> /config/custom_components/mcp_proxy/)")
     else:
         log_info(f"mcp_proxy integration up to date (version {dv})")
 
@@ -320,7 +320,7 @@ def _install_integration() -> IntegrationInstall:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-Config entry management
+# Config entry management
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ensure_config_entry(retries: int = 12, delay: int = 10) -> bool:
@@ -394,7 +394,7 @@ def _reload_config_entry() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-Wait for HA restart
+# Wait for HA restart
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ha_core_api_quiet(method: str, path: str) -> list | dict | None:
@@ -430,7 +430,7 @@ def _wait_for_ha_restart(poll_interval: int = 10, timeout: int = 600) -> None:
         if isinstance(result, list):
             for entry in result:
                 if isinstance(entry, dict) and entry.get("domain") == "mcp_proxy":
-                    log_info("Integration already loaded — HA must have restarted")
+                    log_info("Integration already loaded - HA must have restarted")
                     return
         time.sleep(poll_interval)
 
@@ -441,11 +441,11 @@ def _wait_for_ha_restart(poll_interval: int = 10, timeout: int = 600) -> None:
             log_info("HA Core is back up")
             return
 
-    log_info("Timed out waiting for HA restart — continuing anyway")
+    log_info("Timed out waiting for HA restart - continuing anyway")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-Health check
+# Health check
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _health_check(target_url: str) -> bool:
@@ -460,7 +460,7 @@ def _health_check(target_url: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-Addon auto-discovery via Supervisor API
+# Addon auto-discovery via Supervisor API
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _discover_addon_url(slug: str) -> str | None:
@@ -490,7 +490,7 @@ def _discover_addon_url(slug: str) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-OAuth probe
+# OAuth probe
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _probe_oauth_active() -> bool:
@@ -504,9 +504,8 @@ def _probe_oauth_active() -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-Main
+# Main
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 def _load_servers(config: dict) -> list[dict]:
     servers = []
@@ -517,7 +516,7 @@ def _load_servers(config: dict) -> list[dict]:
         if enabled and url:
             servers.append({"slot": i, "url": url, "token": token})
         elif enabled and not url:
-            log_error(f"Server slot {i} is enabled but has no URL — skipping.")
+            log_error(f"Server slot {i} is enabled but has no URL - skipping.")
     return servers
 
 
@@ -619,7 +618,7 @@ def main() -> int:
         webhook_id = _get_or_create_webhook_id_for_slot(data_dir, slot)
         client_id, client_secret = _resolve_oauth_creds_for_slot(data_dir, slot)
         if not client_id or not client_secret:
-            log_error(f"Slot {slot}: Failed to resolve OAuth credentials — skipping")
+            log_error(f"Slot {slot}: Failed to resolve OAuth credentials - skipping")
             continue
 
         if token:
@@ -667,7 +666,7 @@ def main() -> int:
     first_install, version_changed = _install_integration()
 
     if version_changed:
-        log_info("Integration updated — HA restart required to load new code")
+        log_info("Integration updated - HA restart required to load new code")
         _ha_core_api(
             "POST", "/services/persistent_notification/create",
             {
@@ -678,12 +677,12 @@ def main() -> int:
         )
 
     if first_install:
-        log_info("First install — HA restart required to load the integration")
+        log_info("First install - HA restart required to load the integration")
         _ha_core_api(
             "POST", "/services/persistent_notification/create",
             {
                 "title": "MCP Proxy: Restart Required",
-                "message": "The MCP Proxy integration was installed. Please restart Home Assistant (Settings → System → Restart).",
+                "message": "The MCP Proxy integration was installed. Please restart Home Assistant (Settings > System > Restart).",
                 "notification_id": "mcp_proxy_restart",
             },
         )
@@ -712,7 +711,7 @@ def main() -> int:
             pass
     else:
         log_error(
-            "OAuth probe failed — check HA logs for mcp_proxy errors. "
+            "OAuth probe failed - check HA logs for mcp_proxy errors. "
             "If OAuth is not working, restart Home Assistant."
         )
 
@@ -727,7 +726,7 @@ def main() -> int:
         log_info(f"    OAuth Client Secret: {s['client_secret']}")
         log_info("")
     log_info("  Copy each Remote URL + OAuth credentials into Claude.ai")
-    log_info("  (Claude.ai: connector → Advanced settings)")
+    log_info("  (Claude.ai: connector > Advanced settings)")
     log_info("=" * 70)
     log_info("")
 
