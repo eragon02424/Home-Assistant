@@ -1,25 +1,10 @@
 """OAuth 2.1 provider for the MCP Proxy.
 
-This module is lazy-imported by `__init__.py` ONLY when the user has
-enabled the OAuth toggle. When OAuth is off the import never runs and the
-proxy behaves exactly like a vanilla unauthenticated webhook.
-
-Implements the subset of OAuth 2.1 required by the MCP spec:
-- Authorization-code grant with PKCE (S256)
-- Client authentication via client_secret_basic OR client_secret_post
-- Refresh tokens
-- RFC 8414 Authorization Server Metadata
-- RFC 9728 Protected Resource Metadata
-- WWW-Authenticate: Bearer with resource_metadata pointer (so MCP clients
-  discover the auth server from a 401 on the webhook URL)
-
-Single-tenant by design: one client_id / client_secret pair, configured in
-the addon. Auto-approves the consent screen — the client_id, client_secret
-and webhook URL are already the access gate.
+Auto-approves the consent screen — client_id, client_secret and webhook URL
+are already the access gate. No user interaction required.
 
 Tokens are signed (HMAC-SHA256) with a per-install secret persisted at
-/config/.mcp_proxy_oauth_secret. They contain enough state to validate
-without a server-side store, so the integration survives restarts.
+/config/.mcp_proxy_oauth_secret.
 """
 
 from __future__ import annotations
@@ -58,7 +43,6 @@ TOKEN_KIND_REFRESH = "refresh"
 
 PKCE_VERIFIER_MIN = 43
 PKCE_VERIFIER_MAX = 128
-PKCE_S256_CHALLENGE_LEN = 43
 _PKCE_VERIFIER_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
 _PKCE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
@@ -82,30 +66,17 @@ def _b64url_decode(s: str) -> bytes:
 
 
 def load_or_create_secret() -> bytes:
-    """Persist a 32-byte signing secret across restarts."""
     if SECRET_FILE.exists():
         data = SECRET_FILE.read_bytes()
         if len(data) >= 32:
             return data
-        _LOGGER.warning(
-            "MCP Proxy OAuth: existing signing key at %s is shorter than "
-            "32 bytes (got %d). Regenerating.",
-            SECRET_FILE,
-            len(data),
-        )
     new_secret = secrets.token_bytes(32)
     SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
     SECRET_FILE.write_bytes(new_secret)
     try:
         SECRET_FILE.chmod(0o600)
-    except OSError as e:
-        _LOGGER.warning(
-            "MCP Proxy OAuth: could not chmod 0600 the signing key file "
-            "at %s (%s: %s).",
-            SECRET_FILE,
-            type(e).__name__,
-            e,
-        )
+    except OSError:
+        pass
     return new_secret
 
 
@@ -123,9 +94,7 @@ def _is_valid_redirect_uri(redirect_uri: str) -> bool:
     return not parsed.fragment
 
 
-def _build_base_url(
-    request: web.Request, public_base_url: str | None = None
-) -> str:
+def _build_base_url(request: web.Request, public_base_url: str | None = None) -> str:
     if public_base_url:
         return public_base_url.rstrip("/")
     host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host", "")
@@ -134,23 +103,11 @@ def _build_base_url(
 
 
 class OAuthProvider:
-    """Holds OAuth state and registers HA HTTP views."""
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        client_id: str,
-        client_secret: str,
-        webhook_id: str,
-        signing_key: bytes,
-        public_base_url: str | None = None,
-        slot: int = 1,
-    ) -> None:
+    def __init__(self, hass: HomeAssistant, client_id: str, client_secret: str,
+                 webhook_id: str, signing_key: bytes, public_base_url: str | None = None,
+                 slot: int = 1) -> None:
         if not client_id or len(client_id) < MIN_CLIENT_ID_LEN:
-            raise ValueError(
-                f"client_id must be a non-empty string at least "
-                f"{MIN_CLIENT_ID_LEN} characters long"
-            )
+            raise ValueError(f"client_id must be at least {MIN_CLIENT_ID_LEN} characters")
         if not client_secret:
             raise ValueError("client_secret must be a non-empty string")
         if len(signing_key) < 32:
@@ -198,13 +155,8 @@ class OAuthProvider:
 
     def _issue_token(self, kind: str, ttl: int) -> str:
         now = int(time.time())
-        payload = {
-            "kind": kind,
-            "iat": now,
-            "exp": now + ttl,
-            "jti": secrets.token_urlsafe(12),
-            "cid": self._client_id,
-        }
+        payload = {"kind": kind, "iat": now, "exp": now + ttl,
+                   "jti": secrets.token_urlsafe(12), "cid": self._client_id}
         body = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
         sig = hmac.new(self._signing_key, body.encode("ascii"), hashlib.sha256).digest()
         return f"{body}.{_b64url_encode(sig)}"
@@ -218,9 +170,7 @@ class OAuthProvider:
             actual_sig = _b64url_decode(sig_part)
         except (ValueError, binascii.Error):
             return False
-        expected_sig = hmac.new(
-            self._signing_key, body.encode("ascii"), hashlib.sha256
-        ).digest()
+        expected_sig = hmac.new(self._signing_key, body.encode("ascii"), hashlib.sha256).digest()
         if not hmac.compare_digest(actual_sig, expected_sig):
             return False
         try:
@@ -249,8 +199,7 @@ class OAuthProvider:
         header = request.headers.get("Authorization", "")
         if not header.lower().startswith("bearer "):
             return False
-        token = header[7:].strip()
-        return self.validate_access_token(token)
+        return self.validate_access_token(header[7:].strip())
 
     def issue_code(self, redirect_uri: str, code_challenge: str) -> str | None:
         now = time.time()
@@ -258,11 +207,8 @@ class OAuthProvider:
         if len(self._codes) >= MAX_PENDING_CODES:
             return None
         code = secrets.token_urlsafe(32)
-        self._codes[code] = {
-            "redirect_uri": redirect_uri,
-            "code_challenge": code_challenge,
-            "expires": now + AUTH_CODE_TTL,
-        }
+        self._codes[code] = {"redirect_uri": redirect_uri, "code_challenge": code_challenge,
+                             "expires": now + AUTH_CODE_TTL}
         return code
 
     def consume_code(self, code: str, redirect_uri: str, code_verifier: str) -> bool:
@@ -278,20 +224,13 @@ class OAuthProvider:
         if entry["redirect_uri"] != redirect_uri:
             return False
         derived = _b64url_encode(hashlib.sha256(code_verifier.encode()).digest())
-        return hmac.compare_digest(
-            derived.encode("ascii"),
-            entry["code_challenge"].encode("ascii"),
-        )
+        return hmac.compare_digest(derived.encode("ascii"), entry["code_challenge"].encode("ascii"))
 
-    def authenticate_client(
-        self, client_id: str | None, client_secret: str | None
-    ) -> bool:
+    def authenticate_client(self, client_id: str | None, client_secret: str | None) -> bool:
         if not client_id or not client_secret:
             return False
-        return (
-            hmac.compare_digest(client_id.encode(), self._client_id.encode())
-            and hmac.compare_digest(client_secret.encode(), self._client_secret.encode())
-        )
+        return (hmac.compare_digest(client_id.encode(), self._client_id.encode())
+                and hmac.compare_digest(client_secret.encode(), self._client_secret.encode()))
 
 
 class ProtectedResourceMetadataView(HomeAssistantView):
@@ -305,18 +244,12 @@ class ProtectedResourceMetadataView(HomeAssistantView):
 
     async def get(self, request: web.Request) -> web.Response:
         base = self._provider.base_url_for(request)
-        return web.json_response(
-            {
-                "resource": self._provider.resource_url(base),
-                "authorization_servers": [
-                    self._provider.authorization_server_url(base)
-                ],
-                "bearer_methods_supported": ["header"],
-                "resource_documentation": (
-                    "https://github.com/eragon02424/Home-Assistant"
-                ),
-            }
-        )
+        return web.json_response({
+            "resource": self._provider.resource_url(base),
+            "authorization_servers": [self._provider.authorization_server_url(base)],
+            "bearer_methods_supported": ["header"],
+            "resource_documentation": "https://github.com/eragon02424/Home-Assistant",
+        })
 
 
 class AuthorizationServerMetadataView(HomeAssistantView):
@@ -331,27 +264,19 @@ class AuthorizationServerMetadataView(HomeAssistantView):
     async def get(self, request: web.Request) -> web.Response:
         base = self._provider.base_url_for(request)
         as_url = self._provider.authorization_server_url(base)
-        return web.json_response(
-            {
-                "issuer": as_url,
-                "authorization_endpoint": f"{base}{AUTHORIZE_BASE}",
-                "token_endpoint": f"{base}{TOKEN_BASE}",
-                "response_types_supported": ["code"],
-                "grant_types_supported": [
-                    "authorization_code",
-                    "refresh_token",
-                ],
-                "code_challenge_methods_supported": ["S256"],
-                "token_endpoint_auth_methods_supported": [
-                    "client_secret_basic",
-                    "client_secret_post",
-                ],
-            }
-        )
+        return web.json_response({
+            "issuer": as_url,
+            "authorization_endpoint": f"{base}{AUTHORIZE_BASE}",
+            "token_endpoint": f"{base}{TOKEN_BASE}",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+        })
 
 
 class AuthorizeView(HomeAssistantView):
-    """OAuth /authorize endpoint — auto-approves without a consent screen."""
+    """OAuth /authorize endpoint — auto-approves without consent screen."""
 
     requires_auth = False
 
@@ -364,10 +289,7 @@ class AuthorizeView(HomeAssistantView):
     def _redirect_with(redirect_uri: str, **params: str) -> web.Response:
         import yarl
         url = yarl.URL(redirect_uri).update_query(params)
-        return web.Response(
-            status=302,
-            headers={"Location": str(url)},
-        )
+        return web.Response(status=302, headers={"Location": str(url)})
 
     async def get(self, request: web.Request) -> web.Response:
         params = request.query
@@ -383,22 +305,18 @@ class AuthorizeView(HomeAssistantView):
             self._provider = provider
 
         err = self._validate_authorize_params(
-            response_type=response_type,
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            code_challenge=code_challenge,
+            response_type=response_type, client_id=client_id,
+            redirect_uri=redirect_uri, code_challenge=code_challenge,
             code_challenge_method=code_challenge_method,
         )
         if err is not None:
             return err
 
-        # Auto-approve: issue code immediately without showing consent screen
+        # Auto-approve: issue code immediately without consent screen
         code = self._provider.issue_code(redirect_uri, code_challenge)
         if code is None:
-            return self._redirect_with(
-                redirect_uri, error="temporarily_unavailable", state=state
-            )
-        _LOGGER.debug("MCP Proxy OAuth: auto-approved authorize request for client %s", self._provider.client_id_masked())
+            return self._redirect_with(redirect_uri, error="temporarily_unavailable", state=state)
+        _LOGGER.debug("MCP Proxy OAuth: auto-approved for client %s", self._provider.client_id_masked())
         return self._redirect_with(redirect_uri, code=code, state=state)
 
     async def post(self, request: web.Request) -> web.Response:
@@ -414,10 +332,8 @@ class AuthorizeView(HomeAssistantView):
             self._provider = provider
 
         err = self._validate_authorize_params(
-            response_type="code",
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            code_challenge=code_challenge,
+            response_type="code", client_id=client_id,
+            redirect_uri=redirect_uri, code_challenge=code_challenge,
             code_challenge_method="S256",
         )
         if err is not None:
@@ -425,36 +341,22 @@ class AuthorizeView(HomeAssistantView):
 
         code = self._provider.issue_code(redirect_uri, code_challenge)
         if code is None:
-            return self._redirect_with(
-                redirect_uri, error="temporarily_unavailable", state=state
-            )
+            return self._redirect_with(redirect_uri, error="temporarily_unavailable", state=state)
         return self._redirect_with(redirect_uri, code=code, state=state)
 
-    def _validate_authorize_params(
-        self,
-        *,
-        response_type: str,
-        client_id: str,
-        redirect_uri: str,
-        code_challenge: str,
-        code_challenge_method: str,
-    ) -> web.Response | None:
+    def _validate_authorize_params(self, *, response_type: str, client_id: str,
+                                   redirect_uri: str, code_challenge: str,
+                                   code_challenge_method: str) -> web.Response | None:
         if response_type != "code":
             return web.Response(status=400, text="unsupported_response_type")
         if code_challenge_method != "S256":
-            return web.Response(
-                status=400, text="invalid code_challenge_method (S256 required)"
-            )
+            return web.Response(status=400, text="invalid code_challenge_method (S256 required)")
         if not _PKCE_CHALLENGE_RE.match(code_challenge):
-            return web.Response(
-                status=400, text="invalid code_challenge (must be 43-char base64url)"
-            )
+            return web.Response(status=400, text="invalid code_challenge (must be 43-char base64url)")
         if client_id != self._provider.client_id:
             return web.Response(status=400, text="invalid client_id")
         if not _is_valid_redirect_uri(redirect_uri):
-            return web.Response(
-                status=400, text="redirect_uri must be an https:// URL with a host"
-            )
+            return web.Response(status=400, text="redirect_uri must be an https:// URL with a host")
         return None
 
 
@@ -468,15 +370,11 @@ class TokenView(HomeAssistantView):
         self.name = f"mcp_proxy:oauth:slot{provider.slot}:token"
 
     @staticmethod
-    def _extract_client_creds(
-        request: web.Request, form: dict
-    ) -> tuple[str | None, str | None]:
+    def _extract_client_creds(request: web.Request, form: dict) -> tuple[str | None, str | None]:
         header = request.headers.get("Authorization", "")
         if header.lower().startswith("basic "):
             try:
-                decoded = base64.b64decode(
-                    header[6:].strip(), validate=True
-                ).decode("utf-8")
+                decoded = base64.b64decode(header[6:].strip(), validate=True).decode("utf-8")
             except (ValueError, UnicodeDecodeError, binascii.Error):
                 return None, None
             if ":" in decoded:
@@ -494,20 +392,15 @@ class TokenView(HomeAssistantView):
             self._provider = provider
 
         if not self._provider.authenticate_client(client_id, client_secret):
-            return web.json_response(
-                {"error": "invalid_client"},
-                status=401,
-                headers={"WWW-Authenticate": 'Basic realm="MCP Proxy OAuth"'},
-            )
+            return web.json_response({"error": "invalid_client"}, status=401,
+                                     headers={"WWW-Authenticate": 'Basic realm="MCP Proxy OAuth"'})
 
         grant_type = form.get("grant_type", "")
         if grant_type == "authorization_code":
             return await self._handle_authorization_code(form)
         if grant_type == "refresh_token":
             return await self._handle_refresh(form)
-        return web.json_response(
-            {"error": "unsupported_grant_type"}, status=400
-        )
+        return web.json_response({"error": "unsupported_grant_type"}, status=400)
 
     async def _handle_authorization_code(self, form: dict) -> web.Response:
         code = str(form.get("code", ""))
@@ -517,41 +410,27 @@ class TokenView(HomeAssistantView):
             return web.json_response({"error": "invalid_request"}, status=400)
         if not self._provider.consume_code(code, redirect_uri, code_verifier):
             return web.json_response({"error": "invalid_grant"}, status=400)
-        return web.json_response(
-            {
-                "access_token": self._provider.issue_access_token(),
-                "token_type": "Bearer",
-                "expires_in": ACCESS_TOKEN_TTL,
-                "refresh_token": self._provider.issue_refresh_token(),
-            }
-        )
+        return web.json_response({
+            "access_token": self._provider.issue_access_token(),
+            "token_type": "Bearer",
+            "expires_in": ACCESS_TOKEN_TTL,
+            "refresh_token": self._provider.issue_refresh_token(),
+        })
 
     async def _handle_refresh(self, form: dict) -> web.Response:
         refresh = str(form.get("refresh_token", ""))
         if not refresh or not self._provider.validate_refresh_token(refresh):
             return web.json_response({"error": "invalid_grant"}, status=400)
-        return web.json_response(
-            {
-                "access_token": self._provider.issue_access_token(),
-                "token_type": "Bearer",
-                "expires_in": ACCESS_TOKEN_TTL,
-                "refresh_token": self._provider.issue_refresh_token(),
-            }
-        )
+        return web.json_response({
+            "access_token": self._provider.issue_access_token(),
+            "token_type": "Bearer",
+            "expires_in": ACCESS_TOKEN_TTL,
+            "refresh_token": self._provider.issue_refresh_token(),
+        })
 
 
-def build_unauthorized_response(
-    request: web.Request, provider: OAuthProvider
-) -> web.Response:
+def build_unauthorized_response(request: web.Request, provider: OAuthProvider) -> web.Response:
     base = provider.base_url_for(request)
     metadata_url = f"{base}{OAUTH_BASE}/slot{provider.slot}/protected-resource"
-    return web.Response(
-        status=401,
-        text="Unauthorized",
-        headers={
-            "WWW-Authenticate": (
-                f'Bearer realm="MCP Proxy", '
-                f'resource_metadata="{metadata_url}"'
-            )
-        },
-    )
+    return web.Response(status=401, text="Unauthorized",
+                        headers={"WWW-Authenticate": f'Bearer realm="MCP Proxy", resource_metadata="{metadata_url}"'})
