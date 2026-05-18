@@ -1,6 +1,6 @@
 name: "MCP GitHub"
-description: "Official GitHub MCP Server for AI assistant integration via Model Context Protocol."
-version: "1.3.0"
+description: "GitHub MCP Server with binary file support. Combines the official GitHub MCP server with custom push_file_binary and get_file_binary tools."
+version: "2.0.0"
 slug: "mcp_github"
 init: false
 arch:
