@@ -1,36 +1,56 @@
 #!/usr/bin/env python3
 """
 MCP GitHub Multiplexer
-Combines the official github-mcp-server with custom binary file tools.
-Listens on port 8766, forwards known tools to upstream on port 8767,
-handles push_file_binary and get_file_binary locally.
+Proxies all tools from the official github-mcp-server and adds binary file support.
 """
 
-import asyncio
 import base64
 import json
-import logging
 import os
+import time
 import urllib.request
 import urllib.error
-from typing import Any
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from mcp.server import Server
-from mcp.server.streamable_http import streamable_http_app
-import mcp.types as types
-import uvicorn
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
 
 UPSTREAM_PORT = int(os.environ.get("UPSTREAM_PORT", "8767"))
-GITHUB_TOKEN = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8766"))
+GITHUB_TOKEN = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+UPSTREAM_URL = f"http://127.0.0.1:{UPSTREAM_PORT}/mcp"
 
+# Binary tools handled locally
+BINARY_TOOLS = [
+    {
+        "name": "push_binary_file",
+        "description": "Push a binary file (e.g. PNG image) to a GitHub repository using base64-encoded content.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string", "description": "Repository owner"},
+                "repo": {"type": "string", "description": "Repository name"},
+                "path": {"type": "string", "description": "File path in the repository"},
+                "content_base64": {"type": "string", "description": "Base64-encoded file content"},
+                "message": {"type": "string", "description": "Commit message"},
+                "branch": {"type": "string", "description": "Branch name (default: main)"},
+            },
+            "required": ["owner", "repo", "path", "content_base64", "message"],
+        },
+    },
+    {
+        "name": "get_binary_file",
+        "description": "Get a binary file from a GitHub repository. Returns base64-encoded content.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string", "description": "Repository owner"},
+                "repo": {"type": "string", "description": "Repository name"},
+                "path": {"type": "string", "description": "File path in the repository"},
+            },
+            "required": ["owner", "repo", "path"],
+        },
+    },
+]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GitHub API helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _github_api(method: str, path: str, body: dict | None = None) -> dict:
     url = f"https://api.github.com{path}"
@@ -51,208 +71,169 @@ def _github_api(method: str, path: str, body: dict | None = None) -> dict:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body_text = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"GitHub API {method} {path}: HTTP {e.code} \u2014 {body_text}")
+        return {"error": f"HTTP {e.code}: {body_text}"}
 
 
-def _get_file_sha(owner: str, repo: str, path: str, branch: str) -> str | None:
-    try:
-        result = _github_api("GET", f"/repos/{owner}/{repo}/contents/{path}?ref={branch}")
-        return result.get("sha")
-    except RuntimeError:
-        return None
+def handle_push_binary_file(args: dict) -> str:
+    owner = args["owner"]
+    repo = args["repo"]
+    path = args["path"]
+    content_b64 = args["content_base64"]
+    message = args["message"]
+    branch = args.get("branch", "main")
+
+    existing = _github_api("GET", f"/repos/{owner}/{repo}/contents/{path}?ref={branch}")
+    sha = existing.get("sha")
+
+    body = {"message": message, "content": content_b64, "branch": branch}
+    if sha:
+        body["sha"] = sha
+
+    result = _github_api("PUT", f"/repos/{owner}/{repo}/contents/{path}", body)
+    if "error" in result:
+        return f"Error: {result['error']}"
+    action = "Updated" if sha else "Created"
+    html_url = result.get("content", {}).get("html_url", "")
+    return f"{action} {path} in {owner}/{repo} - {html_url}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Upstream forwarding
-# ─────────────────────────────────────────────────────────────────────────────
+def handle_get_binary_file(args: dict) -> str:
+    owner = args["owner"]
+    repo = args["repo"]
+    path = args["path"]
 
-async def _upstream_initialize() -> dict:
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "multiplexer", "version": "1.0"},
-        },
-    }
-    return await _upstream_request(payload)
+    result = _github_api("GET", f"/repos/{owner}/{repo}/contents/{path}")
+    if "error" in result:
+        return f"Error: {result['error']}"
+
+    content_b64 = result.get("content", "").replace("\n", "")
+    size = result.get("size", 0)
+    return json.dumps({"path": path, "size": size, "encoding": "base64", "content_base64": content_b64})
 
 
-async def _upstream_list_tools() -> list[dict]:
-    payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
-    result = await _upstream_request(payload)
-    return result.get("result", {}).get("tools", [])
-
-
-async def _upstream_call_tool(name: str, arguments: dict) -> list[dict]:
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 3,
-        "method": "tools/call",
-        "params": {"name": name, "arguments": arguments},
-    }
-    result = await _upstream_request(payload)
-    return result.get("result", {}).get("content", [{"type": "text", "text": str(result)}])
-
-
-async def _upstream_request(payload: dict) -> dict:
-    url = f"http://127.0.0.1:{UPSTREAM_PORT}/mcp"
-    data = json.dumps(payload).encode()
-    loop = asyncio.get_event_loop()
-
-    def _do_request():
-        req = urllib.request.Request(
-            url,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-            },
-            data=data,
-        )
+def _wait_for_upstream(retries: int = 20, delay: float = 1.0) -> bool:
+    for i in range(retries):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                raw = resp.read().decode("utf-8")
-                for line in raw.splitlines():
-                    if line.startswith("data:"):
-                        return json.loads(line[5:].strip())
-                return json.loads(raw)
-        except Exception as e:
-            return {"error": str(e)}
-
-    return await loop.run_in_executor(None, _do_request)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MCP Server
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def build_server() -> Server:
-    server = Server("mcp-github-extended")
-
-    for attempt in range(20):
-        try:
-            await _upstream_initialize()
-            log.info("Upstream github-mcp-server is ready")
-            break
-        except Exception:
-            if attempt == 19:
-                log.warning("Upstream not ready after 20 attempts, continuing anyway")
-            await asyncio.sleep(1)
-
-    upstream_tools = await _upstream_list_tools()
-    upstream_tool_names = {t["name"] for t in upstream_tools}
-    log.info(f"Upstream has {len(upstream_tools)} tools")
-
-    custom_tools = [
-        types.Tool(
-            name="push_file_binary",
-            description="Push a binary or text file to a GitHub repository using base64-encoded content. Use this for images (PNG, JPG), icons, or any non-text file.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "owner": {"type": "string", "description": "Repository owner"},
-                    "repo": {"type": "string", "description": "Repository name"},
-                    "path": {"type": "string", "description": "File path in the repository"},
-                    "content_base64": {"type": "string", "description": "Base64-encoded file content"},
-                    "message": {"type": "string", "description": "Commit message"},
-                    "branch": {"type": "string", "description": "Branch name", "default": "main"},
-                },
-                "required": ["owner", "repo", "path", "content_base64", "message"],
-            },
-        ),
-        types.Tool(
-            name="get_file_binary",
-            description="Get a binary file from a GitHub repository as base64-encoded content. Use for images or other binary files.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "owner": {"type": "string", "description": "Repository owner"},
-                    "repo": {"type": "string", "description": "Repository name"},
-                    "path": {"type": "string", "description": "File path in the repository"},
-                    "branch": {"type": "string", "description": "Branch name", "default": "main"},
-                },
-                "required": ["owner", "repo", "path"],
-            },
-        ),
-    ]
-
-    all_tools = list(custom_tools)
-    for t in upstream_tools:
-        all_tools.append(types.Tool(
-            name=t["name"],
-            description=t.get("description", ""),
-            inputSchema=t.get("inputSchema", {"type": "object", "properties": {}}),
-        ))
-
-    @server.list_tools()
-    async def list_tools() -> list[types.Tool]:
-        return all_tools
-
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
-
-        if name == "push_file_binary":
-            owner = arguments["owner"]
-            repo = arguments["repo"]
-            path = arguments["path"]
-            content_b64 = arguments["content_base64"]
-            message = arguments["message"]
-            branch = arguments.get("branch", "main")
-
-            sha = await asyncio.get_event_loop().run_in_executor(
-                None, _get_file_sha, owner, repo, path, branch
+            req = urllib.request.Request(
+                UPSTREAM_URL, method="POST",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                                 "params": {"protocolVersion": "2024-11-05",
+                                            "capabilities": {},
+                                            "clientInfo": {"name": "probe", "version": "0"}}}).encode(),
             )
-            body: dict = {"message": message, "content": content_b64, "branch": branch}
-            if sha:
-                body["sha"] = sha
-
-            def _push():
-                return _github_api("PUT", f"/repos/{owner}/{repo}/contents/{path}", body)
-
-            try:
-                result = await asyncio.get_event_loop().run_in_executor(None, _push)
-                commit_sha = result.get("commit", {}).get("sha", "unknown")
-                return [types.TextContent(type="text", text=f"File pushed successfully. Commit: {commit_sha}")]
-            except RuntimeError as e:
-                return [types.TextContent(type="text", text=f"Error: {e}")]
-
-        if name == "get_file_binary":
-            owner = arguments["owner"]
-            repo = arguments["repo"]
-            path = arguments["path"]
-            branch = arguments.get("branch", "main")
-
-            def _get():
-                return _github_api("GET", f"/repos/{owner}/{repo}/contents/{path}?ref={branch}")
-
-            try:
-                result = await asyncio.get_event_loop().run_in_executor(None, _get)
-                content_b64 = result.get("content", "").replace("\n", "")
-                size = result.get("size", 0)
-                return [types.TextContent(type="text", text=f"File retrieved. Size: {size} bytes. Base64:\n{content_b64}")]
-            except RuntimeError as e:
-                return [types.TextContent(type="text", text=f"Error: {e}")]
-
-        if name in upstream_tool_names:
-            content = await _upstream_call_tool(name, arguments)
-            return [types.TextContent(type="text", text=str(c.get("text", c))) for c in content]
-
-        return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
-
-    return server
+            with urllib.request.urlopen(req, timeout=3):
+                print(f"Upstream ready after {i+1} attempt(s)")
+                return True
+        except Exception:
+            time.sleep(delay)
+    return False
 
 
-async def main():
-    server = await build_server()
-    app = streamable_http_app(server)
-    config = uvicorn.Config(app, host="0.0.0.0", port=LISTEN_PORT, log_level="info")
-    uvi_server = uvicorn.Server(config)
-    log.info(f"MCP GitHub Extended listening on port {LISTEN_PORT}")
-    await uvi_server.serve()
+def _forward_to_upstream(body: bytes, session_id: str | None) -> tuple[int, dict, str]:
+    headers = {"Content-Type": "application/json"}
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    req = urllib.request.Request(UPSTREAM_URL, method="POST", headers=headers, data=body)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.status, dict(resp.headers), resp.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, {}, e.read().decode()
+    except Exception as e:
+        return 502, {}, json.dumps({"error": str(e)})
+
+
+def _make_tool_result(req_id, content: str) -> str:
+    return json.dumps({
+        "jsonrpc": "2.0", "id": req_id,
+        "result": {"content": [{"type": "text", "text": content}], "isError": False},
+    })
+
+
+def _get_upstream_tools(session_id: str | None) -> list:
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode()
+    _, _, resp_text = _forward_to_upstream(body, session_id)
+    try:
+        return json.loads(resp_text).get("result", {}).get("tools", [])
+    except Exception:
+        return []
+
+
+class MuxHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        print(f"[MUX] {fmt % args}")
+
+    def _send_json(self, status: int, body: str, extra_headers: dict | None = None):
+        encoded = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Authorization")
+        self.end_headers()
+
+    def do_GET(self):
+        status, headers, body = _forward_to_upstream(b"", self.headers.get("Mcp-Session-Id"))
+        self._send_json(status, body)
+
+    def do_DELETE(self):
+        status, headers, body = _forward_to_upstream(b"", self.headers.get("Mcp-Session-Id"))
+        self._send_json(status, body)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length)
+        session_id = self.headers.get("Mcp-Session-Id")
+
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            self._send_json(400, json.dumps({"error": "invalid json"}))
+            return
+
+        method = msg.get("method", "")
+        req_id = msg.get("id")
+
+        if method == "tools/list":
+            upstream_tools = _get_upstream_tools(session_id)
+            resp = json.dumps({"jsonrpc": "2.0", "id": req_id,
+                               "result": {"tools": upstream_tools + BINARY_TOOLS}})
+            self._send_json(200, resp)
+            return
+
+        if method == "tools/call":
+            tool_name = msg.get("params", {}).get("name", "")
+            tool_args = msg.get("params", {}).get("arguments", {})
+
+            if tool_name == "push_binary_file":
+                self._send_json(200, _make_tool_result(req_id, handle_push_binary_file(tool_args)))
+                return
+            if tool_name == "get_binary_file":
+                self._send_json(200, _make_tool_result(req_id, handle_get_binary_file(tool_args)))
+                return
+
+        status, resp_headers, body = _forward_to_upstream(raw, session_id)
+        extra = {}
+        if "Mcp-Session-Id" in resp_headers:
+            extra["Mcp-Session-Id"] = resp_headers["Mcp-Session-Id"]
+        self._send_json(status, body, extra)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    print(f"Waiting for upstream on port {UPSTREAM_PORT}...")
+    if not _wait_for_upstream():
+        print("WARNING: upstream not ready, starting anyway")
+    server = HTTPServer(("0.0.0.0", LISTEN_PORT), MuxHandler)
+    print(f"MCP GitHub Multiplexer listening on port {LISTEN_PORT}")
+    server.serve_forever()

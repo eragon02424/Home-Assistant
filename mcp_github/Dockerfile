@@ -1,9 +1,6 @@
 FROM alpine:3.19
 
-RUN apk add --no-cache curl tar python3 py3-pip
-
-# Install Python MCP library for multiplexer
-RUN pip install --no-cache-dir --break-system-packages mcp uvicorn
+RUN apk add --no-cache curl tar python3
 
 # Download latest github-mcp-server binary
 RUN LATEST=$(curl -s https://api.github.com/repos/github/github-mcp-server/releases/latest | grep '"tag_name"' | cut -d'"' -f4) && \

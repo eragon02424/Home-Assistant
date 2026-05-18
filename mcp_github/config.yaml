@@ -1,6 +1,6 @@
 name: "MCP GitHub"
-description: "GitHub MCP Server with binary file support. Combines the official GitHub MCP server with custom push_file_binary and get_file_binary tools."
-version: "2.0.0"
+description: "Official GitHub MCP Server extended with binary file support via Model Context Protocol."
+version: "1.4.0"
 slug: "mcp_github"
 init: false
 arch:
