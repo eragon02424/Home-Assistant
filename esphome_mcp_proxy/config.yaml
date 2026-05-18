@@ -1,5 +1,5 @@
 name: MCP Proxy
-version: "3.2.0"
+version: "3.2.1"
 slug: mcp_proxy_esphome
 description: Proxies MCP requests to up to 10 MCP Server addons via OAuth-protected webhooks (Nabu Casa / reverse proxy compatible).
 url: https://github.com/eragon02424/Home-Assistant
