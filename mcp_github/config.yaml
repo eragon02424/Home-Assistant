@@ -1,6 +1,6 @@
 name: "MCP GitHub"
 description: "Official GitHub MCP Server extended with binary file support via Model Context Protocol."
-version: "1.6.0"
+version: "1.7.0"
 slug: "mcp_github"
 init: false
 arch:
