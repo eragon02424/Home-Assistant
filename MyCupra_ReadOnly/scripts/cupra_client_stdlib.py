@@ -96,14 +96,18 @@ class CupraClient:
         try:
             resp = self.opener.open(req)
             status = resp.status
-            resp_headers = dict(resp.headers)
+            # WICHTIG: resp.headers NICHT mit dict(...) umwandeln - das zerstört
+            # die Case-Insensitivität von HTTP-Headern (z.B. "location" vs "Location").
+            # resp.headers ist ein email.message.Message-Objekt mit eingebautem,
+            # case-insensitivem .get() - das behalten wir bei.
+            resp_headers = resp.headers
             content = resp.read()
             return status, resp_headers, content
         except urllib.error.HTTPError as e:
             # 3xx und 4xx landen wegen NoRedirectHandler / urllib hier als "Fehler",
             # obwohl sie für uns gültige, erwartete Antworten sind.
             status = e.code
-            resp_headers = dict(e.headers)
+            resp_headers = e.headers
             content = e.read()
             if status in (301, 302, 303, 307, 308) or allow_404:
                 return status, resp_headers, content
