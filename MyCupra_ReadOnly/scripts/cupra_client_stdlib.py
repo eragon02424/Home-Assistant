@@ -87,13 +87,22 @@ class CupraClient:
     # Netzwerkproblemen (z.B. Server antwortet gar nicht) endlos hängen bleibt.
     REQUEST_TIMEOUT_SECONDS = 15
 
-    # Retry-Verhalten bei vorübergehenden Fehlern (Netzwerk, abgelehnter Token).
-    # Bei dauerhaften Fehlern (falsches Passwort, falsche VIN) wird NIE wiederholt.
-    MAX_RETRIES = 3
-    RETRY_DELAY_SECONDS = 5
+    # Gestaffelte Backoff-Strategie bei vorübergehenden Fehlern (Netzwerk,
+    # abgelehnter/abgelaufener Token). Jedes Tupel ist (Anzahl Versuche, Wartezeit
+    # in Sekunden zwischen diesen Versuchen). Die letzte Stufe wird unbegrenzt oft
+    # wiederholt (dauerhafter Betrieb), bis es entweder klappt oder ein dauerhafter
+    # Fehler auftritt (falsches Passwort, falsche VIN - siehe CupraPermanentError).
+    RETRY_SCHEDULE = [
+        (10, 10),       # 10 Versuche, alle 10 Sekunden
+        (10, 60),       # 10 Versuche, alle 1 Minute
+        (10, 600),      # 10 Versuche, alle 10 Minuten
+        (10, 1200),     # 10 Versuche, alle 20 Minuten
+    ]
+    RETRY_FINAL_DELAY_SECONDS = 3600  # danach: unbegrenzt, stündlich
 
     def __init__(self, email: str, password: str, vin: str,
-                 request_identifier: str = DEFAULT_REQUEST_IDENTIFIER):
+                 request_identifier: str = DEFAULT_REQUEST_IDENTIFIER,
+                 retry_speedup: float = 1.0):
         self.email = email
         self.password = password
         self.vin = vin
@@ -105,6 +114,10 @@ class CupraClient:
         )
         # Unix-Timestamp, wann der aktuelle access_token abläuft. None = noch nie eingeloggt.
         self._token_expires_at = None
+        # Nur für Tests: Faktor >1 verkürzt alle Retry-Wartezeiten proportional,
+        # damit man die gestaffelte Backoff-Strategie nicht stundenlang live
+        # abwarten muss. Im Normalbetrieb (1.0) ohne Effekt.
+        self._retry_speedup = retry_speedup
 
     # ------------------------------------------------------------------
     # Low-level Request-Helfer
@@ -222,34 +235,45 @@ class CupraClient:
         logger.debug("Kein gültiger Token vorhanden, Login wird durchgeführt.")
         self.login()
 
+    def _retry_delays(self):
+        """Generator, der die Wartezeiten gemäß RETRY_SCHEDULE liefert und danach
+        unbegrenzt RETRY_FINAL_DELAY_SECONDS weiterliefert (dauerhafter Betrieb)."""
+        for count, delay in self.RETRY_SCHEDULE:
+            for _ in range(count):
+                yield delay / self._retry_speedup
+        while True:
+            yield self.RETRY_FINAL_DELAY_SECONDS / self._retry_speedup
+
     def _with_retry(self, func, *args, **kwargs):
         """Führt func aus und versucht es bei CupraRetryableError (Netzwerkfehler,
-        abgelehnter/abgelaufener Token) bis zu MAX_RETRIES mal erneut, jeweils mit
-        kurzer Wartezeit dazwischen. Vor jedem Retry wird der Token verworfen, damit
-        ensure_logged_in() beim nächsten Versuch sicher neu einloggt.
+        abgelehnter/abgelaufener Token) gestaffelt und UNBEGRENZT erneut (siehe
+        RETRY_SCHEDULE) - läuft so lange weiter, bis es entweder klappt oder ein
+        CupraPermanentError auftritt. Vor jedem Retry wird der Token verworfen,
+        damit ensure_logged_in() beim nächsten Versuch sicher neu einloggt.
 
         CupraPermanentError (falsches Passwort, falsche VIN, ungültiger Identifier)
         wird NICHT wiederholt, da ein erneuter Versuch garantiert wieder fehlschlägt -
-        hier soll sofort und klar abgebrochen werden."""
-        last_error = None
-        for attempt in range(1, self.MAX_RETRIES + 1):
+        hier soll sofort und klar abgebrochen werden.
+
+        ACHTUNG: diese Methode kann (bei dauerhaften Netzwerkproblemen) sehr lange
+        blockieren (Stunden). Für den Einsatz in Home Assistant muss das in einem
+        eigenen Hintergrund-Mechanismus laufen, der den HA-Hauptthread nicht blockiert
+        - nicht direkt im synchronen Update-Pfad des Coordinators aufrufen."""
+        attempt = 0
+        for delay in self._retry_delays():
+            attempt += 1
             try:
                 return func(*args, **kwargs)
             except CupraPermanentError:
                 raise
             except CupraRetryableError as e:
-                last_error = e
-                if attempt < self.MAX_RETRIES:
-                    logger.warning(
-                        "Versuch %d/%d fehlgeschlagen (%s) - erneuter Versuch in %ds, "
-                        "Token wird dafür verworfen.",
-                        attempt, self.MAX_RETRIES, e, self.RETRY_DELAY_SECONDS,
-                    )
-                    self._token_expires_at = None  # Erzwingt frischen Login beim Retry
-                    time.sleep(self.RETRY_DELAY_SECONDS)
-                else:
-                    logger.error("Alle %d Versuche fehlgeschlagen.", self.MAX_RETRIES)
-        raise last_error
+                logger.warning(
+                    "Versuch %d fehlgeschlagen (%s) - erneuter Versuch in %ds, "
+                    "Token wird dafür verworfen.",
+                    attempt, e, delay,
+                )
+                self._token_expires_at = None  # Erzwingt frischen Login beim Retry
+                time.sleep(delay)
 
     # ------------------------------------------------------------------
     # Login-Flow, Schritt für Schritt - exakt wie im Browser nachgebildet
@@ -393,7 +417,7 @@ class CupraClient:
         """Liefert die Liste der verfügbaren Dateien für die Home-Assistant-Anfrage.
         Loggt automatisch (erneut) ein, falls kein gültiger Token vorhanden ist.
         Versucht es bei vorübergehenden Fehlern (Netzwerk, abgelehnter Token)
-        automatisch bis zu MAX_RETRIES mal erneut."""
+        gestaffelt und unbegrenzt erneut (siehe RETRY_SCHEDULE)."""
         return self._with_retry(self._list_files_once)
 
     def _list_files_once(self) -> list:
@@ -416,7 +440,7 @@ class CupraClient:
 
     def download_latest(self):
         """Lädt die neueste verfügbare ZIP-Datei herunter. Gibt (bytes, filename) zurück.
-        Versucht es bei vorübergehenden Fehlern automatisch bis zu MAX_RETRIES mal erneut."""
+        Versucht es bei vorübergehenden Fehlern gestaffelt und unbegrenzt erneut."""
         return self._with_retry(self._download_latest_once)
 
     def _download_latest_once(self):
@@ -456,6 +480,9 @@ def main():
                         help="Identifier der Daueranfrage im Portal (Standard: die bekannte "
                              "'Home Assistant'-Anfrage). Zum Testen mit einer ungültigen ID "
                              "überschreibbar.")
+    parser.add_argument("--retry-speedup", type=float, default=1.0,
+                        help="Nur für Tests: Faktor >1 verkürzt alle Retry-Wartezeiten "
+                             "proportional (z.B. 60 = Sekunden statt Minuten warten)")
     parser.add_argument("--debug", action="store_true", help="Ausführliche Log-Ausgaben")
     args = parser.parse_args()
 
@@ -465,7 +492,8 @@ def main():
     )
 
     client = CupraClient(email=args.email, password=args.password, vin=args.vin,
-                         request_identifier=args.request_id)
+                         request_identifier=args.request_id,
+                         retry_speedup=args.retry_speedup)
 
     try:
         if args.double_call:
@@ -488,6 +516,9 @@ def main():
     except CupraLoginError as e:
         logger.error("Fehler: %s", e)
         sys.exit(1)
+    except KeyboardInterrupt:
+        logger.info("Abgebrochen durch Benutzer (Strg+C).")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
