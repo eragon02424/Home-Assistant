@@ -14,6 +14,7 @@ Verwendung:
 Optional:
     --output /pfad/zur/datei.zip   (Standard: aktuelles Verzeichnis)
     --list-only                    (nur die Liste der verfügbaren Dateien zeigen, nichts laden)
+    --double-call                  (Testmodus: prüft Token-Wiederverwendung)
     --debug                        (ausführliche Log-Ausgaben)
 """
 
@@ -24,6 +25,7 @@ import json
 import logging
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -63,6 +65,16 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 class CupraClient:
+    # Sicherheitspuffer: wir betrachten den Token schon als "abgelaufen", wenn
+    # weniger als diese Anzahl Sekunden Restgültigkeit übrig sind. Verhindert,
+    # dass ein Token mitten in einer mehrteiligen Anfrage (Liste -> Download)
+    # plötzlich ungültig wird.
+    TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS = 60
+
+    # Timeout pro einzelnem HTTP-Request. Verhindert, dass das Skript bei
+    # Netzwerkproblemen (z.B. Server antwortet gar nicht) endlos hängen bleibt.
+    REQUEST_TIMEOUT_SECONDS = 15
+
     def __init__(self, email: str, password: str, vin: str,
                  request_identifier: str = DEFAULT_REQUEST_IDENTIFIER):
         self.email = email
@@ -74,6 +86,8 @@ class CupraClient:
             urllib.request.HTTPCookieProcessor(self.cookie_jar),
             NoRedirectHandler(),
         )
+        # Unix-Timestamp, wann der aktuelle access_token abläuft. None = noch nie eingeloggt.
+        self._token_expires_at = None
 
     # ------------------------------------------------------------------
     # Low-level Request-Helfer
@@ -94,7 +108,7 @@ class CupraClient:
         req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
 
         try:
-            resp = self.opener.open(req)
+            resp = self.opener.open(req, timeout=self.REQUEST_TIMEOUT_SECONDS)
             status = resp.status
             # WICHTIG: resp.headers NICHT mit dict(...) umwandeln - das zerstört
             # die Case-Insensitivität von HTTP-Headern (z.B. "location" vs "Location").
@@ -114,6 +128,12 @@ class CupraClient:
             raise CupraLoginError(
                 f"HTTP {status} bei {url}: {content[:300].decode('utf-8', errors='replace')}"
             )
+        except urllib.error.URLError as e:
+            # Netzwerkfehler ohne HTTP-Antwort: DNS-Fehler, Verbindung abgelehnt,
+            # Timeout, kein Internet etc. Wichtig für Langzeitbetrieb (Router-Neustart,
+            # kurzer Internetausfall) - soll als klare, behandelbare Ausnahme ankommen,
+            # nicht als unbehandelter Absturz.
+            raise CupraLoginError(f"Netzwerkfehler bei {url}: {e.reason}")
 
     # ------------------------------------------------------------------
     # Hilfsfunktionen zum Extrahieren von CSRF/HMAC/relayState aus HTML
@@ -152,6 +172,37 @@ class CupraClient:
                 return cookie.value
         return None
 
+    @staticmethod
+    def _decode_jwt_payload(token: str) -> dict:
+        """Dekodiert (ohne Signaturprüfung - reicht für unseren Zweck, da wir den
+        Token nur zur Ablaufzeit-Anzeige auslesen, nicht zur Autorisierung selbst
+        verwenden) den Payload-Teil eines JWT."""
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        return json.loads(base64.urlsafe_b64decode(padded))
+
+    def is_logged_in(self) -> bool:
+        """True, wenn ein aktuell noch gültiger access_token vorhanden ist
+        (mit Sicherheitspuffer, siehe TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS)."""
+        if self._token_expires_at is None:
+            return False
+        if not self._get_cookie("access_token"):
+            return False
+        return time.time() < (self._token_expires_at - self.TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS)
+
+    def ensure_logged_in(self) -> None:
+        """Loggt nur ein, wenn noch kein gültiger Token vorhanden ist.
+        Das ist die Methode, die vor jedem Datenzugriff aufgerufen werden sollte -
+        sie spart unnötige Logins, wenn der bestehende Token noch ausreichend
+        lange gültig ist."""
+        if self.is_logged_in():
+            logger.debug("Bestehender Token ist noch gültig, kein erneuter Login nötig.")
+            return
+        logger.debug("Kein gültiger Token vorhanden, Login wird durchgeführt.")
+        self.login()
+
     # ------------------------------------------------------------------
     # Login-Flow, Schritt für Schritt - exakt wie im Browser nachgebildet
     # und am 17.06.2026 manuell verifiziert.
@@ -168,8 +219,6 @@ class CupraClient:
         }
         url = f"{IDENTITY_BASE}/oidc/v1/authorize?{urllib.parse.urlencode(authorize_params)}"
         status, headers, _ = self._request("GET", url)
-        logger.debug("Authorize Antwort-Status: %s", status)
-        logger.debug("Authorize Antwort-Header: %s", dict(headers.items()))
         if status != 302:
             raise CupraLoginError(f"Authorize fehlgeschlagen: HTTP {status}")
         signin_url = headers["Location"]
@@ -180,7 +229,11 @@ class CupraClient:
         html = body.decode("utf-8")
         fields = self._extract_hidden_inputs(html)
         if not fields.get("_csrf"):
-            raise CupraLoginError("Konnte CSRF-Token von der Signin-Seite nicht extrahieren")
+            raise CupraLoginError(
+                "Konnte CSRF-Token von der Signin-Seite nicht extrahieren. "
+                "Möglich: VW Group hat die Login-Seitenstruktur geändert "
+                "(nicht zwingend ein Problem mit den Zugangsdaten)."
+            )
 
         logger.info("Schritt 3/9: E-Mail senden (Identifier-POST)")
         post_url = signin_url.split("?")[0].replace("/signin/", "/") + "/login/identifier"
@@ -203,7 +256,11 @@ class CupraClient:
         html = body.decode("utf-8")
         pw_fields = self._extract_js_model_fields(html)
         if not pw_fields.get("_csrf"):
-            raise CupraLoginError("Konnte CSRF-Token von der Passwort-Seite nicht extrahieren")
+            raise CupraLoginError(
+                "Konnte CSRF-Token von der Passwort-Seite nicht extrahieren. "
+                "Möglich: VW Group hat die Login-Seitenstruktur geändert "
+                "(nicht zwingend ein Problem mit den Zugangsdaten)."
+            )
 
         logger.info("Schritt 5/9: Passwort senden (Authenticate-POST)")
         authenticate_post_url = authenticate_url.split("?")[0]
@@ -262,13 +319,32 @@ class CupraClient:
                 "unerwarteter Zustand, bitte Flow erneut prüfen."
             )
 
+        # Ablaufzeit aus dem Token selbst auslesen (exp-Claim), damit
+        # ensure_logged_in() spätere unnötige Logins vermeiden kann.
+        try:
+            payload = self._decode_jwt_payload(self._get_cookie("access_token"))
+            self._token_expires_at = payload["exp"]
+            logger.debug(
+                "Token gültig bis %s (in %d Sekunden)",
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._token_expires_at)),
+                self._token_expires_at - time.time(),
+            )
+        except Exception as e:
+            # Sollte das Token-Format sich mal ändern, ist das kein Show-Stopper -
+            # wir loggen dann beim nächsten Aufruf einfach sicherheitshalber neu ein.
+            logger.warning("Konnte Token-Ablaufzeit nicht auslesen (%s) - "
+                           "ensure_logged_in() wird beim nächsten Aufruf neu einloggen.", e)
+            self._token_expires_at = None
+
         logger.info("Login erfolgreich. access_token Cookie gesetzt.")
 
     # ------------------------------------------------------------------
     # Daten abrufen (erst Liste, dann gezielter Download)
     # ------------------------------------------------------------------
     def list_files(self) -> list:
-        """Liefert die Liste der verfügbaren Dateien für die Home-Assistant-Anfrage."""
+        """Liefert die Liste der verfügbaren Dateien für die Home-Assistant-Anfrage.
+        Loggt automatisch (erneut) ein, falls kein gültiger Token vorhanden ist."""
+        self.ensure_logged_in()
         url = (
             f"{PORTAL_BASE}/proxy_api/euda-apim/datadelivery/vehicles/"
             f"{self.vin}/{self.request_identifier}/list"
@@ -309,6 +385,9 @@ def main():
     parser.add_argument("--output", default=".", help="Zielverzeichnis für die ZIP-Datei")
     parser.add_argument("--list-only", action="store_true",
                         help="Nur die Dateiliste zeigen, nichts herunterladen")
+    parser.add_argument("--double-call", action="store_true",
+                        help="Testmodus: list_files() zweimal aufrufen, um zu prüfen ob "
+                             "der zweite Aufruf den Login-Schritt überspringt (Token-Reuse-Test)")
     parser.add_argument("--debug", action="store_true", help="Ausführliche Log-Ausgaben")
     args = parser.parse_args()
 
@@ -320,12 +399,14 @@ def main():
     client = CupraClient(email=args.email, password=args.password, vin=args.vin)
 
     try:
-        client.login()
-    except CupraLoginError as e:
-        logger.error("Login fehlgeschlagen: %s", e)
-        sys.exit(1)
+        if args.double_call:
+            logger.info("=== Erster Aufruf (sollte einloggen) ===")
+            client.list_files()
+            logger.info("=== Zweiter Aufruf (sollte Login NICHT wiederholen) ===")
+            client.list_files()
+            logger.info("Doppel-Aufruf-Test abgeschlossen.")
+            return
 
-    try:
         if args.list_only:
             files = client.list_files()
             print(json.dumps(files, indent=2, ensure_ascii=False))
@@ -336,7 +417,7 @@ def main():
                 f.write(content)
             logger.info("Datei gespeichert: %s (%d Bytes)", out_path, len(content))
     except CupraLoginError as e:
-        logger.error("Datenabruf fehlgeschlagen: %s", e)
+        logger.error("Fehler: %s", e)
         sys.exit(1)
 
 
