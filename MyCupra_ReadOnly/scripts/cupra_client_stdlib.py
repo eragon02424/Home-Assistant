@@ -53,7 +53,20 @@ USER_AGENT = (
 
 
 class CupraLoginError(Exception):
-    """Wird bei fehlgeschlagenem Login ausgelöst (z.B. falsches Passwort)."""
+    """Basis-Fehlerklasse. Wird bei fehlgeschlagenem Login oder Datenabruf ausgelöst."""
+
+
+class CupraRetryableError(CupraLoginError):
+    """Fehler, bei denen ein erneuter Versuch sinnvoll sein kann:
+    Netzwerkprobleme (kurzer Internetausfall) oder ein vom Server abgelehnter/
+    abgelaufener Token (HTTP 401), der durch einen frischen Login behoben wird."""
+
+
+class CupraPermanentError(CupraLoginError):
+    """Fehler, bei denen ein erneuter Versuch garantiert wieder fehlschlägt:
+    falsches Passwort, falsche VIN, ungültiger Anfrage-Identifier. Hier soll
+    sofort und klar abgebrochen werden, statt wiederholt zu versuchen (würde
+    nur Zeit verschwenden und könnte wie ein Brute-Force-Versuch wirken)."""
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -73,6 +86,11 @@ class CupraClient:
     # Timeout pro einzelnem HTTP-Request. Verhindert, dass das Skript bei
     # Netzwerkproblemen (z.B. Server antwortet gar nicht) endlos hängen bleibt.
     REQUEST_TIMEOUT_SECONDS = 15
+
+    # Retry-Verhalten bei vorübergehenden Fehlern (Netzwerk, abgelehnter Token).
+    # Bei dauerhaften Fehlern (falsches Passwort, falsche VIN) wird NIE wiederholt.
+    MAX_RETRIES = 3
+    RETRY_DELAY_SECONDS = 5
 
     def __init__(self, email: str, password: str, vin: str,
                  request_identifier: str = DEFAULT_REQUEST_IDENTIFIER):
@@ -124,15 +142,17 @@ class CupraClient:
             content = e.read()
             if status in (301, 302, 303, 307, 308) or allow_404:
                 return status, resp_headers, content
-            raise CupraLoginError(
-                f"HTTP {status} bei {url}: {content[:300].decode('utf-8', errors='replace')}"
-            )
+            error_text = content[:300].decode('utf-8', errors='replace')
+            if status == 401:
+                # Token vom Server abgelehnt/invalidiert - ein erneuter Login
+                # behebt das typischerweise, daher retry-fähig.
+                raise CupraRetryableError(f"HTTP 401 bei {url} (Token ungültig): {error_text}")
+            raise CupraLoginError(f"HTTP {status} bei {url}: {error_text}")
         except urllib.error.URLError as e:
             # Netzwerkfehler ohne HTTP-Antwort: DNS-Fehler, Verbindung abgelehnt,
-            # Timeout, kein Internet etc. Wichtig für Langzeitbetrieb (Router-Neustart,
-            # kurzer Internetausfall) - soll als klare, behandelbare Ausnahme ankommen,
-            # nicht als unbehandelter Absturz.
-            raise CupraLoginError(f"Netzwerkfehler bei {url}: {e.reason}")
+            # Timeout, kein Internet etc. Retry-fähig, da sich solche Probleme oft
+            # innerhalb von Sekunden bis Minuten selbst beheben (z.B. Router-Neustart).
+            raise CupraRetryableError(f"Netzwerkfehler bei {url}: {e.reason}")
 
     # ------------------------------------------------------------------
     # Hilfsfunktionen zum Extrahieren von CSRF/HMAC/relayState aus HTML
@@ -201,6 +221,35 @@ class CupraClient:
             return
         logger.debug("Kein gültiger Token vorhanden, Login wird durchgeführt.")
         self.login()
+
+    def _with_retry(self, func, *args, **kwargs):
+        """Führt func aus und versucht es bei CupraRetryableError (Netzwerkfehler,
+        abgelehnter/abgelaufener Token) bis zu MAX_RETRIES mal erneut, jeweils mit
+        kurzer Wartezeit dazwischen. Vor jedem Retry wird der Token verworfen, damit
+        ensure_logged_in() beim nächsten Versuch sicher neu einloggt.
+
+        CupraPermanentError (falsches Passwort, falsche VIN, ungültiger Identifier)
+        wird NICHT wiederholt, da ein erneuter Versuch garantiert wieder fehlschlägt -
+        hier soll sofort und klar abgebrochen werden."""
+        last_error = None
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                return func(*args, **kwargs)
+            except CupraPermanentError:
+                raise
+            except CupraRetryableError as e:
+                last_error = e
+                if attempt < self.MAX_RETRIES:
+                    logger.warning(
+                        "Versuch %d/%d fehlgeschlagen (%s) - erneuter Versuch in %ds, "
+                        "Token wird dafür verworfen.",
+                        attempt, self.MAX_RETRIES, e, self.RETRY_DELAY_SECONDS,
+                    )
+                    self._token_expires_at = None  # Erzwingt frischen Login beim Retry
+                    time.sleep(self.RETRY_DELAY_SECONDS)
+                else:
+                    logger.error("Alle %d Versuche fehlgeschlagen.", self.MAX_RETRIES)
+        raise last_error
 
     # ------------------------------------------------------------------
     # Login-Flow, Schritt für Schritt - exakt wie im Browser nachgebildet
@@ -278,7 +327,7 @@ class CupraClient:
             if "error=" in location:
                 error_match = re.search(r"error=([\w.]+)", location)
                 error_code = error_match.group(1) if error_match else "unbekannt"
-                raise CupraLoginError(f"Login abgelehnt: {error_code}")
+                raise CupraPermanentError(f"Login abgelehnt: {error_code}")
             raise CupraLoginError(f"Unerwarteter 303-Redirect ohne Fehler-Code: {location}")
         if status != 302:
             raise CupraLoginError(f"Passwort-Schritt fehlgeschlagen: HTTP {status}")
@@ -342,20 +391,36 @@ class CupraClient:
     # ------------------------------------------------------------------
     def list_files(self) -> list:
         """Liefert die Liste der verfügbaren Dateien für die Home-Assistant-Anfrage.
-        Loggt automatisch (erneut) ein, falls kein gültiger Token vorhanden ist."""
+        Loggt automatisch (erneut) ein, falls kein gültiger Token vorhanden ist.
+        Versucht es bei vorübergehenden Fehlern (Netzwerk, abgelehnter Token)
+        automatisch bis zu MAX_RETRIES mal erneut."""
+        return self._with_retry(self._list_files_once)
+
+    def _list_files_once(self) -> list:
         self.ensure_logged_in()
         url = (
             f"{PORTAL_BASE}/proxy_api/euda-apim/datadelivery/vehicles/"
             f"{self.vin}/{self.request_identifier}/list"
         )
         status, headers, body = self._request("GET", url, headers={"type": "partial"})
+        if status == 400:
+            # 400 bedeutet i.d.R. ungültige VIN oder ungültiger Identifier -
+            # ein erneuter Versuch würde garantiert wieder fehlschlagen.
+            raise CupraPermanentError(
+                f"Datei-Liste konnte nicht geladen werden (VIN/Identifier prüfen): "
+                f"{body[:300].decode('utf-8', errors='replace')}"
+            )
         if status != 200:
             raise CupraLoginError(f"Datei-Liste konnte nicht geladen werden: HTTP {status}")
         return json.loads(body)
 
     def download_latest(self):
-        """Lädt die neueste verfügbare ZIP-Datei herunter. Gibt (bytes, filename) zurück."""
-        files = self.list_files()
+        """Lädt die neueste verfügbare ZIP-Datei herunter. Gibt (bytes, filename) zurück.
+        Versucht es bei vorübergehenden Fehlern automatisch bis zu MAX_RETRIES mal erneut."""
+        return self._with_retry(self._download_latest_once)
+
+    def _download_latest_once(self):
+        files = self._list_files_once()
         if not files:
             raise CupraLoginError("Keine Dateien in der Liste verfügbar.")
         files_sorted = sorted(files, key=lambda f: f["createdOn"], reverse=True)
