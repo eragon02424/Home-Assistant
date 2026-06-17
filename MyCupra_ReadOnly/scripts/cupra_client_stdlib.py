@@ -14,7 +14,6 @@ Verwendung:
 Optional:
     --output /pfad/zur/datei.zip   (Standard: aktuelles Verzeichnis)
     --list-only                    (nur die Liste der verfügbaren Dateien zeigen, nichts laden)
-    --double-call                  (Testmodus: prüft Token-Wiederverwendung)
     --debug                        (ausführliche Log-Ausgaben)
 """
 
@@ -388,6 +387,10 @@ def main():
     parser.add_argument("--double-call", action="store_true",
                         help="Testmodus: list_files() zweimal aufrufen, um zu prüfen ob "
                              "der zweite Aufruf den Login-Schritt überspringt (Token-Reuse-Test)")
+    parser.add_argument("--request-id", default=DEFAULT_REQUEST_IDENTIFIER,
+                        help="Identifier der Daueranfrage im Portal (Standard: die bekannte "
+                             "'Home Assistant'-Anfrage). Zum Testen mit einer ungültigen ID "
+                             "überschreibbar.")
     parser.add_argument("--debug", action="store_true", help="Ausführliche Log-Ausgaben")
     args = parser.parse_args()
 
@@ -396,7 +399,8 @@ def main():
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    client = CupraClient(email=args.email, password=args.password, vin=args.vin)
+    client = CupraClient(email=args.email, password=args.password, vin=args.vin,
+                         request_identifier=args.request_id)
 
     try:
         if args.double_call:
