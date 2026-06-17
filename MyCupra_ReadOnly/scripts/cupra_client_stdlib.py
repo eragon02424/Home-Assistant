@@ -168,6 +168,8 @@ class CupraClient:
         }
         url = f"{IDENTITY_BASE}/oidc/v1/authorize?{urllib.parse.urlencode(authorize_params)}"
         status, headers, _ = self._request("GET", url)
+        logger.debug("Authorize Antwort-Status: %s", status)
+        logger.debug("Authorize Antwort-Header: %s", dict(headers.items()))
         if status != 302:
             raise CupraLoginError(f"Authorize fehlgeschlagen: HTTP {status}")
         signin_url = headers["Location"]
