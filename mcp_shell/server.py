@@ -114,4 +114,4 @@ app = mcp.streamable_http_app()
 app.add_middleware(TokenAuthMiddleware)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8766)
+    uvicorn.run(app, host="0.0.0.0", port=8767)
