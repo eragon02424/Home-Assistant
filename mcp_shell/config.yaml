@@ -12,7 +12,7 @@ arch:
 startup: services
 boot: auto
 ports:
-  8766/tcp: 8766
+  8767/tcp: 8767
 options: {}
 schema: {}
 map:
