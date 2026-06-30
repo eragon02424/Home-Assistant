@@ -11,22 +11,18 @@ from job_manager import JobManager
 _LOGGER = logging.getLogger("mcp_esphome.api")
 
 
-def _check_auth(request: web.Request) -> bool:
-    expected = request.app.get("bearer_token", "")
-    if not expected:
-        return True  # no auth configured
-    auth_header = request.headers.get("Authorization", "")
-    return auth_header == f"Bearer {expected}"
-
-
 def setup_routes(app: web.Application):
     device_manager = app["device_manager"]
     job_manager = JobManager(device_manager.esphome_dashboard_url)
     app["job_manager"] = job_manager
+    bearer_token = app.get("bearer_token", "")
 
+    @web.middleware
     async def auth_middleware(request, handler):
-        if not _check_auth(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
+        if bearer_token:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header != f"Bearer {bearer_token}":
+                return web.json_response({"error": "unauthorized"}, status=401)
         return await handler(request)
 
     app.middlewares.append(auth_middleware)
