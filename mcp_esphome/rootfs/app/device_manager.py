@@ -2,13 +2,18 @@
 
 Uses aioesphomeapi for native communication with ESPHome devices.
 Maintains:
-- A list of known devices (auto-discovered)
+- A list of known devices (auto-discovered via the ESPHome dashboard's /devices endpoint)
 - A 24h rolling log buffer per device
 - A 30-day heartbeat (connect/disconnect) history per device
+
+Noise encryption keys are read directly from each device's YAML config
+(api.encryption.key), which is where ESPHome puts them by default -
+NOT from secrets.yaml (which only holds wifi credentials in this setup).
 """
 import asyncio
 import json
 import logging
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -26,13 +31,24 @@ except ImportError:
 _LOGGER = logging.getLogger("mcp_esphome.device_manager")
 
 STORAGE_DIR = Path("/data/mcp_esphome")
+ESPHOME_CONFIG_DIR = Path("/config/esphome")
 DISCOVERY_INTERVAL_SECONDS = 60
+
+# Matches:
+# api:
+#   encryption:
+#     key: "....."
+_NOISE_KEY_RE = re.compile(
+    r"api:\s*\n(?:.*\n)*?\s*encryption:\s*\n\s*key:\s*[\"']?([A-Za-z0-9+/=]+)[\"']?",
+)
 
 
 @dataclass
 class DeviceState:
     name: str
     address: str
+    configuration_file: str = ""
+    noise_psk: Optional[str] = None
     online: bool = False
     last_seen: Optional[float] = None
     last_disconnect: Optional[float] = None
@@ -84,6 +100,30 @@ class DeviceManager:
         cutoff = time.time() - self.heartbeat_retention_seconds
         device.heartbeat_events = [e for e in device.heartbeat_events if e[0] >= cutoff]
 
+    # ── Noise PSK extraction ─────────────────────────────────────
+
+    def _read_noise_psk(self, configuration_file: str) -> Optional[str]:
+        """Read the Noise encryption key directly from the device's YAML file.
+
+        ESPHome puts this under api.encryption.key by default - it is NOT
+        moved to secrets.yaml automatically. We read it with a regex instead
+        of a full YAML parser to avoid choking on ESPHome's custom YAML tags
+        (!secret, !lambda, etc.) that a plain yaml.safe_load() can't handle.
+        """
+        if not configuration_file:
+            return None
+        path = ESPHOME_CONFIG_DIR / configuration_file
+        try:
+            content = path.read_text(encoding="utf-8")
+        except Exception as err:
+            _LOGGER.debug("Could not read %s for noise key: %s", path, err)
+            return None
+
+        match = _NOISE_KEY_RE.search(content)
+        if match:
+            return match.group(1)
+        return None
+
     # ── Discovery ────────────────────────────────────────────────
 
     async def run_discovery_loop(self):
@@ -109,14 +149,14 @@ class DeviceManager:
             return
 
         configured = data.get("configured", []) if isinstance(data, dict) else []
-        seen_names = set()
 
         for entry in configured:
-            name = entry.get("name") or entry.get("friendly_name")
+            name = entry.get("name")
+            configuration_file = entry.get("configuration", "")
             address = entry.get("address") or f"{name}.local"
+            api_encrypted = entry.get("api_encrypted", False)
             if not name:
                 continue
-            seen_names.add(name)
 
             if name not in self.devices:
                 _LOGGER.info("New device discovered: %s (%s)", name, address)
@@ -124,6 +164,18 @@ class DeviceManager:
 
             device = self.devices[name]
             device.address = address
+            device.configuration_file = configuration_file
+
+            if api_encrypted and device.noise_psk is None:
+                device.noise_psk = self._read_noise_psk(configuration_file)
+                if device.noise_psk:
+                    _LOGGER.debug("Noise PSK loaded for %s", name)
+                else:
+                    _LOGGER.warning(
+                        "Device %s has API encryption enabled but no key found in %s "
+                        "(may be in secrets.yaml or a non-standard location)",
+                        name, configuration_file,
+                    )
 
             if device.connect_task is None or device.connect_task.done():
                 device.connect_task = asyncio.create_task(self._maintain_connection(name))
@@ -143,7 +195,12 @@ class DeviceManager:
 
         while True:
             try:
-                client = APIClient(device.address, 6053, None)
+                client = APIClient(
+                    device.address,
+                    6053,
+                    None,
+                    noise_psk=device.noise_psk,
+                )
                 await client.connect(login=False)
                 device.client = client
                 self._mark_online(device_name)
@@ -216,6 +273,7 @@ class DeviceManager:
                 "address": device.address,
                 "online": device.online,
                 "last_seen": device.last_seen,
+                "has_noise_key": device.noise_psk is not None,
             })
         return result
 
