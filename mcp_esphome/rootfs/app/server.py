@@ -1,7 +1,4 @@
-"""MCP ESPHome - Main server entry point.
-
-Starts the HTTP/MCP-facing API and the background ESPHome connection manager.
-"""
+"""MCP ESPHome - Main server entry point."""
 import asyncio
 import json
 import logging
@@ -39,24 +36,30 @@ async def main():
     port = opts.get("port", 8090)
     log_retention_hours = opts.get("log_retention_hours", 24)
     heartbeat_retention_days = opts.get("heartbeat_retention_days", 30)
+    mqtt_host = opts.get("mqtt_host", "core-mosquitto")
+    mqtt_port = opts.get("mqtt_port", 1883)
+    mqtt_username = opts.get("mqtt_username", "")
+    mqtt_password = opts.get("mqtt_password", "")
 
     _LOGGER.info("=" * 60)
     _LOGGER.info("MCP ESPHome starting")
     _LOGGER.info("Dashboard URL: %s", esphome_dashboard_url)
     _LOGGER.info("Port: %s", port)
-    _LOGGER.info("Log retention: %sh, Heartbeat retention: %sd", log_retention_hours, heartbeat_retention_days)
+    _LOGGER.info("MQTT: %s:%s", mqtt_host, mqtt_port)
     _LOGGER.info("=" * 60)
 
     device_manager = DeviceManager(
         esphome_dashboard_url=esphome_dashboard_url,
         log_retention_hours=log_retention_hours,
         heartbeat_retention_days=heartbeat_retention_days,
+        mqtt_host=mqtt_host,
+        mqtt_port=mqtt_port,
+        mqtt_username=mqtt_username,
+        mqtt_password=mqtt_password,
     )
 
-    # Start background tasks: device discovery + connection management
     asyncio.create_task(device_manager.run_discovery_loop())
 
-    # Setup HTTP API
     app = web.Application()
     app["device_manager"] = device_manager
     app["bearer_token"] = bearer_token
@@ -69,7 +72,6 @@ async def main():
 
     _LOGGER.info("MCP ESPHome API listening on 0.0.0.0:%s", port)
 
-    # Keep running
     while True:
         await asyncio.sleep(3600)
 
