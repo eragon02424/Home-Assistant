@@ -34,6 +34,14 @@ STORAGE_DIR = Path("/data/mcp_esphome")
 ESPHOME_CONFIG_DIR = Path("/config/esphome")
 DISCOVERY_INTERVAL_SECONDS = 60
 
+# How often to ping connected devices and how long to wait for a response.
+# Offline detection time = KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT (max ~18s).
+KEEPALIVE_INTERVAL = 10   # seconds between device_info() pings
+KEEPALIVE_TIMEOUT  = 8    # seconds to wait for a ping response before marking offline
+
+# Reconnect interval for devices that are offline / sleeping.
+RECONNECT_INTERVAL = 15   # seconds between reconnect attempts
+
 # Matches:
 # api:
 #   encryption:
@@ -103,13 +111,6 @@ class DeviceManager:
     # ── Noise PSK extraction ─────────────────────────────────────
 
     def _read_noise_psk(self, configuration_file: str) -> Optional[str]:
-        """Read the Noise encryption key directly from the device's YAML file.
-
-        ESPHome puts this under api.encryption.key by default - it is NOT
-        moved to secrets.yaml automatically. We read it with a regex instead
-        of a full YAML parser to avoid choking on ESPHome's custom YAML tags
-        (!secret, !lambda, etc.) that a plain yaml.safe_load() can't handle.
-        """
         if not configuration_file:
             return None
         path = ESPHOME_CONFIG_DIR / configuration_file
@@ -118,7 +119,6 @@ class DeviceManager:
         except Exception as err:
             _LOGGER.debug("Could not read %s for noise key: %s", path, err)
             return None
-
         match = _NOISE_KEY_RE.search(content)
         if match:
             return match.group(1)
@@ -127,7 +127,6 @@ class DeviceManager:
     # ── Discovery ────────────────────────────────────────────────
 
     async def run_discovery_loop(self):
-        """Periodically discover ESPHome devices from the dashboard and ensure connections."""
         while True:
             try:
                 await self._discover_devices()
@@ -136,7 +135,6 @@ class DeviceManager:
             await asyncio.sleep(DISCOVERY_INTERVAL_SECONDS)
 
     async def _discover_devices(self):
-        """Query the ESPHome dashboard for known devices and ensure we have connections."""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(f"{self.esphome_dashboard_url}/devices", timeout=10) as resp:
@@ -172,21 +170,27 @@ class DeviceManager:
                     _LOGGER.debug("Noise PSK loaded for %s", name)
                 else:
                     _LOGGER.warning(
-                        "Device %s has API encryption enabled but no key found in %s "
-                        "(may be in secrets.yaml or a non-standard location)",
+                        "Device %s has API encryption enabled but no key found in %s",
                         name, configuration_file,
                     )
 
             if device.connect_task is None or device.connect_task.done():
                 device.connect_task = asyncio.create_task(self._maintain_connection(name))
 
-        # Note: devices that disappear from dashboard config are NOT removed automatically
-        # (heartbeat history should persist). They'll just show as long-offline.
-
     # ── Connection + Logs ────────────────────────────────────────
 
     async def _maintain_connection(self, device_name: str):
-        """Keep a persistent connection to a device, handling reconnects for sleepy devices."""
+        """Keep a persistent connection to a device.
+
+        Online devices are pinged every KEEPALIVE_INTERVAL seconds with a
+        device_info() call that has a hard KEEPALIVE_TIMEOUT.  This means
+        offline detection takes at most KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT
+        (~18 s) instead of the OS TCP timeout (~4-5 min).
+
+        Offline / sleeping devices are retried every RECONNECT_INTERVAL seconds.
+        Deep-sleep devices connect themselves when they wake up - the reconnect
+        loop catches them quickly without needing any special handling.
+        """
         if APIClient is None:
             _LOGGER.error("aioesphomeapi not available, cannot connect to %s", device_name)
             return
@@ -207,12 +211,16 @@ class DeviceManager:
 
                 client.subscribe_logs(lambda msg, dn=device_name: self._on_log_message(dn, msg))
 
-                # Wait until disconnected
+                # Keep-alive loop: ping every 10s, timeout after 8s
                 while device.client is not None:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(KEEPALIVE_INTERVAL)
                     try:
-                        await client.device_info()
+                        await asyncio.wait_for(
+                            client.device_info(),
+                            timeout=KEEPALIVE_TIMEOUT,
+                        )
                     except Exception:
+                        # Ping failed or timed out → device is gone
                         break
 
             except APIConnectionError:
@@ -222,7 +230,7 @@ class DeviceManager:
 
             self._mark_offline(device_name)
             device.client = None
-            await asyncio.sleep(15)  # retry interval for sleepy/offline devices
+            await asyncio.sleep(RECONNECT_INTERVAL)
 
     def _on_log_message(self, device_name: str, msg):
         device = self.devices.get(device_name)
