@@ -1,24 +1,17 @@
 """
-MCP Shell Server for Home Assistant v2.2.0
+MCP Shell Server for Home Assistant v2.3.0
 Provides execute_command tool for running shell commands via SSH on the real
-Home Assistant host (Advanced SSH & Web Terminal add-on), giving access to
-the `ha` CLI, `docker`, and the full host filesystem — exactly as if the
-user typed the command themselves over SSH.
+Home Assistant host (Advanced SSH & Web Terminal add-on).
 
-Authentication to clients: Bearer token (same pattern as before).
-Authentication to the HA host: SSH key-based auth (no password used).
-
-Logging:
-  INFO  — every command sent + result summary (exit code, first line of output)
-  WARNING — SSH reconnects, auth failures
-  ERROR — exceptions, timeouts, connection failures
-  (uvicorn HTTP noise is suppressed to WARNING level)
+Log format per Befehl:
+  Anfrage: <workdir> $ <cmd>
+  Antwort: OK (rc=0) | <stdout-preview>
+  Antwort: FEHLER (rc=N) | <stdout> | <stderr>
 """
 
 import asyncio
 import logging
 import os
-import textwrap
 
 import asyncssh
 from mcp.server.fastmcp import FastMCP
@@ -28,7 +21,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 import uvicorn
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+# ── Logging setup ────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,15 +30,20 @@ logging.basicConfig(
 )
 log = logging.getLogger("mcp_shell")
 
-# Suppress uvicorn access log spam (every HTTP request) — keep uvicorn errors
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
-logging.getLogger("asyncssh").setLevel(logging.WARNING)
+# Unterdrücke ganzen Framework-/HTTP-Spam
+for _noisy in (
+    "uvicorn.access",
+    "uvicorn.error",
+    "asyncssh",
+    "mcp",           # FastMCP "Processing request of type ..." noise
+    "mcp.server",
+    "mcp.server.fastmcp",
+):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # ── Config from environment ───────────────────────────────────────────────────
 
 TOKEN = os.environ.get("MCP_TOKEN", "")
-
 SSH_HOST = os.environ.get("SSH_HOST", "127.0.0.1")
 SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
 SSH_USER = os.environ.get("SSH_USER", "")
@@ -54,7 +52,7 @@ SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", "/data/ssh_key/mcp_shell_key")
 log.info("Token auth: %s", "enabled" if TOKEN else "disabled")
 log.info("SSH target: %s@%s:%s", SSH_USER, SSH_HOST, SSH_PORT)
 
-# ── Persistent SSH connection (reconnect on failure) ──────────────────────────
+# ── SSH connection (persistent, auto-reconnect) ──────────────────────────────
 
 _ssh_conn = None
 _ssh_lock = asyncio.Lock()
@@ -65,7 +63,7 @@ async def _get_connection():
     async with _ssh_lock:
         if _ssh_conn is not None and not _ssh_conn.is_closed():
             return _ssh_conn
-        log.warning("SSH: (re)connecting to %s@%s:%s", SSH_USER, SSH_HOST, SSH_PORT)
+        log.warning("SSH: Verbindungsaufbau zu %s@%s:%s ...", SSH_USER, SSH_HOST, SSH_PORT)
         _ssh_conn = await asyncssh.connect(
             host=SSH_HOST,
             port=SSH_PORT,
@@ -73,7 +71,7 @@ async def _get_connection():
             client_keys=[SSH_KEY_PATH],
             known_hosts=None,
         )
-        log.info("SSH: connected")
+        log.info("SSH: Verbunden")
         return _ssh_conn
 
 
@@ -82,13 +80,10 @@ async def _get_connection():
 mcp = FastMCP(
     name="MCP Shell",
     instructions=(
-        "Real SSH terminal access to the Home Assistant host (same as the "
-        "Advanced SSH & Web Terminal add-on). Use execute_command to run any "
-        "bash command, including `ha`, `docker`, and access to /addons, "
-        "/share, /homeassistant and the rest of the host filesystem. "
-        "Working directory defaults to /homeassistant (= /config). "
-        "SUPERVISOR_TOKEN is exported automatically so `ha` CLI commands "
-        "work without extra setup."
+        "Real SSH terminal access to the Home Assistant host. "
+        "Use execute_command to run any bash command including `ha`, `docker`. "
+        "Working directory defaults to /homeassistant (same as /config). "
+        "SUPERVISOR_TOKEN is exported automatically."
     ),
 )
 
@@ -96,15 +91,19 @@ mcp.settings.transport_security = TransportSecuritySettings(
     enable_dns_rebinding_protection=False
 )
 
-# ── Tools ─────────────────────────────────────────────────────────────────────
+# ── Helper ──────────────────────────────────────────────────────────────────────
 
-def _truncate(text: str, max_chars: int = 200) -> str:
-    """Return first line(s) up to max_chars for log output."""
-    preview = text.strip()[:max_chars]
-    if len(text.strip()) > max_chars:
-        preview += " …"
-    return preview
+def _preview(text: str, max_chars: int = 300) -> str:
+    """Erste max_chars Zeichen, mehrzeilig erhalten, mit Ellipse wenn gekürzt."""
+    t = text.strip()
+    if not t:
+        return "(leer)"
+    if len(t) <= max_chars:
+        return t
+    return t[:max_chars] + " …"
 
+
+# ── Tool ───────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 async def execute_command(
@@ -113,8 +112,7 @@ async def execute_command(
     timeout: int = 60,
 ) -> dict:
     """
-    Execute a shell command on the Home Assistant host via SSH — identical
-    to running it yourself in the Advanced SSH & Web Terminal add-on.
+    Execute a shell command on the Home Assistant host via SSH.
 
     Args:
         cmd:     The bash command to run (e.g. 'ha apps reload', 'docker ps')
@@ -123,7 +121,7 @@ async def execute_command(
     """
     timeout = min(timeout, 300)
 
-    log.info("CMD  [%s] %s", workdir, cmd)
+    log.info("Anfrage: %s $ %s", workdir, cmd)
 
     full_cmd = (
         f"cd {workdir!r} && "
@@ -138,29 +136,23 @@ async def execute_command(
                 conn.run(full_cmd, check=False), timeout=timeout
             )
         except asyncio.TimeoutError:
-            log.error("TIMEOUT after %ss | CMD: %s", timeout, cmd)
-            return {
-                "success": False,
-                "error": f"Command timed out after {timeout}s",
-                "cmd": cmd,
-            }
+            log.error("Antwort: TIMEOUT nach %ss", timeout)
+            return {"success": False, "error": f"Command timed out after {timeout}s", "cmd": cmd}
 
         stdout = result.stdout or ""
         stderr = result.stderr or ""
         rc = result.exit_status
 
         if rc == 0:
-            log.info(
-                "OK   rc=0 | stdout: %s%s",
-                _truncate(stdout),
-                f" | stderr: {_truncate(stderr)}" if stderr.strip() else "",
-            )
+            out_preview = _preview(stdout)
+            if stderr.strip():
+                log.info("Antwort: OK (rc=0)\n  stdout: %s\n  stderr: %s", out_preview, _preview(stderr))
+            else:
+                log.info("Antwort: OK (rc=0)\n  stdout: %s", out_preview)
         else:
             log.warning(
-                "FAIL rc=%s | stdout: %s | stderr: %s",
-                rc,
-                _truncate(stdout),
-                _truncate(stderr),
+                "Antwort: FEHLER (rc=%s)\n  stdout: %s\n  stderr: %s",
+                rc, _preview(stdout), _preview(stderr),
             )
 
         return {
@@ -176,19 +168,11 @@ async def execute_command(
         global _ssh_conn
         async with _ssh_lock:
             _ssh_conn = None
-        log.error("SSH error: %s | CMD: %s", e, cmd)
-        return {
-            "success": False,
-            "error": f"SSH error: {e}",
-            "cmd": cmd,
-        }
+        log.error("Antwort: SSH-Fehler: %s", e)
+        return {"success": False, "error": f"SSH error: {e}", "cmd": cmd}
     except Exception as e:
-        log.error("Unexpected error: %s | CMD: %s", e, cmd)
-        return {
-            "success": False,
-            "error": str(e),
-            "cmd": cmd,
-        }
+        log.error("Antwort: Unerwarteter Fehler: %s", e)
+        return {"success": False, "error": str(e), "cmd": cmd}
 
 
 # ── Token auth middleware ─────────────────────────────────────────────────────
@@ -211,9 +195,4 @@ app = mcp.streamable_http_app()
 app.add_middleware(TokenAuthMiddleware)
 
 if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8767,
-        log_level="warning",  # suppress uvicorn access log noise
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8767, log_level="warning")
