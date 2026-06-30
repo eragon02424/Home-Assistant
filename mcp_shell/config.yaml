@@ -1,6 +1,6 @@
 name: "MCP Shell"
 description: "MCP Server for executing shell commands on the Home Assistant host"
-version: "2.0.0"
+version: "2.0.1"
 slug: "mcp_shell"
 init: false
 arch:
@@ -11,6 +11,7 @@ arch:
   - i386
 startup: services
 boot: auto
+host_network: true
 ports:
   8767/tcp: 8767
 options: {}
