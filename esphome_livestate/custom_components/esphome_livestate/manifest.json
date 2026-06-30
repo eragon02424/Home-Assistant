@@ -1,0 +1,11 @@
+{
+  "domain": "esphome_livestate",
+  "name": "ESPHome LiveState",
+  "version": "0.1.0",
+  "documentation": "https://github.com/eragon02424/Home-Assistant",
+  "dependencies": [],
+  "codeowners": [],
+  "config_flow": true,
+  "iot_class": "local_polling",
+  "requirements": []
+}
