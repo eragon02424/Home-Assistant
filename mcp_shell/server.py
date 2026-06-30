@@ -1,9 +1,9 @@
 """
-MCP Shell Server for Home Assistant v2.0.0
+MCP Shell Server for Home Assistant v2.1.0
 Provides execute_command tool for running shell commands via SSH on the real
 Home Assistant host (Advanced SSH & Web Terminal add-on), giving access to
-the `ha` CLI, `docker`, and the full host filesystem (/addons, /share, etc.)
-— exactly as if the user typed the command themselves over SSH.
+the `ha` CLI, `docker`, and the full host filesystem — exactly as if the
+user typed the command themselves over SSH.
 
 Authentication to clients: Bearer token (same pattern as before).
 Authentication to the HA host: SSH key-based auth (no password used).
@@ -62,7 +62,8 @@ mcp = FastMCP(
         "Advanced SSH & Web Terminal add-on). Use execute_command to run any "
         "bash command, including `ha`, `docker`, and access to /addons, "
         "/share, /config and the rest of the host filesystem. "
-        "Working directory defaults to /config."
+        "Working directory defaults to /config. SUPERVISOR_TOKEN is exported "
+        "automatically so `ha` CLI commands work without extra setup."
     ),
 )
 
@@ -88,7 +89,15 @@ async def execute_command(
         timeout: Max seconds to wait for completion (default: 60, max: 300)
     """
     timeout = min(timeout, 300)
-    full_cmd = f"cd {workdir!r} && {cmd}"
+    # Non-interactive SSH sessions don't source /etc/profile.d/, so the
+    # SUPERVISOR_TOKEN that `ha` needs isn't in scope by default. Re-export
+    # it from the login profile before running the actual command so `ha`
+    # works out of the box.
+    full_cmd = (
+        f"cd {workdir!r} && "
+        f"export SUPERVISOR_TOKEN=$(grep -h SUPERVISOR_TOKEN /etc/profile.d/*.sh 2>/dev/null "
+        f"| head -1 | cut -d'\"' -f2); {cmd}"
+    )
 
     try:
         conn = await _get_connection()
