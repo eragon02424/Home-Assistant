@@ -1,0 +1,25 @@
+name: "MCP ESPHome"
+description: "Vermittler-Service zwischen Claude und ESPHome-Geräten via native API. Compile, Flash, Logs, Device-Discovery, Online/Offline-Heartbeat-Historie."
+version: "0.1.0"
+slug: "mcp_esphome"
+init: false
+arch:
+  - aarch64
+  - amd64
+startup: services
+boot: auto
+map:
+  - config:rw
+  - addon_config:rw
+options:
+  esphome_dashboard_url: "http://localhost:6052"
+  bearer_token: ""
+  port: 8090
+  log_retention_hours: 24
+  heartbeat_retention_days: 30
+schema:
+  esphome_dashboard_url: str
+  bearer_token: str
+  port: int
+  log_retention_hours: int
+  heartbeat_retention_days: int
