@@ -1,6 +1,6 @@
 name: "MCP ESPHome"
 description: "Vermittler-Service zwischen Claude und ESPHome-Geräten via native API. Compile, Flash, Logs, Device-Discovery, Online/Offline-Heartbeat-Historie."
-version: "0.1.1"
+version: "0.1.2"
 slug: "mcp_esphome"
 init: false
 arch:
