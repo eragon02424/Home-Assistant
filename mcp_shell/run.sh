@@ -25,7 +25,7 @@ export SSH_PORT="${SSH_PORT:-22}"
 export SSH_USER="${SSH_USER:-eragon02424}"
 export SSH_KEY_PATH="$KEY_FILE"
 
-bashio::log.info "Starting MCP Shell v2.0.0 (SSH mode) on port 8767..."
+bashio::log.info "Starting MCP Shell v2.2.0 (SSH mode) on port 8767..."
 bashio::log.info "SSH target: ${SSH_USER}@${SSH_HOST}:${SSH_PORT}"
 
 exec python3 /server.py
