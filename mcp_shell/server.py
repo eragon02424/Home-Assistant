@@ -1,12 +1,18 @@
 """
-MCP Shell Server for Home Assistant v1.0.0
-Provides execute_command tool for running arbitrary shell commands.
-Authentication via Bearer token (same pattern as mcp_file_server).
+MCP Shell Server for Home Assistant v2.0.0
+Provides execute_command tool for running shell commands via SSH on the real
+Home Assistant host (Advanced SSH & Web Terminal add-on), giving access to
+the `ha` CLI, `docker`, and the full host filesystem (/addons, /share, etc.)
+— exactly as if the user typed the command themselves over SSH.
+
+Authentication to clients: Bearer token (same pattern as before).
+Authentication to the HA host: SSH key-based auth (no password used).
 """
 
 import asyncio
 import os
 
+import asyncssh
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -18,16 +24,44 @@ import uvicorn
 
 TOKEN = os.environ.get("MCP_TOKEN", "")
 
+SSH_HOST = os.environ.get("SSH_HOST", "127.0.0.1")
+SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
+SSH_USER = os.environ.get("SSH_USER", "")
+SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", "/data/ssh_key/mcp_shell_key")
+
 print(f"[MCP Shell] Token auth: {'enabled' if TOKEN else 'disabled'}")
+print(f"[MCP Shell] SSH target: {SSH_USER}@{SSH_HOST}:{SSH_PORT}")
+
+# ── Persistent SSH connection (reconnect on failure) ──────────────────────────
+
+_ssh_conn = None
+_ssh_lock = asyncio.Lock()
+
+
+async def _get_connection():
+    global _ssh_conn
+    async with _ssh_lock:
+        if _ssh_conn is not None and not _ssh_conn.is_closed():
+            return _ssh_conn
+        _ssh_conn = await asyncssh.connect(
+            host=SSH_HOST,
+            port=SSH_PORT,
+            username=SSH_USER,
+            client_keys=[SSH_KEY_PATH],
+            known_hosts=None,  # local trusted host, no host-key pinning needed
+        )
+        return _ssh_conn
+
 
 # ── FastMCP server ────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
     name="MCP Shell",
     instructions=(
-        "Shell access for Home Assistant host. "
-        "Use execute_command to run any bash command. "
-        "stdout and stderr are returned separately. "
+        "Real SSH terminal access to the Home Assistant host (same as the "
+        "Advanced SSH & Web Terminal add-on). Use execute_command to run any "
+        "bash command, including `ha`, `docker`, and access to /addons, "
+        "/share, /config and the rest of the host filesystem. "
         "Working directory defaults to /config."
     ),
 )
@@ -45,48 +79,49 @@ async def execute_command(
     timeout: int = 60,
 ) -> dict:
     """
-    Execute a shell command on the Home Assistant host.
+    Execute a shell command on the Home Assistant host via SSH — identical
+    to running it yourself in the Advanced SSH & Web Terminal add-on.
 
     Args:
-        cmd:     The bash command to run (e.g. 'esphome logs mydevice.yaml')
+        cmd:     The bash command to run (e.g. 'ha apps reload', 'docker ps')
         workdir: Working directory (default: /config)
         timeout: Max seconds to wait for completion (default: 60, max: 300)
     """
     timeout = min(timeout, 300)
+    full_cmd = f"cd {workdir!r} && {cmd}"
 
     try:
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=workdir,
-        )
+        conn = await _get_connection()
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
+            result = await asyncio.wait_for(
+                conn.run(full_cmd, check=False), timeout=timeout
             )
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.communicate()
             return {
                 "success": False,
                 "error": f"Command timed out after {timeout}s",
                 "cmd": cmd,
             }
 
-        stdout = stdout_bytes.decode("utf-8", errors="replace")
-        stderr = stderr_bytes.decode("utf-8", errors="replace")
-        returncode = proc.returncode
-
         return {
-            "success": returncode == 0,
-            "returncode": returncode,
+            "success": result.exit_status == 0,
+            "returncode": result.exit_status,
             "cmd": cmd,
             "workdir": workdir,
-            "stdout": stdout,
-            "stderr": stderr,
+            "stdout": result.stdout or "",
+            "stderr": result.stderr or "",
         }
 
+    except (asyncssh.Error, OSError) as e:
+        # Connection likely stale/dropped — force reconnect on next call
+        global _ssh_conn
+        async with _ssh_lock:
+            _ssh_conn = None
+        return {
+            "success": False,
+            "error": f"SSH error: {e}",
+            "cmd": cmd,
+        }
     except Exception as e:
         return {
             "success": False,
@@ -95,7 +130,7 @@ async def execute_command(
         }
 
 
-# ── Token auth middleware ─────────────────────────────────────────────────────
+# ── Token auth middleware (protects this MCP server from clients) ────────────
 
 class TokenAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
