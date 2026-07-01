@@ -1,2 +1,5 @@
 #!/usr/bin/with-contenv bashio
-exec python3 /usr/bin/mcp_serial_server.py
+
+bashio::log.info "Starting MCP Serial HomeAssistant v1.0.0..."
+
+exec python3 /server.py

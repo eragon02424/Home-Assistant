@@ -14,9 +14,7 @@ startup: services
 boot: auto
 full_access: true
 map:
-  - type: config
-    path: /config
-    read_only: false
+  - config:rw
 options:
   baud_rate: 115200
   ring_buffer_lines: 300
