@@ -1,0 +1,22 @@
+name: MCP Serial HomeAssistant
+version: "1.0.0"
+slug: mcp_serial_homeassistant
+description: Persistent serial port listener for ESP32-S2 (USB-CDC) as MCP server via stdio proxy
+url: https://github.com/eragon02424/Home-Assistant
+arch:
+  - aarch64
+  - amd64
+  - armv7
+startup: services
+boot: auto
+privileged: true
+options:
+  baud_rate: 115200
+  ring_buffer_lines: 300
+  log_retention_hours: 24
+  log_max_size_mb: 20
+schema:
+  baud_rate: int
+  ring_buffer_lines: int
+  log_retention_hours: int
+  log_max_size_mb: int
