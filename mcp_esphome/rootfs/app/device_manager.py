@@ -71,6 +71,7 @@ class DeviceState:
     last_disconnect: Optional[float] = None
     mqtt_discovery_published: bool = False
     first_ping_done: bool = False
+    stagger_done: bool = False        # True after the one-time startup stagger has elapsed
     log_buffer: deque = field(default_factory=lambda: deque(maxlen=5000))
     heartbeat_events: list = field(default_factory=list)
     client: Optional[object] = None
@@ -266,15 +267,18 @@ class DeviceManager:
             if device.connect_task is None or device.connect_task.done():
                 device.connect_task = asyncio.create_task(self._start_reconnect_logic(name))
 
-    # ── Connection via ReconnectLogic (mDNS-triggered + timer fallback) ──
+    # ── Connection via ReconnectLogic + keepalive ─────────────────
 
     async def _start_reconnect_logic(self, device_name: str):
-        """Use aioesphomeapi.ReconnectLogic which listens for mDNS announcements
-        and reconnects immediately when a device comes online, with a timer
-        fallback (keepalive_interval * 3) for devices that don't use mDNS.
+        """Start ReconnectLogic for mDNS-triggered reconnects.
 
-        This replaces the manual asyncio.sleep(RECONNECT_INTERVAL) loop and
-        gives us near-instant online detection instead of waiting up to 30s.
+        Stagger: on the very first on_connect call after service start we wait
+        (ping_index / num_devices) * keepalive_interval seconds before the
+        first ping so that N devices spread their pings evenly across one
+        keepalive window.  Example: 10 devices, 10 s interval → device 0 pings
+        at t=0 s, device 1 at t=1 s, ..., device 9 at t=9 s.  After the
+        stagger has fired once (stagger_done=True) every subsequent on_connect
+        goes straight to the keepalive loop without any extra delay.
         """
         if not HAS_AIOESPHOMEAPI:
             _LOGGER.error("aioesphomeapi not available")
@@ -290,17 +294,21 @@ class DeviceManager:
         )
         device.client = client
 
-        num_devices = max(len(self.devices), 1)
-        stagger_offset = (device.ping_index % num_devices) * (self.keepalive_interval / num_devices)
-
         async def on_connect():
-            """Called by ReconnectLogic when connection is established."""
             _LOGGER.info("Connected to %s", device_name)
             self._mark_online(device_name)
             client.subscribe_logs(lambda msg, dn=device_name: self._on_log_message(dn, msg))
 
-            # First ping: get device info for MAC/model + MQTT discovery
-            await asyncio.sleep(stagger_offset)
+            # One-time startup stagger so pings are spread across the interval.
+            # After the first connect this is skipped on every reconnect.
+            if not device.stagger_done:
+                device.stagger_done = True
+                num_devices = max(len(self.devices), 1)
+                stagger = (device.ping_index % num_devices) * (self.keepalive_interval / num_devices)
+                if stagger > 0:
+                    await asyncio.sleep(stagger)
+
+            # First ping: collect MAC/model and publish MQTT discovery
             try:
                 info = await asyncio.wait_for(client.device_info(), timeout=self.keepalive_timeout)
                 if not device.first_ping_done:
@@ -314,18 +322,17 @@ class DeviceManager:
             except Exception as err:
                 _LOGGER.debug("First ping failed for %s: %s", device_name, err)
 
-            # Keepalive loop — ReconnectLogic handles reconnect on disconnect,
-            # we just need to detect the disconnect via a failing ping
+            # Keepalive loop: ping every keepalive_interval seconds.
+            # A failed ping triggers ReconnectLogic's disconnect path.
             while True:
                 await asyncio.sleep(self.keepalive_interval)
                 try:
                     await asyncio.wait_for(client.device_info(), timeout=self.keepalive_timeout)
                 except Exception:
-                    _LOGGER.debug("Keepalive ping failed for %s, disconnecting", device_name)
+                    _LOGGER.debug("Keepalive ping failed for %s", device_name)
                     break
 
         async def on_disconnect(expected: bool):
-            """Called by ReconnectLogic when connection is lost."""
             _LOGGER.info("Disconnected from %s (expected=%s)", device_name, expected)
             self._mark_offline(device_name)
 
@@ -333,15 +340,11 @@ class DeviceManager:
             client=client,
             on_connect=on_connect,
             on_disconnect=on_disconnect,
-            # zeroconf_instance=None means ReconnectLogic creates its own
-            # This enables mDNS-triggered reconnects automatically
             zeroconf_instance=None,
         )
         device.reconnect_logic = reconnect_logic
 
         await reconnect_logic.start()
-
-        # Keep task alive — ReconnectLogic runs in background
         try:
             while True:
                 await asyncio.sleep(3600)
