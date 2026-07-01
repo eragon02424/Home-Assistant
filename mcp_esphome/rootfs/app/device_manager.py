@@ -1,15 +1,4 @@
-"""Device Manager - handles ESPHome device discovery, connections, logs and heartbeat history.
-
-Uses aioesphomeapi for native communication with ESPHome devices.
-Maintains:
-- A list of known devices (auto-discovered via the ESPHome dashboard's /devices endpoint)
-- A 24h rolling log buffer per device
-- A 30-day heartbeat (connect/disconnect) history per device
-
-Noise encryption keys are read directly from each device's YAML config.
-MQTT Discovery is used to auto-create Online/Offline binary_sensor entities
-in HA, attached to the correct ESP device via MAC address.
-"""
+"""Device Manager - handles ESPHome device discovery, connections, logs and heartbeat history."""
 import asyncio
 import json
 import logging
@@ -23,11 +12,10 @@ from typing import Optional
 import aiohttp
 
 try:
-    from aioesphomeapi import APIClient, APIConnectionError, DeviceInfo
+    from aioesphomeapi import APIClient, APIConnectionError
 except ImportError:
     APIClient = None
     APIConnectionError = Exception
-    DeviceInfo = None
 
 try:
     import aiomqtt
@@ -39,9 +27,6 @@ _LOGGER = logging.getLogger("mcp_esphome.device_manager")
 STORAGE_DIR = Path("/data/mcp_esphome")
 ESPHOME_CONFIG_DIR = Path("/config/esphome")
 DISCOVERY_INTERVAL_SECONDS = 60
-
-KEEPALIVE_INTERVAL = 10
-KEEPALIVE_TIMEOUT  = 8
 RECONNECT_INTERVAL = 15
 
 _NOISE_KEY_RE = re.compile(
@@ -73,6 +58,7 @@ class DeviceManager:
         esphome_dashboard_url: str,
         log_retention_hours: int,
         heartbeat_retention_days: int,
+        keepalive_interval: int = 10,
         mqtt_host: str = "core-mosquitto",
         mqtt_port: int = 1883,
         mqtt_username: str = "",
@@ -81,6 +67,9 @@ class DeviceManager:
         self.esphome_dashboard_url = esphome_dashboard_url.rstrip("/")
         self.log_retention_seconds = log_retention_hours * 3600
         self.heartbeat_retention_seconds = heartbeat_retention_days * 86400
+        self.keepalive_interval = keepalive_interval
+        # Timeout is always 2s less than interval, minimum 3s
+        self.keepalive_timeout = max(keepalive_interval - 2, 3)
         self.mqtt_host = mqtt_host
         self.mqtt_port = mqtt_port
         self.mqtt_username = mqtt_username
@@ -122,7 +111,7 @@ class DeviceManager:
         cutoff = time.time() - self.heartbeat_retention_seconds
         device.heartbeat_events = [e for e in device.heartbeat_events if e[0] >= cutoff]
 
-    # ── Noise PSK ───────────────────────────────────────────────────
+    # ── Noise PSK ───────────────────────────────────────────────
 
     def _read_noise_psk(self, configuration_file: str) -> Optional[str]:
         if not configuration_file:
@@ -141,22 +130,16 @@ class DeviceManager:
     # ── MQTT Discovery ────────────────────────────────────────────
 
     async def _publish_mqtt_discovery(self, device: DeviceState):
-        """Publish MQTT Discovery payload so HA auto-creates the binary_sensor
-        and attaches it to the correct ESP device (matched by MAC address)."""
         if aiomqtt is None:
             _LOGGER.warning("aiomqtt not available, skipping MQTT discovery for %s", device.name)
             return
 
-        # Use MAC as unique identifier if available, otherwise fall back to name
         identifier = device.mac_address.replace(":", "") if device.mac_address else f"esphome_{device.name}"
         unique_id = f"mcp_esphome_{identifier}_online"
         state_topic = f"mcp_esphome/{device.name}/online"
         config_topic = f"homeassistant/binary_sensor/{unique_id}/config"
 
-        device_block: dict = {
-            "name": device.name,
-            "identifiers": [identifier],
-        }
+        device_block: dict = {"name": device.name, "identifiers": [identifier]}
         if device.mac_address:
             device_block["connections"] = [["mac", device.mac_address]]
         if device.model:
@@ -179,25 +162,14 @@ class DeviceManager:
                 username=self.mqtt_username or None,
                 password=self.mqtt_password or None,
             ) as client:
-                # Publish discovery config (retained so HA picks it up after restart)
-                await client.publish(
-                    config_topic,
-                    payload=json.dumps(payload),
-                    retain=True,
-                )
-                # Publish initial state
-                await client.publish(
-                    state_topic,
-                    payload="ON" if device.online else "OFF",
-                    retain=True,
-                )
-            _LOGGER.info("MQTT Discovery published for %s (identifier: %s)", device.name, identifier)
+                await client.publish(config_topic, payload=json.dumps(payload), retain=True)
+                await client.publish(state_topic, payload="ON" if device.online else "OFF", retain=True)
+            _LOGGER.info("MQTT Discovery published for %s", device.name)
             device.mqtt_discovery_published = True
         except Exception as err:
             _LOGGER.error("Failed to publish MQTT discovery for %s: %s", device.name, err)
 
     async def _publish_mqtt_state(self, device: DeviceState, online: bool):
-        """Publish online/offline state update to MQTT."""
         if aiomqtt is None or not device.mqtt_discovery_published:
             return
         state_topic = f"mcp_esphome/{device.name}/online"
@@ -208,11 +180,7 @@ class DeviceManager:
                 username=self.mqtt_username or None,
                 password=self.mqtt_password or None,
             ) as client:
-                await client.publish(
-                    state_topic,
-                    payload="ON" if online else "OFF",
-                    retain=True,
-                )
+                await client.publish(state_topic, payload="ON" if online else "OFF", retain=True)
         except Exception as err:
             _LOGGER.warning("Failed to publish MQTT state for %s: %s", device.name, err)
 
@@ -257,17 +225,13 @@ class DeviceManager:
             device.address = address
             device.configuration_file = configuration_file
 
-            # Pre-fill MAC from dashboard if available (saves one device_info() call)
             if mac_from_dashboard and not device.mac_address:
                 device.mac_address = mac_from_dashboard
 
             if api_encrypted and device.noise_psk is None:
                 device.noise_psk = self._read_noise_psk(configuration_file)
                 if not device.noise_psk:
-                    _LOGGER.warning(
-                        "Device %s has API encryption but no key found in %s",
-                        name, configuration_file,
-                    )
+                    _LOGGER.warning("Device %s has API encryption but no key found in %s", name, configuration_file)
 
             if device.connect_task is None or device.connect_task.done():
                 device.connect_task = asyncio.create_task(self._maintain_connection(name))
@@ -283,12 +247,7 @@ class DeviceManager:
 
         while True:
             try:
-                client = APIClient(
-                    device.address,
-                    6053,
-                    None,
-                    noise_psk=device.noise_psk,
-                )
+                client = APIClient(device.address, 6053, None, noise_psk=device.noise_psk)
                 await client.connect(login=False)
                 device.client = client
                 self._mark_online(device_name)
@@ -297,18 +256,17 @@ class DeviceManager:
 
                 first_ping = True
                 while device.client is not None:
-                    await asyncio.sleep(KEEPALIVE_INTERVAL)
+                    await asyncio.sleep(self.keepalive_interval)
                     try:
                         info = await asyncio.wait_for(
                             client.device_info(),
-                            timeout=KEEPALIVE_TIMEOUT,
+                            timeout=self.keepalive_timeout,
                         )
-                        # On first successful ping: extract device info and publish MQTT discovery
                         if first_ping:
                             first_ping = False
-                            if not device.mac_address and hasattr(info, 'mac_address'):
+                            if not device.mac_address and hasattr(info, "mac_address"):
                                 device.mac_address = info.mac_address
-                            if not device.model and hasattr(info, 'model'):
+                            if not device.model and hasattr(info, "model"):
                                 device.model = info.model
                             if not device.mqtt_discovery_published:
                                 asyncio.create_task(self._publish_mqtt_discovery(device))
@@ -328,9 +286,9 @@ class DeviceManager:
         device = self.devices.get(device_name)
         if not device:
             return
-        line = getattr(msg, 'message', str(msg))
+        line = getattr(msg, "message", str(msg))
         if isinstance(line, bytes):
-            line = line.decode('utf-8', errors='replace')
+            line = line.decode("utf-8", errors="replace")
         device.log_buffer.append((time.time(), line))
         self._mark_online(device_name)
         self._prune_logs(device_name)
@@ -368,17 +326,17 @@ class DeviceManager:
     # ── Public query API ──────────────────────────────────────────
 
     def list_devices(self) -> list[dict]:
-        result = []
-        for name, device in self.devices.items():
-            result.append({
+        return [
+            {
                 "name": name,
                 "address": device.address,
                 "online": device.online,
                 "last_seen": device.last_seen,
                 "has_noise_key": device.noise_psk is not None,
                 "mac_address": device.mac_address,
-            })
-        return result
+            }
+            for name, device in self.devices.items()
+        ]
 
     def get_device_logs(self, device_name: str) -> list[dict]:
         device = self.devices.get(device_name)
@@ -402,7 +360,7 @@ class DeviceManager:
             return []
         events = device.heartbeat_events[-(last_n_cycles * 2):]
         cycles = []
-        current = {}
+        current: dict = {}
         for ts, kind in events:
             if kind == "connected":
                 current = {"connected_at": ts}
