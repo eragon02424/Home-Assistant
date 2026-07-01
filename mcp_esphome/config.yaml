@@ -1,6 +1,6 @@
 name: "MCP ESPHome"
 description: "Vermittler-Service zwischen Claude und ESPHome-Geräten via native API."
-version: "0.3.5"
+version: "0.3.6"
 slug: "mcp_esphome"
 init: false
 arch:
@@ -19,7 +19,8 @@ options:
   log_retention_hours: 24
   heartbeat_retention_days: 30
   keepalive_interval: 10
-  keepalive_retries: 5
+  keepalive_retries: 1
+  keepalive_ping_timeout_ms: 100
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
 schema:
@@ -30,5 +31,6 @@ schema:
   heartbeat_retention_days: int
   keepalive_interval: int
   keepalive_retries: int
+  keepalive_ping_timeout_ms: int
   mqtt_host: str
   mqtt_port: int
