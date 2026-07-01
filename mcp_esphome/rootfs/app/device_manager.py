@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import random
 import re
 import secrets
 import string
@@ -39,18 +40,17 @@ ESPHOME_CONFIG_DIR = Path("/config/esphome")
 DISCOVERY_INTERVAL_SECONDS = 60
 BEARER_TOKEN_FILE = STORAGE_DIR / "bearer_token.txt"
 MDNS_SERVICE_TYPE = "_esphomelib._tcp.local."
-CONNECT_TIMEOUT = 15.0  # increased: aioesphomeapi handshake can take >8s under load
+
+# Max simultaneous connect attempts — prevents Event Loop saturation
+# when many devices start simultaneously at addon boot.
+MAX_CONCURRENT_CONNECTS = 5
+
+# Retry interval for devices that have never been seen (last_seen is None).
+RETRY_NEVER_SEEN_INTERVAL = 30
 
 _NOISE_KEY_RE = re.compile(
     r"api:\s*\n(?:.*\n)*?\s*encryption:\s*\n\s*key:\s*[\"']?([A-Za-z0-9+/=]+)[\"']?",
 )
-
-# How often to retry connecting to offline devices that were never reached at startup.
-# This covers devices that were already online when the addon started but whose
-# mDNS announce arrived before our listener was ready, or whose connect failed
-# transiently. We re-attempt every RETRY_OFFLINE_INTERVAL seconds via the
-# discovery loop for devices that have never been seen (last_seen is None).
-RETRY_NEVER_SEEN_INTERVAL = 30  # seconds between retries for never-seen devices
 
 
 def load_or_generate_bearer_token(configured_token: str) -> str:
@@ -83,7 +83,7 @@ class DeviceState:
     online: bool = False
     last_seen: Optional[float] = None
     last_disconnect: Optional[float] = None
-    last_connect_attempt: Optional[float] = None  # timestamp of last _connect_device call
+    last_connect_attempt: Optional[float] = None
     mqtt_discovery_published: bool = False
     first_ping_done: bool = False
     log_buffer: deque = field(default_factory=lambda: deque(maxlen=5000))
@@ -118,6 +118,8 @@ class DeviceManager:
         self._ping_counter = 0
         self._azeroconf: Optional[object] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Semaphore limits simultaneous connect attempts
+        self._connect_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CONNECTS)
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
         self._load_heartbeat_history()
 
@@ -242,8 +244,7 @@ class DeviceManager:
             api_encrypted = entry.get("api_encrypted", False)
 
             if name not in self.devices:
-                # Truly new device
-                _LOGGER.info("New device discovered: %s @ %s (encrypted=%s)", name, address, api_encrypted)
+                _LOGGER.info("New device discovered: %s @ %s", name, address)
                 device = DeviceState(name=name, address=address, ping_index=self._ping_counter)
                 self._ping_counter += 1
                 self.devices[name] = device
@@ -252,7 +253,10 @@ class DeviceManager:
                 if api_encrypted:
                     device.noise_psk = self._read_noise_psk(configuration_file)
                 device.configuration_file = configuration_file
-                asyncio.create_task(self._connect_device(name, source="dashboard"))
+                # Stagger new device connects with a small random delay
+                # so all devices discovered at boot don't connect simultaneously
+                delay = random.uniform(0, 2)
+                asyncio.create_task(self._connect_with_delay(name, source="dashboard", delay=delay))
             else:
                 device = self.devices[name]
                 device.address = address
@@ -262,10 +266,8 @@ class DeviceManager:
                 if api_encrypted and device.noise_psk is None:
                     device.noise_psk = self._read_noise_psk(configuration_file)
 
-                # Retry connect for devices that were never successfully reached.
-                # This handles the case where the device was already online when the
-                # addon started but the initial connect failed (e.g. Finishing
-                # connection cancelled) and no further mDNS announce arrived.
+                # Retry only for devices never successfully connected,
+                # throttled by RETRY_NEVER_SEEN_INTERVAL
                 if (
                     not device.online
                     and not device.connecting
@@ -278,9 +280,23 @@ class DeviceManager:
                     _LOGGER.info("Retry connect (never seen): %s", name)
                     asyncio.create_task(self._connect_device(name, source="retry"))
 
+    async def _connect_with_delay(self, device_name: str, source: str, delay: float):
+        """Small delay before connecting to spread boot-time connects."""
+        if delay > 0:
+            await asyncio.sleep(delay)
+        await self._connect_device(device_name, source=source)
+
     # ── Connect a device ─────────────────────────────────────────
 
     async def _connect_device(self, device_name: str, source: str):
+        """Attempt one TCP connect for a single device.
+
+        Uses a semaphore to limit simultaneous connects to MAX_CONCURRENT_CONNECTS.
+        This prevents Event Loop saturation when many devices are tried at once.
+        Does NOT use asyncio.wait_for on client.connect() to avoid the
+        'Finishing connection cancelled' error from forceful Task cancellation.
+        aioesphomeapi handles its own internal connect timeout.
+        """
         if not HAS_AIOESPHOMEAPI:
             return
 
@@ -289,7 +305,6 @@ class DeviceManager:
             return
 
         if device.online:
-            _LOGGER.info("Connect [%s] %s skipped: already online", source, device_name)
             return
         if device.connecting:
             _LOGGER.info("Connect [%s] %s skipped: already connecting", source, device_name)
@@ -299,45 +314,49 @@ class DeviceManager:
         device.last_connect_attempt = time.time()
 
         try:
-            _LOGGER.info("Connecting [%s] %s @ %s ...", source, device_name, device.address)
-            client = APIClient(device.address, 6053, None, noise_psk=device.noise_psk)
-            try:
-                await asyncio.wait_for(client.connect(login=False), timeout=CONNECT_TIMEOUT)
-            except Exception as err:
-                _LOGGER.info("Connect failed [%s] %s: %s", source, device_name, err)
-                return
+            async with self._connect_semaphore:
+                if device.online:
+                    return  # became online while waiting for semaphore
 
-            device.client = client
-            _LOGGER.info("ONLINE (%s): %s", source, device_name)
-            self._mark_online(device_name)
-            client.subscribe_logs(lambda msg, dn=device_name: self._on_log_message(dn, msg))
-
-            if not device.first_ping_done:
-                _LOGGER.info("First device_info ping: %s", device_name)
+                _LOGGER.info("Connecting [%s] %s @ %s ...", source, device_name, device.address)
+                client = APIClient(device.address, 6053, None, noise_psk=device.noise_psk)
                 try:
-                    info = await asyncio.wait_for(
-                        client.device_info(), timeout=self.keepalive_ping_timeout
-                    )
-                    device.first_ping_done = True
-                    if not device.mac_address and hasattr(info, "mac_address"):
-                        device.mac_address = info.mac_address
-                    if not device.model and hasattr(info, "model"):
-                        device.model = info.model
-                    _LOGGER.info("Device info OK: %s mac=%s model=%s",
-                                 device_name, device.mac_address, device.model)
-                    if not device.mqtt_discovery_published:
-                        asyncio.create_task(self._publish_mqtt_discovery(device))
+                    # No wait_for here — let aioesphomeapi manage its own timeout
+                    await client.connect(login=False)
                 except Exception as err:
-                    _LOGGER.warning("First device_info failed for %s: %s", device_name, err)
+                    _LOGGER.info("Connect failed [%s] %s: %s", source, device_name, err)
+                    return
 
-            num_devices = max(len(self.devices), 1)
-            stagger = (device.ping_index % num_devices) * (self.keepalive_interval / num_devices)
-            effective_stagger = stagger if source == "dashboard" else 0
-            _LOGGER.info("Starting keepalive task: %s (stagger=%.1fs interval=%ds retries=%d)",
-                         device_name, effective_stagger, self.keepalive_interval, self.keepalive_retries)
-            device.keepalive_task = asyncio.create_task(
-                self._keepalive_loop(device_name, client, effective_stagger)
-            )
+                device.client = client
+                _LOGGER.info("ONLINE (%s): %s", source, device_name)
+                self._mark_online(device_name)
+                client.subscribe_logs(lambda msg, dn=device_name: self._on_log_message(dn, msg))
+
+                if not device.first_ping_done:
+                    try:
+                        info = await asyncio.wait_for(
+                            client.device_info(), timeout=self.keepalive_ping_timeout
+                        )
+                        device.first_ping_done = True
+                        if not device.mac_address and hasattr(info, "mac_address"):
+                            device.mac_address = info.mac_address
+                        if not device.model and hasattr(info, "model"):
+                            device.model = info.model
+                        _LOGGER.info("Device info OK: %s mac=%s model=%s",
+                                     device_name, device.mac_address, device.model)
+                        if not device.mqtt_discovery_published:
+                            asyncio.create_task(self._publish_mqtt_discovery(device))
+                    except Exception as err:
+                        _LOGGER.warning("First device_info failed for %s: %s", device_name, err)
+
+                num_devices = max(len(self.devices), 1)
+                stagger = (device.ping_index % num_devices) * (self.keepalive_interval / num_devices)
+                effective_stagger = stagger if source == "dashboard" else 0
+                _LOGGER.info("Starting keepalive task: %s (stagger=%.1fs interval=%ds retries=%d)",
+                             device_name, effective_stagger, self.keepalive_interval, self.keepalive_retries)
+                device.keepalive_task = asyncio.create_task(
+                    self._keepalive_loop(device_name, client, effective_stagger)
+                )
         finally:
             device.connecting = False
 
@@ -349,15 +368,14 @@ class DeviceManager:
             return
 
         if initial_stagger > 0:
-            _LOGGER.info("Keepalive stagger: %s waiting %.1fs before first ping",
-                         device_name, initial_stagger)
+            _LOGGER.info("Keepalive stagger: %s waiting %.1fs", device_name, initial_stagger)
             await asyncio.sleep(initial_stagger)
 
         while True:
             await asyncio.sleep(self.keepalive_interval)
 
             if not device.online:
-                _LOGGER.info("Keepalive task ending: %s is already offline", device_name)
+                _LOGGER.info("Keepalive task ending: %s already offline", device_name)
                 break
 
             _LOGGER.info("Keepalive ping: %s (up to %d attempts)", device_name, self.keepalive_retries)
