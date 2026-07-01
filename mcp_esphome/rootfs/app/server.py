@@ -36,6 +36,7 @@ async def main():
     log_retention_hours = opts.get("log_retention_hours", 24)
     heartbeat_retention_days = opts.get("heartbeat_retention_days", 30)
     keepalive_interval = opts.get("keepalive_interval", 10)
+    keepalive_retries = opts.get("keepalive_retries", 5)
     mqtt_host = opts.get("mqtt_host", "core-mosquitto")
     mqtt_port = opts.get("mqtt_port", 1883)
 
@@ -44,6 +45,7 @@ async def main():
         log_retention_hours=log_retention_hours,
         heartbeat_retention_days=heartbeat_retention_days,
         keepalive_interval=keepalive_interval,
+        keepalive_retries=keepalive_retries,
         bearer_token=bearer_token,
         mqtt_host=mqtt_host,
         mqtt_port=mqtt_port,
@@ -53,7 +55,8 @@ async def main():
     _LOGGER.info("MCP ESPHome starting")
     _LOGGER.info("Dashboard URL: %s", esphome_dashboard_url)
     _LOGGER.info("Port: %s", port)
-    _LOGGER.info("Keepalive: interval=%ss timeout=%ss", keepalive_interval, device_manager.keepalive_timeout)
+    _LOGGER.info("Keepalive: interval=%ss retries=%d timeout=1s/attempt",
+                 keepalive_interval, keepalive_retries)
     _LOGGER.info("Bearer Token: %s", device_manager.bearer_token)
     _LOGGER.info("=" * 60)
 
