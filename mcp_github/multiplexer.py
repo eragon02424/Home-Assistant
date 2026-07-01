@@ -48,6 +48,24 @@ BINARY_TOOLS = [
             "required": ["owner", "repo", "path"],
         },
     },
+    {
+        "name": "create_release",
+        "description": "Create a GitHub Release (with tag) for a repository. HACS uses the tag name of the latest release to detect updates — publishing only a tag is not enough, a Release is required. After pushing a new version, call this tool to create the release so HACS shows an update notification.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string", "description": "Repository owner"},
+                "repo": {"type": "string", "description": "Repository name"},
+                "tag_name": {"type": "string", "description": "Tag name for the release, e.g. 'v1.2.3'"},
+                "name": {"type": "string", "description": "Release title, e.g. 'v1.2.3'"},
+                "body": {"type": "string", "description": "Release notes / changelog text"},
+                "draft": {"type": "boolean", "description": "Set true to create as draft (default: false)"},
+                "prerelease": {"type": "boolean", "description": "Set true to mark as pre-release (default: false)"},
+                "target_commitish": {"type": "string", "description": "Branch or commit SHA the tag is created from (default: main)"},
+            },
+            "required": ["owner", "repo", "tag_name"],
+        },
+    },
 ]
 
 # Required headers for MCP Streamable HTTP protocol
@@ -117,6 +135,32 @@ def handle_get_binary_file(args: dict) -> str:
     content_b64 = result.get("content", "").replace("\n", "")
     size = result.get("size", 0)
     return json.dumps({"path": path, "size": size, "encoding": "base64", "content_base64": content_b64})
+
+
+def handle_create_release(args: dict) -> str:
+    owner = args["owner"]
+    repo = args["repo"]
+    tag_name = args["tag_name"]
+    name = args.get("name", tag_name)
+    body_text = args.get("body", "")
+    draft = args.get("draft", False)
+    prerelease = args.get("prerelease", False)
+    target_commitish = args.get("target_commitish", "main")
+
+    payload = {
+        "tag_name": tag_name,
+        "name": name,
+        "body": body_text,
+        "draft": draft,
+        "prerelease": prerelease,
+        "target_commitish": target_commitish,
+    }
+
+    result = _github_api("POST", f"/repos/{owner}/{repo}/releases", payload)
+    if "error" in result:
+        return f"Error: {result['error']}"
+    html_url = result.get("html_url", "")
+    return f"Release '{name}' created with tag '{tag_name}' in {owner}/{repo} - {html_url}"
 
 
 def _wait_for_upstream(retries: int = 15, delay: float = 4.0) -> bool:
@@ -307,6 +351,9 @@ class MuxHandler(BaseHTTPRequestHandler):
                 return
             if tool_name == "get_binary_file":
                 self._send_json(200, _make_tool_result(req_id, handle_get_binary_file(tool_args)))
+                return
+            if tool_name == "create_release":
+                self._send_json(200, _make_tool_result(req_id, handle_create_release(tool_args)))
                 return
 
         status, resp_headers, body = _forward_to_upstream(raw, session_id)
