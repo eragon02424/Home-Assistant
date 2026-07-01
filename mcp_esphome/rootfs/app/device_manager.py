@@ -1,4 +1,21 @@
-"""Device Manager - handles ESPHome device discovery, connections, logs and heartbeat history."""
+"""Device Manager - handles ESPHome device discovery, connections, logs and heartbeat history.
+
+Architecture per device:
+- ReconnectLogic task  : handles connect/disconnect events and mDNS-triggered wakeups.
+                         Calls _mark_online / _mark_offline on state changes.
+- Keepalive task       : fully independent asyncio.Task per device.
+                         Every keepalive_interval seconds it calls device_info()
+                         with a hard timeout.  If the call fails the device is
+                         marked offline immediately - regardless of what
+                         ReconnectLogic thinks.  This gives a guaranteed worst-case
+                         offline-detection time of keepalive_interval + timeout.
+                         The task is started when a device first connects and
+                         cancelled when it disconnects.  It is never cancelled by
+                         ReconnectLogic because it lives outside on_connect().
+
+- New devices discovered by the 60-second dashboard poll are added and their
+  tasks are started without any service restart.
+"""
 import asyncio
 import json
 import logging
@@ -71,12 +88,13 @@ class DeviceState:
     last_disconnect: Optional[float] = None
     mqtt_discovery_published: bool = False
     first_ping_done: bool = False
-    stagger_done: bool = False        # True after the one-time startup stagger has elapsed
     log_buffer: deque = field(default_factory=lambda: deque(maxlen=5000))
     heartbeat_events: list = field(default_factory=list)
+    # Tasks - managed by DeviceManager, never by ReconnectLogic
     client: Optional[object] = None
     reconnect_logic: Optional[object] = None
-    connect_task: Optional[asyncio.Task] = None
+    reconnect_task: Optional[asyncio.Task] = None  # outer task keeping RL alive
+    keepalive_task: Optional[asyncio.Task] = None  # independent ping loop
 
 
 class DeviceManager:
@@ -96,7 +114,9 @@ class DeviceManager:
         self.log_retention_seconds = log_retention_hours * 3600
         self.heartbeat_retention_seconds = heartbeat_retention_days * 86400
         self.keepalive_interval = keepalive_interval
-        self.keepalive_timeout = min(5, keepalive_interval - 1) if keepalive_interval > 1 else 1
+        # Timeout is always 5 s or (interval - 1) s, whichever is smaller.
+        # This guarantees timeout < interval even if the user sets interval = 2 s.
+        self.keepalive_timeout = min(5, max(1, keepalive_interval - 1))
         self.bearer_token = load_or_generate_bearer_token(bearer_token)
         self.mqtt_host = mqtt_host
         self.mqtt_port = mqtt_port
@@ -160,36 +180,25 @@ class DeviceManager:
 
     async def _publish_mqtt_discovery(self, device: DeviceState):
         if aiomqtt is None:
-            _LOGGER.warning("aiomqtt not available, skipping MQTT discovery for %s", device.name)
             return
-
         identifier = device.mac_address.replace(":", "") if device.mac_address else f"esphome_{device.name}"
         unique_id = f"mcp_esphome_{identifier}_online"
         state_topic = f"mcp_esphome/{device.name}/online"
         config_topic = f"homeassistant/binary_sensor/{unique_id}/config"
-
         device_block: dict = {"name": device.name, "identifiers": [identifier]}
         if device.mac_address:
             device_block["connections"] = [["mac", device.mac_address]]
         if device.model:
             device_block["model"] = device.model
-
         payload = {
-            "name": "Online",
-            "unique_id": unique_id,
-            "device_class": "connectivity",
-            "state_topic": state_topic,
-            "payload_on": "ON",
-            "payload_off": "OFF",
+            "name": "Online", "unique_id": unique_id, "device_class": "connectivity",
+            "state_topic": state_topic, "payload_on": "ON", "payload_off": "OFF",
             "device": device_block,
         }
-
         try:
             async with aiomqtt.Client(
-                hostname=self.mqtt_host,
-                port=self.mqtt_port,
-                username=self.mqtt_username or None,
-                password=self.mqtt_password or None,
+                hostname=self.mqtt_host, port=self.mqtt_port,
+                username=self.mqtt_username or None, password=self.mqtt_password or None,
             ) as client:
                 await client.publish(config_topic, payload=json.dumps(payload), retain=True)
                 await client.publish(state_topic, payload="ON" if device.online else "OFF", retain=True)
@@ -204,10 +213,8 @@ class DeviceManager:
         state_topic = f"mcp_esphome/{device.name}/online"
         try:
             async with aiomqtt.Client(
-                hostname=self.mqtt_host,
-                port=self.mqtt_port,
-                username=self.mqtt_username or None,
-                password=self.mqtt_password or None,
+                hostname=self.mqtt_host, port=self.mqtt_port,
+                username=self.mqtt_username or None, password=self.mqtt_password or None,
             ) as client:
                 await client.publish(state_topic, payload="ON" if online else "OFF", retain=True)
         except Exception as err:
@@ -236,7 +243,6 @@ class DeviceManager:
             return
 
         configured = data.get("configured", []) if isinstance(data, dict) else []
-
         for entry in configured:
             name = entry.get("name")
             configuration_file = entry.get("configuration", "")
@@ -251,47 +257,40 @@ class DeviceManager:
                 device = DeviceState(name=name, address=address, ping_index=self._ping_counter)
                 self._ping_counter += 1
                 self.devices[name] = device
+            else:
+                device = self.devices[name]
 
-            device = self.devices[name]
             device.address = address
             device.configuration_file = configuration_file
-
             if mac_from_dashboard and not device.mac_address:
                 device.mac_address = mac_from_dashboard
-
             if api_encrypted and device.noise_psk is None:
                 device.noise_psk = self._read_noise_psk(configuration_file)
                 if not device.noise_psk:
                     _LOGGER.warning("Device %s has API encryption but no key found in %s", name, configuration_file)
 
-            if device.connect_task is None or device.connect_task.done():
-                device.connect_task = asyncio.create_task(self._start_reconnect_logic(name))
+            # Start reconnect task if not running (also picks up newly added devices)
+            if device.reconnect_task is None or device.reconnect_task.done():
+                device.reconnect_task = asyncio.create_task(self._run_reconnect_logic(name))
 
-    # ── Connection via ReconnectLogic + keepalive ─────────────────
+    # ── ReconnectLogic wrapper ─────────────────────────────────────
 
-    async def _start_reconnect_logic(self, device_name: str):
-        """Start ReconnectLogic for mDNS-triggered reconnects.
+    async def _run_reconnect_logic(self, device_name: str):
+        """Outer task that owns ReconnectLogic for one device.
 
-        Stagger: on the very first on_connect call after service start we wait
-        (ping_index / num_devices) * keepalive_interval seconds before the
-        first ping so that N devices spread their pings evenly across one
-        keepalive window.  Example: 10 devices, 10 s interval → device 0 pings
-        at t=0 s, device 1 at t=1 s, ..., device 9 at t=9 s.  After the
-        stagger has fired once (stagger_done=True) every subsequent on_connect
-        goes straight to the keepalive loop without any extra delay.
+        on_connect  → marks device online, starts the independent keepalive task,
+                      collects MAC/model on first connect.
+        on_disconnect → marks device offline, cancels the keepalive task.
+
+        The keepalive task is NOT inside on_connect so it is never cancelled
+        when ReconnectLogic cancels the on_connect coroutine.
         """
         if not HAS_AIOESPHOMEAPI:
             _LOGGER.error("aioesphomeapi not available")
             return
 
         device = self.devices[device_name]
-
-        client = APIClient(
-            device.address,
-            6053,
-            None,
-            noise_psk=device.noise_psk,
-        )
+        client = APIClient(device.address, 6053, None, noise_psk=device.noise_psk)
         device.client = client
 
         async def on_connect():
@@ -299,19 +298,10 @@ class DeviceManager:
             self._mark_online(device_name)
             client.subscribe_logs(lambda msg, dn=device_name: self._on_log_message(dn, msg))
 
-            # One-time startup stagger so pings are spread across the interval.
-            # After the first connect this is skipped on every reconnect.
-            if not device.stagger_done:
-                device.stagger_done = True
-                num_devices = max(len(self.devices), 1)
-                stagger = (device.ping_index % num_devices) * (self.keepalive_interval / num_devices)
-                if stagger > 0:
-                    await asyncio.sleep(stagger)
-
-            # First ping: collect MAC/model and publish MQTT discovery
-            try:
-                info = await asyncio.wait_for(client.device_info(), timeout=self.keepalive_timeout)
-                if not device.first_ping_done:
+            # Collect device info on first ever connect for MAC / model / MQTT discovery
+            if not device.first_ping_done:
+                try:
+                    info = await asyncio.wait_for(client.device_info(), timeout=self.keepalive_timeout)
                     device.first_ping_done = True
                     if not device.mac_address and hasattr(info, "mac_address"):
                         device.mac_address = info.mac_address
@@ -319,21 +309,27 @@ class DeviceManager:
                         device.model = info.model
                     if not device.mqtt_discovery_published:
                         asyncio.create_task(self._publish_mqtt_discovery(device))
-            except Exception as err:
-                _LOGGER.debug("First ping failed for %s: %s", device_name, err)
+                except Exception as err:
+                    _LOGGER.debug("First device_info failed for %s: %s", device_name, err)
 
-            # Keepalive loop: ping every keepalive_interval seconds.
-            # A failed ping triggers ReconnectLogic's disconnect path.
-            while True:
-                await asyncio.sleep(self.keepalive_interval)
-                try:
-                    await asyncio.wait_for(client.device_info(), timeout=self.keepalive_timeout)
-                except Exception:
-                    _LOGGER.debug("Keepalive ping failed for %s", device_name)
-                    break
+            # Start the independent keepalive task (staggered start for load spreading)
+            if device.keepalive_task is None or device.keepalive_task.done():
+                num_devices = max(len(self.devices), 1)
+                stagger = (device.ping_index % num_devices) * (self.keepalive_interval / num_devices)
+                device.keepalive_task = asyncio.create_task(
+                    self._keepalive_loop(device_name, client, stagger)
+                )
 
         async def on_disconnect(expected: bool):
             _LOGGER.info("Disconnected from %s (expected=%s)", device_name, expected)
+            # Cancel keepalive task so it stops pinging a dead connection
+            if device.keepalive_task and not device.keepalive_task.done():
+                device.keepalive_task.cancel()
+                try:
+                    await device.keepalive_task
+                except asyncio.CancelledError:
+                    pass
+            device.keepalive_task = None
             self._mark_offline(device_name)
 
         reconnect_logic = ReconnectLogic(
@@ -343,13 +339,57 @@ class DeviceManager:
             zeroconf_instance=None,
         )
         device.reconnect_logic = reconnect_logic
-
         await reconnect_logic.start()
         try:
             while True:
                 await asyncio.sleep(3600)
         finally:
             await reconnect_logic.stop()
+
+    # ── Independent keepalive loop ────────────────────────────────
+
+    async def _keepalive_loop(self, device_name: str, client: object, initial_stagger: float):
+        """Runs as a completely independent task - NOT inside on_connect.
+
+        Timing per device (example: 10 devices, interval=10 s):
+          device 0: pings at t=0, 10, 20, ...
+          device 1: pings at t=1, 11, 21, ...
+          device 9: pings at t=9, 19, 29, ...
+
+        The stagger is applied only once at startup.  On reconnect the keepalive
+        task is recreated by on_connect with stagger=0 so the first ping fires
+        immediately.
+
+        If device_info() times out or raises, the device is marked offline right
+        away.  ReconnectLogic will handle the reconnect independently.
+        """
+        device = self.devices.get(device_name)
+        if not device:
+            return
+
+        # One-time startup stagger
+        if initial_stagger > 0:
+            await asyncio.sleep(initial_stagger)
+
+        while True:
+            await asyncio.sleep(self.keepalive_interval)
+            if not device.online:
+                # Already offline (marked by on_disconnect) - stop pinging
+                break
+            try:
+                await asyncio.wait_for(client.device_info(), timeout=self.keepalive_timeout)  # type: ignore[arg-type]
+                # Ping succeeded: refresh last_seen
+                device.last_seen = time.time()
+                _LOGGER.debug("Keepalive OK: %s", device_name)
+            except asyncio.CancelledError:
+                raise  # propagate cancellation
+            except Exception:
+                _LOGGER.info("Keepalive failed for %s → marking offline", device_name)
+                self._mark_offline(device_name)
+                # Do NOT try to reconnect here - ReconnectLogic owns that
+                break
+
+    # ── Log subscription callback ─────────────────────────────────
 
     def _on_log_message(self, device_name: str, msg):
         device = self.devices.get(device_name)
@@ -367,6 +407,8 @@ class DeviceManager:
         cutoff = time.time() - self.log_retention_seconds
         while device.log_buffer and device.log_buffer[0][0] < cutoff:
             device.log_buffer.popleft()
+
+    # ── State transitions ────────────────────────────────────────
 
     def _mark_online(self, device_name: str):
         device = self.devices[device_name]
