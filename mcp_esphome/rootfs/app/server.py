@@ -31,7 +31,7 @@ async def main():
     opts = load_options()
 
     esphome_dashboard_url = opts.get("esphome_dashboard_url", "http://localhost:6052")
-    bearer_token = opts.get("bearer_token", "")
+    bearer_token = opts.get("bearer_token", "")  # empty = auto-generate
     port = opts.get("port", 8090)
     log_retention_hours = opts.get("log_retention_hours", 24)
     heartbeat_retention_days = opts.get("heartbeat_retention_days", 30)
@@ -41,30 +41,33 @@ async def main():
     mqtt_username = opts.get("mqtt_username", "")
     mqtt_password = opts.get("mqtt_password", "")
 
-    _LOGGER.info("=" * 60)
-    _LOGGER.info("MCP ESPHome starting")
-    _LOGGER.info("Dashboard URL: %s", esphome_dashboard_url)
-    _LOGGER.info("Port: %s", port)
-    _LOGGER.info("Keepalive interval: %ss, timeout: %ss", keepalive_interval, keepalive_interval - 2)
-    _LOGGER.info("MQTT: %s:%s", mqtt_host, mqtt_port)
-    _LOGGER.info("=" * 60)
-
     device_manager = DeviceManager(
         esphome_dashboard_url=esphome_dashboard_url,
         log_retention_hours=log_retention_hours,
         heartbeat_retention_days=heartbeat_retention_days,
         keepalive_interval=keepalive_interval,
+        bearer_token=bearer_token,
         mqtt_host=mqtt_host,
         mqtt_port=mqtt_port,
         mqtt_username=mqtt_username,
         mqtt_password=mqtt_password,
     )
 
+    _LOGGER.info("=" * 60)
+    _LOGGER.info("MCP ESPHome starting")
+    _LOGGER.info("Dashboard URL: %s", esphome_dashboard_url)
+    _LOGGER.info("Port: %s", port)
+    _LOGGER.info("Keepalive: interval=%ss timeout=%ss", keepalive_interval, device_manager.keepalive_timeout)
+    _LOGGER.info("Bearer Token: %s", device_manager.bearer_token)
+    _LOGGER.info("MQTT: %s:%s", mqtt_host, mqtt_port)
+    _LOGGER.info("=" * 60)
+
     asyncio.create_task(device_manager.run_discovery_loop())
 
     app = web.Application()
     app["device_manager"] = device_manager
-    app["bearer_token"] = bearer_token
+    # Use the resolved token (auto-generated or from config) for API auth
+    app["bearer_token"] = device_manager.bearer_token
     setup_routes(app)
 
     runner = web.AppRunner(app)

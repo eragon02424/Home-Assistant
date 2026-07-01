@@ -3,6 +3,8 @@ import asyncio
 import json
 import logging
 import re
+import secrets
+import string
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -28,16 +30,38 @@ STORAGE_DIR = Path("/data/mcp_esphome")
 ESPHOME_CONFIG_DIR = Path("/config/esphome")
 DISCOVERY_INTERVAL_SECONDS = 60
 RECONNECT_INTERVAL = 15
+BEARER_TOKEN_FILE = STORAGE_DIR / "bearer_token.txt"
 
 _NOISE_KEY_RE = re.compile(
     r"api:\s*\n(?:.*\n)*?\s*encryption:\s*\n\s*key:\s*[\"']?([A-Za-z0-9+/=]+)[\"']?",
 )
 
 
+def load_or_generate_bearer_token(configured_token: str) -> str:
+    """Return the configured token if set, otherwise load or generate a persistent one."""
+    if configured_token:
+        return configured_token
+    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    if BEARER_TOKEN_FILE.exists():
+        token = BEARER_TOKEN_FILE.read_text().strip()
+        if token:
+            return token
+    # Generate a secure random token
+    alphabet = string.ascii_letters + string.digits
+    token = "mcp_" + "".join(secrets.choice(alphabet) for _ in range(40))
+    BEARER_TOKEN_FILE.write_text(token)
+    _LOGGER.warning("=" * 60)
+    _LOGGER.warning("Auto-generated Bearer Token: %s", token)
+    _LOGGER.warning("Add this token to your Claude MCP connector.")
+    _LOGGER.warning("=" * 60)
+    return token
+
+
 @dataclass
 class DeviceState:
     name: str
     address: str
+    ping_index: int = 0            # used to stagger keepalive pings
     configuration_file: str = ""
     noise_psk: Optional[str] = None
     mac_address: Optional[str] = None
@@ -59,6 +83,7 @@ class DeviceManager:
         log_retention_hours: int,
         heartbeat_retention_days: int,
         keepalive_interval: int = 10,
+        bearer_token: str = "",
         mqtt_host: str = "core-mosquitto",
         mqtt_port: int = 1883,
         mqtt_username: str = "",
@@ -68,13 +93,15 @@ class DeviceManager:
         self.log_retention_seconds = log_retention_hours * 3600
         self.heartbeat_retention_seconds = heartbeat_retention_days * 86400
         self.keepalive_interval = keepalive_interval
-        # Timeout is always 2s less than interval, minimum 3s
-        self.keepalive_timeout = max(keepalive_interval - 2, 3)
+        # Timeout: fixed 5s, but never >= keepalive_interval (so a 2s interval still works)
+        self.keepalive_timeout = min(5, keepalive_interval - 1) if keepalive_interval > 1 else 1
+        self.bearer_token = load_or_generate_bearer_token(bearer_token)
         self.mqtt_host = mqtt_host
         self.mqtt_port = mqtt_port
         self.mqtt_username = mqtt_username
         self.mqtt_password = mqtt_password
         self.devices: dict[str, DeviceState] = {}
+        self._ping_counter = 0     # global counter for assigning stagger indices
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
         self._load_heartbeat_history()
 
@@ -219,7 +246,9 @@ class DeviceManager:
 
             if name not in self.devices:
                 _LOGGER.info("New device discovered: %s (%s)", name, address)
-                self.devices[name] = DeviceState(name=name, address=address)
+                device = DeviceState(name=name, address=address, ping_index=self._ping_counter)
+                self._ping_counter += 1
+                self.devices[name] = device
 
             device = self.devices[name]
             device.address = address
@@ -245,6 +274,12 @@ class DeviceManager:
 
         device = self.devices[device_name]
 
+        # Stagger initial ping: spread devices evenly across the keepalive interval.
+        # ping_index is assigned at discovery time so the offset is stable across reconnects.
+        # Example: interval=10s, 10 devices → device 0 pings at 0s, device 1 at 1s, ...
+        num_devices = max(len(self.devices), 1)
+        stagger_offset = (device.ping_index % num_devices) * (self.keepalive_interval / num_devices)
+
         while True:
             try:
                 client = APIClient(device.address, 6053, None, noise_psk=device.noise_psk)
@@ -254,9 +289,11 @@ class DeviceManager:
 
                 client.subscribe_logs(lambda msg, dn=device_name: self._on_log_message(dn, msg))
 
+                # Wait for this device's stagger slot before starting the ping loop
+                await asyncio.sleep(stagger_offset)
+
                 first_ping = True
                 while device.client is not None:
-                    await asyncio.sleep(self.keepalive_interval)
                     try:
                         info = await asyncio.wait_for(
                             client.device_info(),
@@ -272,6 +309,7 @@ class DeviceManager:
                                 asyncio.create_task(self._publish_mqtt_discovery(device))
                     except Exception:
                         break
+                    await asyncio.sleep(self.keepalive_interval)
 
             except APIConnectionError:
                 pass
@@ -324,6 +362,9 @@ class DeviceManager:
             asyncio.create_task(self._publish_mqtt_state(device, False))
 
     # ── Public query API ──────────────────────────────────────────
+
+    def get_bearer_token(self) -> str:
+        return self.bearer_token
 
     def list_devices(self) -> list[dict]:
         return [
