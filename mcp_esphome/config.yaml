@@ -19,7 +19,7 @@ options:
   log_retention_hours: 24
   heartbeat_retention_days: 30
   keepalive_interval: 10
-  keepalive_retries: 1
+  keepalive_retries: 2
   keepalive_ping_timeout_ms: 100
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
