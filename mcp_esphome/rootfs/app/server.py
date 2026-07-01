@@ -36,7 +36,7 @@ async def main():
     log_retention_hours = opts.get("log_retention_hours", 24)
     heartbeat_retention_days = opts.get("heartbeat_retention_days", 30)
     keepalive_interval = opts.get("keepalive_interval", 10)
-    keepalive_retries = opts.get("keepalive_retries", 1)
+    keepalive_retries = opts.get("keepalive_retries", 2)
     keepalive_ping_timeout_ms = opts.get("keepalive_ping_timeout_ms", 100)
     mqtt_host = opts.get("mqtt_host", "core-mosquitto")
     mqtt_port = opts.get("mqtt_port", 1883)
@@ -62,7 +62,17 @@ async def main():
     _LOGGER.info("Bearer Token: %s", device_manager.bearer_token)
     _LOGGER.info("=" * 60)
 
+    # Run initial discovery FIRST — all devices get their PSK loaded before
+    # the mDNS listener starts. This prevents the race condition where a mDNS
+    # announce arrives before device.noise_psk has been read from the YAML.
+    _LOGGER.info("Running initial device discovery...")
+    await device_manager.run_initial_discovery()
+    _LOGGER.info("Initial discovery complete — starting mDNS listener")
+
+    # Now safe: all known devices have PSK loaded
     await device_manager.start_mdns_listener()
+
+    # Continue polling for NEW devices every 60s
     asyncio.create_task(device_manager.run_discovery_loop())
 
     app = web.Application()
