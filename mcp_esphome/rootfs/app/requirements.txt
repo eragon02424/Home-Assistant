@@ -2,3 +2,4 @@ aiohttp
 aioesphomeapi
 aiomqtt
 zeroconf
+# v0.4.0 cache-bust
