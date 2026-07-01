@@ -3,11 +3,12 @@
 Architecture:
 ─────────────
 STARTUP / INIT
-  Sequential connect: devices are tried one by one in order.
-  For each device: up to keepalive_retries attempts with keepalive_ping_timeout
-  between each attempt. Move to next device regardless of result.
-  If a device connects successfully its keepalive task starts immediately
-  and runs in parallel while init continues with the next device.
+  Sequential connect: ONLY devices that ESPHome dashboard reports as online
+  are tried, in order. Offline devices are registered but skipped — the mDNS
+  listener will pick them up when they come online.
+  For each online device: keepalive_retries attempts, keepalive_ping_timeout
+  seconds between each attempt. Move to next device regardless of result.
+  If connected, keepalive task starts immediately in parallel.
 
 ONLINE DETECTION (after init)
   Global mDNS listener for _esphomelib._tcp.local.
@@ -115,7 +116,7 @@ class DeviceManager:
         log_retention_hours: int,
         heartbeat_retention_days: int,
         keepalive_interval: int = 10,
-        keepalive_retries: int = 1,
+        keepalive_retries: int = 2,
         keepalive_ping_timeout_ms: int = 100,
         bearer_token: str = "",
         mqtt_host: str = "core-mosquitto",
@@ -170,15 +171,27 @@ class DeviceManager:
     # ── Noise PSK ───────────────────────────────────────────────
 
     def _read_noise_psk(self, configuration_file: str) -> Optional[str]:
+        """Read Noise PSK from ESPHome YAML config file.
+
+        The configuration_file field from the dashboard is just the filename
+        (e.g. "heizreglerv1.yaml"), not a full path. We look it up in
+        ESPHOME_CONFIG_DIR (/config/esphome/).
+        """
         if not configuration_file:
             return None
-        path = ESPHOME_CONFIG_DIR / configuration_file
+        # Strip any path separators — only use the filename
+        filename = Path(configuration_file).name
+        path = ESPHOME_CONFIG_DIR / filename
         try:
             content = path.read_text(encoding="utf-8")
-        except Exception:
+        except Exception as err:
+            _LOGGER.debug("Could not read %s for noise key: %s", path, err)
             return None
         match = _NOISE_KEY_RE.search(content)
-        return match.group(1) if match else None
+        if match:
+            return match.group(1)
+        _LOGGER.debug("No noise key found in %s", path)
+        return None
 
     # ── MQTT Discovery ────────────────────────────────────────────
 
@@ -243,52 +256,74 @@ class DeviceManager:
             return
 
         configured = data.get("configured", []) if isinstance(data, dict) else []
-        new_devices = []
+        new_online: list[str] = []
+        new_offline: list[str] = []
 
         for entry in configured:
             name = entry.get("name")
-            if not name or name in self.devices:
-                # Update metadata for known devices
-                if name and name in self.devices:
-                    d = self.devices[name]
-                    d.address = entry.get("address") or f"{name}.local"
-                    if entry.get("mac_address") and not d.mac_address:
-                        d.mac_address = entry["mac_address"]
+            if not name:
+                continue
+
+            if name in self.devices:
+                # Update address/MAC for known devices only
+                d = self.devices[name]
+                addr = entry.get("address") or f"{name}.local"
+                d.address = addr
+                if entry.get("mac_address") and not d.mac_address:
+                    d.mac_address = entry["mac_address"]
                 continue
 
             address = entry.get("address") or f"{name}.local"
+            configuration_file = entry.get("configuration", "")
+            api_encrypted = entry.get("api_encrypted", False)
+            dashboard_online = entry.get("online", False)
+
             device = DeviceState(name=name, address=address, ping_index=self._ping_counter)
             self._ping_counter += 1
+            device.configuration_file = configuration_file
             if entry.get("mac_address"):
                 device.mac_address = entry["mac_address"]
-            if entry.get("api_encrypted"):
-                device.noise_psk = self._read_noise_psk(entry.get("configuration", ""))
-            device.configuration_file = entry.get("configuration", "")
+            if api_encrypted:
+                psk = self._read_noise_psk(configuration_file)
+                device.noise_psk = psk
+                if psk:
+                    _LOGGER.info("Noise PSK loaded for %s", name)
+                else:
+                    _LOGGER.warning("No noise PSK found for encrypted device %s (config: %s)",
+                                    name, configuration_file)
             self.devices[name] = device
-            new_devices.append(name)
-            _LOGGER.info("New device registered: %s @ %s", name, address)
 
-        if new_devices:
-            _LOGGER.info("Starting sequential init for %d new device(s)", len(new_devices))
-            asyncio.create_task(self._sequential_init(new_devices))
+            if dashboard_online:
+                new_online.append(name)
+                _LOGGER.info("New device registered (online): %s @ %s", name, address)
+            else:
+                new_offline.append(name)
+                _LOGGER.info("New device registered (offline): %s @ %s — skipping init", name, address)
+
+        if new_online:
+            _LOGGER.info("Sequential init for %d online device(s), %d offline skipped",
+                         len(new_online), len(new_offline))
+            asyncio.create_task(self._sequential_init(new_online))
+        elif new_offline:
+            _LOGGER.info("All %d new device(s) are offline — waiting for mDNS", len(new_offline))
 
     # ── Sequential init ───────────────────────────────────────────
 
     async def _sequential_init(self, device_names: list[str]):
-        """Try connecting to devices one by one.
+        """Try connecting to ONLINE devices one by one.
 
-        For each device: attempt connection with keepalive_retries tries,
-        keepalive_ping_timeout seconds between each attempt.
-        Move to next device regardless of result.
-        If connected, keepalive task starts immediately in parallel.
+        For each device: keepalive_retries attempts with keepalive_ping_timeout
+        between each attempt. Move to next regardless of result.
+        Keepalive task starts immediately when a device connects.
         """
         total = len(device_names)
         for i, name in enumerate(device_names):
             device = self.devices.get(name)
-            if not device:
+            if not device or device.online:
                 continue
 
-            _LOGGER.info("Init [%d/%d] %s @ %s", i + 1, total, name, device.address)
+            _LOGGER.info("Init [%d/%d] %s @ %s (encrypted=%s)",
+                         i + 1, total, name, device.address, device.noise_psk is not None)
             connected = False
 
             for attempt in range(1, self.keepalive_retries + 1):
@@ -298,12 +333,14 @@ class DeviceManager:
                     client = APIClient(device.address, 6053, None, noise_psk=device.noise_psk)
                     await client.connect(login=False)
                     device.client = client
-                    _LOGGER.info("ONLINE (dashboard): %s (attempt %d/%d)", name, attempt, self.keepalive_retries)
+                    _LOGGER.info("ONLINE (dashboard): %s (attempt %d/%d)",
+                                 name, attempt, self.keepalive_retries)
                     self._mark_online(name)
                     client.subscribe_logs(lambda msg, dn=name: self._on_log_message(dn, msg))
-                    # Collect MAC/model
                     try:
-                        info = await asyncio.wait_for(client.device_info(), timeout=self.keepalive_ping_timeout)
+                        info = await asyncio.wait_for(
+                            client.device_info(), timeout=self.keepalive_ping_timeout
+                        )
                         device.first_ping_done = True
                         if not device.mac_address and hasattr(info, "mac_address"):
                             device.mac_address = info.mac_address
@@ -313,7 +350,6 @@ class DeviceManager:
                             asyncio.create_task(self._publish_mqtt_discovery(device))
                     except Exception:
                         pass
-                    # Start keepalive immediately in parallel
                     num = max(len(self.devices), 1)
                     stagger = (device.ping_index % num) * (self.keepalive_interval / num)
                     device.keepalive_task = asyncio.create_task(
@@ -328,14 +364,12 @@ class DeviceManager:
                         await asyncio.sleep(self.keepalive_ping_timeout)
 
             if not connected:
-                _LOGGER.info("Init: %s offline after %d attempt(s)", name, self.keepalive_retries)
+                _LOGGER.info("Init: %s offline after %d attempt(s) — mDNS will reconnect",
+                             name, self.keepalive_retries)
 
     # ── Single connect (mDNS triggered) ──────────────────────────
 
     async def _connect_device(self, device_name: str, source: str):
-        """Single connect attempt for mDNS-triggered wakeups.
-        No retry needed — mDNS will fire again if it fails.
-        """
         if not HAS_AIOESPHOMEAPI:
             return
         device = self.devices.get(device_name)
@@ -344,7 +378,8 @@ class DeviceManager:
 
         device.connecting = True
         try:
-            _LOGGER.info("Connecting [%s] %s @ %s ...", source, device_name, device.address)
+            _LOGGER.info("Connecting [%s] %s @ %s (encrypted=%s) ...",
+                         source, device_name, device.address, device.noise_psk is not None)
             client = APIClient(device.address, 6053, None, noise_psk=device.noise_psk)
             try:
                 await client.connect(login=False)
@@ -359,7 +394,9 @@ class DeviceManager:
 
             if not device.first_ping_done:
                 try:
-                    info = await asyncio.wait_for(client.device_info(), timeout=self.keepalive_ping_timeout)
+                    info = await asyncio.wait_for(
+                        client.device_info(), timeout=self.keepalive_ping_timeout
+                    )
                     device.first_ping_done = True
                     if not device.mac_address and hasattr(info, "mac_address"):
                         device.mac_address = info.mac_address
