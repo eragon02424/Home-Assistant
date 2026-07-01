@@ -38,8 +38,6 @@ async def main():
     keepalive_interval = opts.get("keepalive_interval", 10)
     mqtt_host = opts.get("mqtt_host", "core-mosquitto")
     mqtt_port = opts.get("mqtt_port", 1883)
-    mqtt_username = opts.get("mqtt_username", "")
-    mqtt_password = opts.get("mqtt_password", "")
 
     device_manager = DeviceManager(
         esphome_dashboard_url=esphome_dashboard_url,
@@ -49,8 +47,6 @@ async def main():
         bearer_token=bearer_token,
         mqtt_host=mqtt_host,
         mqtt_port=mqtt_port,
-        mqtt_username=mqtt_username,
-        mqtt_password=mqtt_password,
     )
 
     _LOGGER.info("=" * 60)
@@ -61,10 +57,7 @@ async def main():
     _LOGGER.info("Bearer Token: %s", device_manager.bearer_token)
     _LOGGER.info("=" * 60)
 
-    # Start global mDNS listener (one instance for all devices)
     await device_manager.start_mdns_listener()
-
-    # Start dashboard discovery loop (initial + every 60s for new devices)
     asyncio.create_task(device_manager.run_discovery_loop())
 
     app = web.Application()
