@@ -1,8 +1,10 @@
 """
-MCP Serial HomeAssistant v1.0.3
+MCP Serial HomeAssistant v1.0.4
 Persistenter serieller Listener fuer ESP32-S2 USB-CDC.
 FastMCP HTTP Transport.
-Polling statt udev (udev NETLINK wird in Docker-Containern geblockt).
+Polling alle 0.5s (udev NETLINK in Docker geblockt).
+ttyACM* hat immer Vorrang vor ttyUSB* (ESP32-S2 vs Zigbee-Dongles).
+active_port wird NICHT auto-sticky gesetzt - nur wenn manuell per Tool konfiguriert.
 """
 import logging
 import os
@@ -44,7 +46,7 @@ opts = load_options()
 
 state = {
     "baud_rate":           opts.get("baud_rate", 115200),
-    "active_port":         None,   # None = auto-detect (ttyACM bevorzugt)
+    "active_port":         None,   # None = auto-detect; nur per MCP-Tool setzbar
     "ring_buffer_lines":   opts.get("ring_buffer_lines", 300),
     "log_retention_hours": opts.get("log_retention_hours", 24),
     "log_max_size_mb":     opts.get("log_max_size_mb", 20),
@@ -97,15 +99,21 @@ def write_log_line(entry: dict):
 
 # ---------------------------------------------------------------------------
 # Port-Erkennung
+# ttyACM* hat immer Vorrang (ESP32-S2 USB-CDC).
+# ttyUSB* nur als Fallback wenn kein ttyACM vorhanden.
+# active_port wird NUR benutzt wenn manuell per serial_set_port gesetzt.
 # ---------------------------------------------------------------------------
 def find_target_port() -> str | None:
-    """Gibt den konfigurierten Port zurueck, oder auto-detect (ttyACM* bevorzugt)."""
     target = state["active_port"]
     if target:
+        # Manuell konfiguriert - nur zurueckgeben wenn vorhanden
         return target if os.path.exists(target) else None
+    # Auto-detect: ttyACM bevorzugen (ESP32-S2), ttyUSB nur als Fallback
     acm = sorted(glob.glob("/dev/ttyACM*"))
-    usb = sorted(glob.glob("/dev/ttyUSB*"))
-    return (acm + usb)[0] if (acm or usb) else None
+    if acm:
+        return acm[0]
+    # Kein ttyACM -> kein ESP32-S2 verbunden, nichts oeffnen
+    return None
 
 # ---------------------------------------------------------------------------
 # Serielle Verbindung
@@ -143,14 +151,9 @@ def close_port():
             ser = None
 
 # ---------------------------------------------------------------------------
-# Haupt-Loop: Lesen + Polling in einem Thread
+# Haupt-Loop: Lesen + Polling
 # ---------------------------------------------------------------------------
 def serial_loop():
-    """
-    Kombinierter Read+Reconnect-Loop.
-    - Port offen: readline(), bei Fehler schliessen
-    - Port zu: alle 0.5s pruefen ob ttyACM* erschienen ist, sofort oeffnen
-    """
     last_seen_port = None
 
     while True:
@@ -171,25 +174,23 @@ def serial_loop():
                         ring_buffer.append(entry)
                     write_log_line(entry)
             except serial.SerialException:
-                log.info("Port verloren (ESP schlaeft) - polling bis er wiederkommt...")
+                log.info("Port verloren (ESP schlaeft) - polling...")
                 close_port()
                 last_seen_port = None
             except Exception as e:
                 log.debug("Read error: %s", e)
                 time.sleep(0.05)
         else:
-            # Polling: taucht ein passender Port auf?
             port = find_target_port()
             if port and port != last_seen_port:
                 log.info("Port erkannt: %s - oeffne...", port)
-                time.sleep(0.15)  # kurz warten bis USB-CDC stabil
+                time.sleep(0.15)
                 if open_port(port, state["baud_rate"]):
                     last_seen_port = port
-                    # active_port merken fuer naechsten Zyklus (auto-detect sticky)
-                    if state["active_port"] is None:
-                        state["active_port"] = port
                 else:
                     last_seen_port = None
+            elif not port:
+                last_seen_port = None
             time.sleep(0.5)
 
 # ---------------------------------------------------------------------------
@@ -249,10 +250,13 @@ def serial_list_ports() -> dict:
 
 @mcp.tool()
 def serial_set_port(port: str) -> dict:
-    """Wechselt den aktiven seriellen Port live (ueberschreibt Auto-Detect). z.B. /dev/ttyACM0"""
+    """Setzt den aktiven Port manuell (ueberschreibt Auto-Detect dauerhaft). Leer-String = zurueck zu Auto-Detect."""
+    if port == "":
+        state["active_port"] = None
+        return {"active_port": None, "note": "Auto-Detect aktiv (ttyACM bevorzugt)"}
     state["active_port"] = port
     if not os.path.exists(port):
-        return {"port": port, "opened": False, "note": "Port existiert noch nicht, wird beim naechsten Aufwachen geoeffnet"}
+        return {"port": port, "opened": False, "note": "Existiert noch nicht, wird beim naechsten Aufwachen geoeffnet"}
     ok = open_port(port, state["baud_rate"])
     return {"port": port, "opened": ok}
 
@@ -281,6 +285,7 @@ def serial_status() -> dict:
     return {
         "port": s.port if s else None,
         "configured_port": state["active_port"],
+        "auto_detect": state["active_port"] is None,
         "baud_rate": state["baud_rate"],
         "port_open": s.is_open if s else False,
         "ring_buffer_used": buf_len,
@@ -294,7 +299,7 @@ def serial_status() -> dict:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     threading.Thread(target=serial_loop, daemon=True).start()
-    log.info("MCP Serial HomeAssistant v1.0.3 gestartet auf Port %d", MCP_PORT)
-    log.info("Polling fuer ttyACM*/ttyUSB* alle 0.5s (udev nicht noetig)")
+    log.info("MCP Serial HomeAssistant v1.0.4 gestartet auf Port %d", MCP_PORT)
+    log.info("Auto-Detect: ttyACM* bevorzugt (ESP32-S2), ttyUSB* ignoriert im Auto-Mode")
     app = mcp.http_app()
     uvicorn.run(app, host="0.0.0.0", port=MCP_PORT, log_level="warning")
