@@ -193,13 +193,27 @@ class DeviceManager:
         except Exception as err:
             _LOGGER.warning("MQTT state publish failed for %s: %s", device.name, err)
 
+    async def run_initial_discovery(self):
+        """Run one complete discovery pass synchronously.
+
+        Called BEFORE start_mdns_listener() so that all devices have their
+        noise_psk loaded before any mDNS announce can trigger a connect.
+        """
+        try:
+            await self._discover_new_devices()
+        except Exception as err:
+            _LOGGER.error("Initial discovery error: %s", err)
+
     async def run_discovery_loop(self):
+        """Poll for NEW devices every 60s after initial discovery.
+        Sleeps first — initial discovery already ran at startup.
+        """
         while True:
+            await asyncio.sleep(DISCOVERY_INTERVAL_SECONDS)
             try:
                 await self._discover_new_devices()
             except Exception as err:
                 _LOGGER.error("Discovery loop error: %s", err)
-            await asyncio.sleep(DISCOVERY_INTERVAL_SECONDS)
 
     async def _discover_new_devices(self):
         try:
@@ -239,8 +253,6 @@ class DeviceManager:
             if entry.get("mac_address"):
                 device.mac_address = entry["mac_address"]
 
-            # Always try to read PSK from YAML — the dashboard api_encrypted flag
-            # is unreliable: some devices report False but still require encryption.
             psk = self._read_noise_psk(configuration_file)
             device.noise_psk = psk
             if psk:
