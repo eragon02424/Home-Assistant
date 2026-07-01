@@ -40,8 +40,10 @@ DISCOVERY_INTERVAL_SECONDS = 60
 BEARER_TOKEN_FILE = STORAGE_DIR / "bearer_token.txt"
 MDNS_SERVICE_TYPE = "_esphomelib._tcp.local."
 
+# Simplified pattern: just find "encryption:" followed by "key:" anywhere in the file.
+# The original pattern anchored on "api:" caused silent failures in the container.
 _NOISE_KEY_RE = re.compile(
-    r"api:\s*\n(?:.*\n)*?\s*encryption:\s*\n\s*key:\s*[\"']?([A-Za-z0-9+/=]+)[\"']?",
+    r"encryption:\s*\n\s*key:\s*[\"']?([A-Za-z0-9+/=]+)[\"']?"
 )
 
 
@@ -149,10 +151,13 @@ class DeviceManager:
         try:
             content = path.read_text(encoding="utf-8")
         except Exception as err:
-            _LOGGER.debug("Could not read %s: %s", path, err)
+            _LOGGER.info("Could not read %s: %s", path, err)
             return None
         match = _NOISE_KEY_RE.search(content)
-        return match.group(1) if match else None
+        if match:
+            return match.group(1)
+        _LOGGER.debug("No noise key found in %s", path)
+        return None
 
     async def _publish_mqtt_discovery(self, device: DeviceState):
         if aiomqtt is None:
@@ -194,20 +199,14 @@ class DeviceManager:
             _LOGGER.warning("MQTT state publish failed for %s: %s", device.name, err)
 
     async def run_initial_discovery(self):
-        """Run one complete discovery pass synchronously.
-
-        Called BEFORE start_mdns_listener() so that all devices have their
-        noise_psk loaded before any mDNS announce can trigger a connect.
-        """
+        """Run one complete discovery pass synchronously before mDNS starts."""
         try:
             await self._discover_new_devices()
         except Exception as err:
             _LOGGER.error("Initial discovery error: %s", err)
 
     async def run_discovery_loop(self):
-        """Poll for NEW devices every 60s after initial discovery.
-        Sleeps first — initial discovery already ran at startup.
-        """
+        """Poll for NEW devices every 60s — sleeps first since initial discovery already ran."""
         while True:
             await asyncio.sleep(DISCOVERY_INTERVAL_SECONDS)
             try:
