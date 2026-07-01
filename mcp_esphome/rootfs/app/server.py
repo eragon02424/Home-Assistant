@@ -31,7 +31,7 @@ async def main():
     opts = load_options()
 
     esphome_dashboard_url = opts.get("esphome_dashboard_url", "http://localhost:6052")
-    bearer_token = opts.get("bearer_token", "")  # empty = auto-generate
+    bearer_token = opts.get("bearer_token", "")
     port = opts.get("port", 8090)
     log_retention_hours = opts.get("log_retention_hours", 24)
     heartbeat_retention_days = opts.get("heartbeat_retention_days", 30)
@@ -59,14 +59,16 @@ async def main():
     _LOGGER.info("Port: %s", port)
     _LOGGER.info("Keepalive: interval=%ss timeout=%ss", keepalive_interval, device_manager.keepalive_timeout)
     _LOGGER.info("Bearer Token: %s", device_manager.bearer_token)
-    _LOGGER.info("MQTT: %s:%s", mqtt_host, mqtt_port)
     _LOGGER.info("=" * 60)
 
+    # Start global mDNS listener (one instance for all devices)
+    await device_manager.start_mdns_listener()
+
+    # Start dashboard discovery loop (initial + every 60s for new devices)
     asyncio.create_task(device_manager.run_discovery_loop())
 
     app = web.Application()
     app["device_manager"] = device_manager
-    # Use the resolved token (auto-generated or from config) for API auth
     app["bearer_token"] = device_manager.bearer_token
     setup_routes(app)
 
