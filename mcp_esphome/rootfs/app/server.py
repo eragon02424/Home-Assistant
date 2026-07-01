@@ -2,7 +2,6 @@
 import asyncio
 import json
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -36,6 +35,7 @@ async def main():
     port = opts.get("port", 8090)
     log_retention_hours = opts.get("log_retention_hours", 24)
     heartbeat_retention_days = opts.get("heartbeat_retention_days", 30)
+    keepalive_interval = opts.get("keepalive_interval", 10)
     mqtt_host = opts.get("mqtt_host", "core-mosquitto")
     mqtt_port = opts.get("mqtt_port", 1883)
     mqtt_username = opts.get("mqtt_username", "")
@@ -45,6 +45,7 @@ async def main():
     _LOGGER.info("MCP ESPHome starting")
     _LOGGER.info("Dashboard URL: %s", esphome_dashboard_url)
     _LOGGER.info("Port: %s", port)
+    _LOGGER.info("Keepalive interval: %ss, timeout: %ss", keepalive_interval, keepalive_interval - 2)
     _LOGGER.info("MQTT: %s:%s", mqtt_host, mqtt_port)
     _LOGGER.info("=" * 60)
 
@@ -52,6 +53,7 @@ async def main():
         esphome_dashboard_url=esphome_dashboard_url,
         log_retention_hours=log_retention_hours,
         heartbeat_retention_days=heartbeat_retention_days,
+        keepalive_interval=keepalive_interval,
         mqtt_host=mqtt_host,
         mqtt_port=mqtt_port,
         mqtt_username=mqtt_username,
