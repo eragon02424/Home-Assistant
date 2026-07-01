@@ -39,11 +39,18 @@ ESPHOME_CONFIG_DIR = Path("/config/esphome")
 DISCOVERY_INTERVAL_SECONDS = 60
 BEARER_TOKEN_FILE = STORAGE_DIR / "bearer_token.txt"
 MDNS_SERVICE_TYPE = "_esphomelib._tcp.local."
-CONNECT_TIMEOUT = 8.0
+CONNECT_TIMEOUT = 15.0  # increased: aioesphomeapi handshake can take >8s under load
 
 _NOISE_KEY_RE = re.compile(
     r"api:\s*\n(?:.*\n)*?\s*encryption:\s*\n\s*key:\s*[\"']?([A-Za-z0-9+/=]+)[\"']?",
 )
+
+# How often to retry connecting to offline devices that were never reached at startup.
+# This covers devices that were already online when the addon started but whose
+# mDNS announce arrived before our listener was ready, or whose connect failed
+# transiently. We re-attempt every RETRY_OFFLINE_INTERVAL seconds via the
+# discovery loop for devices that have never been seen (last_seen is None).
+RETRY_NEVER_SEEN_INTERVAL = 30  # seconds between retries for never-seen devices
 
 
 def load_or_generate_bearer_token(configured_token: str) -> str:
@@ -76,6 +83,7 @@ class DeviceState:
     online: bool = False
     last_seen: Optional[float] = None
     last_disconnect: Optional[float] = None
+    last_connect_attempt: Optional[float] = None  # timestamp of last _connect_device call
     mqtt_discovery_published: bool = False
     first_ping_done: bool = False
     log_buffer: deque = field(default_factory=lambda: deque(maxlen=5000))
@@ -222,6 +230,7 @@ class DeviceManager:
 
         configured = data.get("configured", []) if isinstance(data, dict) else []
         _LOGGER.info("Dashboard scan: %d configured devices found", len(configured))
+        now = time.time()
 
         for entry in configured:
             name = entry.get("name")
@@ -233,6 +242,7 @@ class DeviceManager:
             api_encrypted = entry.get("api_encrypted", False)
 
             if name not in self.devices:
+                # Truly new device
                 _LOGGER.info("New device discovered: %s @ %s (encrypted=%s)", name, address, api_encrypted)
                 device = DeviceState(name=name, address=address, ping_index=self._ping_counter)
                 self._ping_counter += 1
@@ -242,7 +252,6 @@ class DeviceManager:
                 if api_encrypted:
                     device.noise_psk = self._read_noise_psk(configuration_file)
                 device.configuration_file = configuration_file
-                _LOGGER.info("Attempting initial connect: %s", name)
                 asyncio.create_task(self._connect_device(name, source="dashboard"))
             else:
                 device = self.devices[name]
@@ -252,6 +261,22 @@ class DeviceManager:
                     device.mac_address = mac_from_dashboard
                 if api_encrypted and device.noise_psk is None:
                     device.noise_psk = self._read_noise_psk(configuration_file)
+
+                # Retry connect for devices that were never successfully reached.
+                # This handles the case where the device was already online when the
+                # addon started but the initial connect failed (e.g. Finishing
+                # connection cancelled) and no further mDNS announce arrived.
+                if (
+                    not device.online
+                    and not device.connecting
+                    and device.last_seen is None
+                    and (
+                        device.last_connect_attempt is None
+                        or now - device.last_connect_attempt >= RETRY_NEVER_SEEN_INTERVAL
+                    )
+                ):
+                    _LOGGER.info("Retry connect (never seen): %s", name)
+                    asyncio.create_task(self._connect_device(name, source="retry"))
 
     # ── Connect a device ─────────────────────────────────────────
 
@@ -269,7 +294,9 @@ class DeviceManager:
         if device.connecting:
             _LOGGER.info("Connect [%s] %s skipped: already connecting", source, device_name)
             return
+
         device.connecting = True
+        device.last_connect_attempt = time.time()
 
         try:
             _LOGGER.info("Connecting [%s] %s @ %s ...", source, device_name, device.address)
@@ -296,7 +323,8 @@ class DeviceManager:
                         device.mac_address = info.mac_address
                     if not device.model and hasattr(info, "model"):
                         device.model = info.model
-                    _LOGGER.info("Device info OK: %s mac=%s model=%s", device_name, device.mac_address, device.model)
+                    _LOGGER.info("Device info OK: %s mac=%s model=%s",
+                                 device_name, device.mac_address, device.model)
                     if not device.mqtt_discovery_published:
                         asyncio.create_task(self._publish_mqtt_discovery(device))
                 except Exception as err:
@@ -321,7 +349,8 @@ class DeviceManager:
             return
 
         if initial_stagger > 0:
-            _LOGGER.info("Keepalive stagger: %s waiting %.1fs before first ping", device_name, initial_stagger)
+            _LOGGER.info("Keepalive stagger: %s waiting %.1fs before first ping",
+                         device_name, initial_stagger)
             await asyncio.sleep(initial_stagger)
 
         while True:
@@ -340,7 +369,8 @@ class DeviceManager:
                         timeout=self.keepalive_ping_timeout,
                     )
                     device.last_seen = time.time()
-                    _LOGGER.info("Keepalive OK: %s (attempt %d/%d)", device_name, attempt, self.keepalive_retries)
+                    _LOGGER.info("Keepalive OK: %s (attempt %d/%d)",
+                                 device_name, attempt, self.keepalive_retries)
                     success = True
                     break
                 except asyncio.CancelledError:
@@ -352,7 +382,8 @@ class DeviceManager:
                         await asyncio.sleep(1)
 
             if not success:
-                _LOGGER.info("OFFLINE (Keepalive): %s — all %d attempts failed", device_name, self.keepalive_retries)
+                _LOGGER.info("OFFLINE (Keepalive): %s — all %d attempts failed",
+                             device_name, self.keepalive_retries)
                 self._mark_offline(device_name)
                 device.client = None
                 break
@@ -371,7 +402,10 @@ class DeviceManager:
 
         class _ESPHomeListener:
             def add_service(self, zc, type_, name):
-                device_name = name.replace(f".{MDNS_SERVICE_TYPE}", "").replace(f".{type_}", "").rstrip(".")
+                device_name = (name
+                               .replace(f".{MDNS_SERVICE_TYPE}", "")
+                               .replace(f".{type_}", "")
+                               .rstrip("."))
                 if device_name in mgr.devices and not mgr.devices[device_name].online:
                     _LOGGER.info("mDNS announce received: %s → triggering connect", device_name)
                     asyncio.run_coroutine_threadsafe(
