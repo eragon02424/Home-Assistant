@@ -14,10 +14,13 @@ from typing import Optional
 import aiohttp
 
 try:
-    from aioesphomeapi import APIClient, APIConnectionError
+    from aioesphomeapi import APIClient, APIConnectionError, ReconnectLogic
+    HAS_AIOESPHOMEAPI = True
 except ImportError:
     APIClient = None
     APIConnectionError = Exception
+    ReconnectLogic = None
+    HAS_AIOESPHOMEAPI = False
 
 try:
     import aiomqtt
@@ -29,7 +32,6 @@ _LOGGER = logging.getLogger("mcp_esphome.device_manager")
 STORAGE_DIR = Path("/data/mcp_esphome")
 ESPHOME_CONFIG_DIR = Path("/config/esphome")
 DISCOVERY_INTERVAL_SECONDS = 60
-RECONNECT_INTERVAL = 15
 BEARER_TOKEN_FILE = STORAGE_DIR / "bearer_token.txt"
 
 _NOISE_KEY_RE = re.compile(
@@ -38,7 +40,6 @@ _NOISE_KEY_RE = re.compile(
 
 
 def load_or_generate_bearer_token(configured_token: str) -> str:
-    """Return the configured token if set, otherwise load or generate a persistent one."""
     if configured_token:
         return configured_token
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -46,7 +47,6 @@ def load_or_generate_bearer_token(configured_token: str) -> str:
         token = BEARER_TOKEN_FILE.read_text().strip()
         if token:
             return token
-    # Generate a secure random token
     alphabet = string.ascii_letters + string.digits
     token = "mcp_" + "".join(secrets.choice(alphabet) for _ in range(40))
     BEARER_TOKEN_FILE.write_text(token)
@@ -61,7 +61,7 @@ def load_or_generate_bearer_token(configured_token: str) -> str:
 class DeviceState:
     name: str
     address: str
-    ping_index: int = 0            # used to stagger keepalive pings
+    ping_index: int = 0
     configuration_file: str = ""
     noise_psk: Optional[str] = None
     mac_address: Optional[str] = None
@@ -70,9 +70,11 @@ class DeviceState:
     last_seen: Optional[float] = None
     last_disconnect: Optional[float] = None
     mqtt_discovery_published: bool = False
+    first_ping_done: bool = False
     log_buffer: deque = field(default_factory=lambda: deque(maxlen=5000))
     heartbeat_events: list = field(default_factory=list)
     client: Optional[object] = None
+    reconnect_logic: Optional[object] = None
     connect_task: Optional[asyncio.Task] = None
 
 
@@ -93,7 +95,6 @@ class DeviceManager:
         self.log_retention_seconds = log_retention_hours * 3600
         self.heartbeat_retention_seconds = heartbeat_retention_days * 86400
         self.keepalive_interval = keepalive_interval
-        # Timeout: fixed 5s, but never >= keepalive_interval (so a 2s interval still works)
         self.keepalive_timeout = min(5, keepalive_interval - 1) if keepalive_interval > 1 else 1
         self.bearer_token = load_or_generate_bearer_token(bearer_token)
         self.mqtt_host = mqtt_host
@@ -101,7 +102,7 @@ class DeviceManager:
         self.mqtt_username = mqtt_username
         self.mqtt_password = mqtt_password
         self.devices: dict[str, DeviceState] = {}
-        self._ping_counter = 0     # global counter for assigning stagger indices
+        self._ping_counter = 0
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
         self._load_heartbeat_history()
 
@@ -263,62 +264,89 @@ class DeviceManager:
                     _LOGGER.warning("Device %s has API encryption but no key found in %s", name, configuration_file)
 
             if device.connect_task is None or device.connect_task.done():
-                device.connect_task = asyncio.create_task(self._maintain_connection(name))
+                device.connect_task = asyncio.create_task(self._start_reconnect_logic(name))
 
-    # ── Connection + Logs ───────────────────────────────────────
+    # ── Connection via ReconnectLogic (mDNS-triggered + timer fallback) ──
 
-    async def _maintain_connection(self, device_name: str):
-        if APIClient is None:
-            _LOGGER.error("aioesphomeapi not available, cannot connect to %s", device_name)
+    async def _start_reconnect_logic(self, device_name: str):
+        """Use aioesphomeapi.ReconnectLogic which listens for mDNS announcements
+        and reconnects immediately when a device comes online, with a timer
+        fallback (keepalive_interval * 3) for devices that don't use mDNS.
+
+        This replaces the manual asyncio.sleep(RECONNECT_INTERVAL) loop and
+        gives us near-instant online detection instead of waiting up to 30s.
+        """
+        if not HAS_AIOESPHOMEAPI:
+            _LOGGER.error("aioesphomeapi not available")
             return
 
         device = self.devices[device_name]
 
-        # Stagger initial ping: spread devices evenly across the keepalive interval.
-        # ping_index is assigned at discovery time so the offset is stable across reconnects.
-        # Example: interval=10s, 10 devices → device 0 pings at 0s, device 1 at 1s, ...
+        client = APIClient(
+            device.address,
+            6053,
+            None,
+            noise_psk=device.noise_psk,
+        )
+        device.client = client
+
         num_devices = max(len(self.devices), 1)
         stagger_offset = (device.ping_index % num_devices) * (self.keepalive_interval / num_devices)
 
-        while True:
+        async def on_connect():
+            """Called by ReconnectLogic when connection is established."""
+            _LOGGER.info("Connected to %s", device_name)
+            self._mark_online(device_name)
+            client.subscribe_logs(lambda msg, dn=device_name: self._on_log_message(dn, msg))
+
+            # First ping: get device info for MAC/model + MQTT discovery
+            await asyncio.sleep(stagger_offset)
             try:
-                client = APIClient(device.address, 6053, None, noise_psk=device.noise_psk)
-                await client.connect(login=False)
-                device.client = client
-                self._mark_online(device_name)
-
-                client.subscribe_logs(lambda msg, dn=device_name: self._on_log_message(dn, msg))
-
-                # Wait for this device's stagger slot before starting the ping loop
-                await asyncio.sleep(stagger_offset)
-
-                first_ping = True
-                while device.client is not None:
-                    try:
-                        info = await asyncio.wait_for(
-                            client.device_info(),
-                            timeout=self.keepalive_timeout,
-                        )
-                        if first_ping:
-                            first_ping = False
-                            if not device.mac_address and hasattr(info, "mac_address"):
-                                device.mac_address = info.mac_address
-                            if not device.model and hasattr(info, "model"):
-                                device.model = info.model
-                            if not device.mqtt_discovery_published:
-                                asyncio.create_task(self._publish_mqtt_discovery(device))
-                    except Exception:
-                        break
-                    await asyncio.sleep(self.keepalive_interval)
-
-            except APIConnectionError:
-                pass
+                info = await asyncio.wait_for(client.device_info(), timeout=self.keepalive_timeout)
+                if not device.first_ping_done:
+                    device.first_ping_done = True
+                    if not device.mac_address and hasattr(info, "mac_address"):
+                        device.mac_address = info.mac_address
+                    if not device.model and hasattr(info, "model"):
+                        device.model = info.model
+                    if not device.mqtt_discovery_published:
+                        asyncio.create_task(self._publish_mqtt_discovery(device))
             except Exception as err:
-                _LOGGER.debug("Connection attempt to %s failed: %s", device_name, err)
+                _LOGGER.debug("First ping failed for %s: %s", device_name, err)
 
+            # Keepalive loop — ReconnectLogic handles reconnect on disconnect,
+            # we just need to detect the disconnect via a failing ping
+            while True:
+                await asyncio.sleep(self.keepalive_interval)
+                try:
+                    await asyncio.wait_for(client.device_info(), timeout=self.keepalive_timeout)
+                except Exception:
+                    _LOGGER.debug("Keepalive ping failed for %s, disconnecting", device_name)
+                    break
+
+        async def on_disconnect(expected: bool):
+            """Called by ReconnectLogic when connection is lost."""
+            _LOGGER.info("Disconnected from %s (expected=%s)", device_name, expected)
             self._mark_offline(device_name)
-            device.client = None
-            await asyncio.sleep(RECONNECT_INTERVAL)
+
+        reconnect_logic = ReconnectLogic(
+            client=client,
+            on_connect=on_connect,
+            on_disconnect=on_disconnect,
+            # zeroconf_instance=None means ReconnectLogic creates its own
+            # This enables mDNS-triggered reconnects automatically
+            zeroconf_instance=None,
+        )
+        device.reconnect_logic = reconnect_logic
+
+        await reconnect_logic.start()
+
+        # Keep task alive — ReconnectLogic runs in background
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        finally:
+            await reconnect_logic.stop()
 
     def _on_log_message(self, device_name: str, msg):
         device = self.devices.get(device_name)
