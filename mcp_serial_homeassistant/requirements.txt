@@ -1,4 +1,4 @@
-mcp==1.3.0
-uvicorn==0.34.0
+fastmcp
+uvicorn
 pyserial==3.5
 pyudev==0.24.3

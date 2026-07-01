@@ -9,6 +9,7 @@ import os
 import threading
 import time
 import glob
+import json
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,8 +17,7 @@ from pathlib import Path
 import serial
 import pyudev
 import uvicorn
-from mcp.server.fastmcp import FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
+from fastmcp import FastMCP
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -28,14 +28,12 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("mcp_serial")
-for _noisy in ("uvicorn.access", "uvicorn.error", "mcp", "mcp.server"):
+for _noisy in ("uvicorn.access", "uvicorn.error", "mcp", "fastmcp"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # Konfiguration aus HA options.json
 # ---------------------------------------------------------------------------
-import json
-
 def load_options() -> dict:
     try:
         with open("/data/options.json") as f:
@@ -46,13 +44,12 @@ def load_options() -> dict:
 opts = load_options()
 
 state = {
-    "baud_rate":          opts.get("baud_rate", 115200),
-    "active_port":        None,   # None = auto-detect
-    "ring_buffer_lines":  opts.get("ring_buffer_lines", 300),
+    "baud_rate":           opts.get("baud_rate", 115200),
+    "active_port":         None,
+    "ring_buffer_lines":   opts.get("ring_buffer_lines", 300),
     "log_retention_hours": opts.get("log_retention_hours", 24),
-    "log_max_size_mb":    opts.get("log_max_size_mb", 20),
+    "log_max_size_mb":     opts.get("log_max_size_mb", 20),
 }
-
 MCP_PORT = int(opts.get("port", 8769))
 
 # ---------------------------------------------------------------------------
@@ -100,13 +97,12 @@ def write_log_line(entry: dict):
             log.warning("Log write error: %s", e)
 
 # ---------------------------------------------------------------------------
-# Auto-Detect: erster ttyACM* bevorzugt (ESP32-S2), dann ttyUSB*
+# Auto-Detect
 # ---------------------------------------------------------------------------
 def auto_detect_port() -> str | None:
     acm = sorted(glob.glob("/dev/ttyACM*"))
     usb = sorted(glob.glob("/dev/ttyUSB*"))
-    candidates = acm + usb
-    return candidates[0] if candidates else None
+    return (acm + usb)[0] if (acm or usb) else None
 
 # ---------------------------------------------------------------------------
 # Serielle Verbindung
@@ -151,7 +147,7 @@ def read_loop():
                         ring_buffer.append(entry)
                     write_log_line(entry)
             except serial.SerialException:
-                log.info("Port verloren (ESP schlaeft?) - warte auf udev...")
+                log.info("Port verloren - warte auf udev...")
                 with ser_lock:
                     try:
                         ser.close()
@@ -164,9 +160,6 @@ def read_loop():
         else:
             time.sleep(0.05)
 
-# ---------------------------------------------------------------------------
-# pyudev Watcher fuer ESP32-S2 Re-Enumeration
-# ---------------------------------------------------------------------------
 def udev_watcher():
     try:
         context = pyudev.Context()
@@ -182,8 +175,8 @@ def udev_watcher():
                     continue
                 target = state["active_port"]
                 if target is None or dev_node == target:
-                    log.info("udev: Neues Device %s - oeffne...", dev_node)
-                    time.sleep(0.15)  # warten bis USB-CDC ready
+                    log.info("udev: %s erkannt - oeffne...", dev_node)
+                    time.sleep(0.15)
                     if open_port(dev_node, state["baud_rate"]):
                         if state["active_port"] is None:
                             state["active_port"] = dev_node
@@ -191,19 +184,13 @@ def udev_watcher():
         log.error("udev Watcher Fehler: %s", e)
 
 # ---------------------------------------------------------------------------
-# FastMCP Server
+# FastMCP Tools
 # ---------------------------------------------------------------------------
-mcp = FastMCP(
-    name="MCP Serial HomeAssistant",
-    instructions="Serieller Port Listener fuer ESP32-S2. Liest UART-Output persistent ohne Reconnect.",
-)
-mcp.settings.transport_security = TransportSecuritySettings(
-    enable_dns_rebinding_protection=False
-)
+mcp = FastMCP("MCP Serial HomeAssistant")
 
 @mcp.tool()
 def serial_read_recent(lines: int = 50) -> dict:
-    """Letzte N Zeilen aus dem RAM-Ring-Buffer (schnell, kein Disk-IO). Fuer kurze Checks nach ESP32-S2 Aufwachen."""
+    """Letzte N Zeilen aus dem RAM-Ring-Buffer. Fuer schnelle Checks nach ESP32-S2 Aufwachen."""
     n = min(lines, state["ring_buffer_lines"])
     with buffer_lock:
         items = list(ring_buffer)[-n:]
@@ -211,7 +198,7 @@ def serial_read_recent(lines: int = 50) -> dict:
 
 @mcp.tool()
 def serial_read_timerange(since: str = "", until: str = "", max_lines: int = 5000) -> dict:
-    """Log-Eintraege aus persistierter Disk-Log-Datei fuer einen Zeitraum. since/until als ISO timestamp."""
+    """Log-Eintraege aus Disk-Log fuer Zeitraum. since/until als ISO timestamp."""
     results = []
     for lf in sorted(LOG_DIR.glob("*.log")):
         try:
@@ -236,17 +223,11 @@ def serial_read_timerange(since: str = "", until: str = "", max_lines: int = 500
             continue
         if len(results) >= max_lines:
             break
-    return {
-        "lines": results,
-        "count": len(results),
-        "since": since or None,
-        "until": until or None,
-        "truncated": len(results) >= max_lines,
-    }
+    return {"lines": results, "count": len(results), "truncated": len(results) >= max_lines}
 
 @mcp.tool()
 def serial_list_ports() -> dict:
-    """Zeigt alle verfuegbaren seriellen Ports auf dem HA-Host (ttyACM*, ttyUSB*) inkl. by-id Symlinks."""
+    """Zeigt alle verfuegbaren seriellen Ports (ttyACM*, ttyUSB*) inkl. by-id Symlinks."""
     ports = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
     by_id = {}
     try:
@@ -259,7 +240,7 @@ def serial_list_ports() -> dict:
 
 @mcp.tool()
 def serial_set_port(port: str) -> dict:
-    """Wechselt den aktiven seriellen Port live (kein Neustart). Ueberschreibt Auto-Detect. z.B. /dev/ttyACM0"""
+    """Wechselt den aktiven seriellen Port live. z.B. /dev/ttyACM0"""
     if not os.path.exists(port):
         return {"error": f"{port} nicht gefunden"}
     state["active_port"] = port
@@ -268,14 +249,14 @@ def serial_set_port(port: str) -> dict:
 
 @mcp.tool()
 def serial_set_baudrate(baud_rate: int) -> dict:
-    """Aendert die Baudrate live ohne Neustart. Gilt sofort auf offenem Port. z.B. 115200, 9600, 921600"""
+    """Aendert die Baudrate live ohne Neustart. z.B. 115200, 9600, 921600"""
     state["baud_rate"] = baud_rate
     with ser_lock:
         s = ser
     if s and s.is_open:
         try:
             s.baudrate = baud_rate
-            return {"baud_rate": baud_rate, "applied": True, "note": "Live geaendert"}
+            return {"baud_rate": baud_rate, "applied": True}
         except Exception as e:
             return {"baud_rate": baud_rate, "applied": False, "error": str(e)}
     return {"baud_rate": baud_rate, "applied": False, "note": "Kein Port offen, gilt beim naechsten Open"}
@@ -286,7 +267,6 @@ def serial_status() -> dict:
     with ser_lock:
         s = ser
     log_files = list(LOG_DIR.glob("*.log"))
-    log_size = sum(f.stat().st_size for f in log_files)
     with buffer_lock:
         buf_len = len(ring_buffer)
     return {
@@ -297,26 +277,23 @@ def serial_status() -> dict:
         "ring_buffer_used": buf_len,
         "ring_buffer_capacity": state["ring_buffer_lines"],
         "log_files": len(log_files),
-        "log_size_bytes": log_size,
+        "log_size_bytes": sum(f.stat().st_size for f in log_files),
     }
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Background Threads
     threading.Thread(target=read_loop, daemon=True).start()
     threading.Thread(target=udev_watcher, daemon=True).start()
 
-    # Auto-detect beim Start
     port = auto_detect_port()
     if port:
         state["active_port"] = port
         open_port(port, state["baud_rate"])
     else:
-        log.info("Kein Port beim Start gefunden - warte auf udev-Event...")
+        log.info("Kein Port beim Start - warte auf udev...")
 
-    log.info("MCP Serial HomeAssistant gestartet auf Port %d", MCP_PORT)
-
-    app = mcp.streamable_http_app()
+    log.info("MCP Serial gestartet auf Port %d", MCP_PORT)
+    app = mcp.http_app()
     uvicorn.run(app, host="0.0.0.0", port=MCP_PORT, log_level="warning")
