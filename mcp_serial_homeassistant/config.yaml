@@ -1,6 +1,6 @@
 name: "MCP Serial HomeAssistant"
 description: "Persistent serial port listener for ESP32-S2 (USB-CDC) as MCP server via stdio proxy"
-version: "1.0.1"
+version: "1.0.2"
 slug: "mcp_serial_homeassistant"
 url: "https://github.com/eragon02424/Home-Assistant"
 init: false
@@ -14,6 +14,7 @@ startup: services
 boot: auto
 host_network: true
 full_access: true
+uart: true
 map:
   - config:rw
 options:
