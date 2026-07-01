@@ -1,6 +1,6 @@
 name: "MCP ESPHome"
 description: "Vermittler-Service zwischen Claude und ESPHome-Geräten via native API."
-version: "0.1.7"
+version: "0.1.8"
 slug: "mcp_esphome"
 init: false
 arch:
@@ -18,7 +18,7 @@ options:
   port: 8090
   log_retention_hours: 24
   heartbeat_retention_days: 30
-  keepalive_interval: 10
+  keepalive_interval: 30
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
   mqtt_username: ""
