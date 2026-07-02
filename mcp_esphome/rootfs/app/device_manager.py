@@ -40,8 +40,6 @@ DISCOVERY_INTERVAL_SECONDS = 60
 BEARER_TOKEN_FILE = STORAGE_DIR / "bearer_token.txt"
 MDNS_SERVICE_TYPE = "_esphomelib._tcp.local."
 
-# Simplified pattern: just find "encryption:" followed by "key:" anywhere in the file.
-# The original pattern anchored on "api:" caused silent failures in the container.
 _NOISE_KEY_RE = re.compile(
     r"encryption:\s*\n\s*key:\s*[\"']?([A-Za-z0-9+/=]+)[\"']?"
 )
@@ -79,6 +77,9 @@ class DeviceState:
     last_disconnect: Optional[float] = None
     mqtt_discovery_published: bool = False
     first_ping_done: bool = False
+    # False for stubs created by _load_heartbeat_history.
+    # mDNS connects are blocked until _discover_new_devices sets this True.
+    initialized: bool = False
     log_buffer: deque = field(default_factory=lambda: deque(maxlen=5000))
     heartbeat_events: list = field(default_factory=list)
     client: Optional[object] = None
@@ -119,13 +120,18 @@ class DeviceManager:
         return STORAGE_DIR / f"heartbeat_{device_name.replace('/', '_')}.json"
 
     def _load_heartbeat_history(self):
+        """Load heartbeat events from disk as stubs (initialized=False).
+        mDNS connects are blocked until _discover_new_devices sets initialized=True.
+        """
         for f in STORAGE_DIR.glob("heartbeat_*.json"):
             try:
                 device_name = f.stem.replace("heartbeat_", "")
                 with open(f) as fh:
                     events = json.load(fh)
                 if device_name not in self.devices:
-                    self.devices[device_name] = DeviceState(name=device_name, address="")
+                    self.devices[device_name] = DeviceState(
+                        name=device_name, address="", initialized=False
+                    )
                 self.devices[device_name].heartbeat_events = events
             except Exception as err:
                 _LOGGER.warning("Failed to load heartbeat history from %s: %s", f, err)
@@ -154,10 +160,7 @@ class DeviceManager:
             _LOGGER.info("Could not read %s: %s", path, err)
             return None
         match = _NOISE_KEY_RE.search(content)
-        if match:
-            return match.group(1)
-        _LOGGER.debug("No noise key found in %s", path)
-        return None
+        return match.group(1) if match else None
 
     async def _publish_mqtt_discovery(self, device: DeviceState):
         if aiomqtt is None:
@@ -199,14 +202,16 @@ class DeviceManager:
             _LOGGER.warning("MQTT state publish failed for %s: %s", device.name, err)
 
     async def run_initial_discovery(self):
-        """Run one complete discovery pass synchronously before mDNS starts."""
+        """Run one complete discovery pass synchronously before mDNS starts.
+        After this all devices have initialized=True and noise_psk loaded.
+        """
         try:
             await self._discover_new_devices()
         except Exception as err:
             _LOGGER.error("Initial discovery error: %s", err)
 
     async def run_discovery_loop(self):
-        """Poll for NEW devices every 60s — sleeps first since initial discovery already ran."""
+        """Poll for new devices every 60s — sleeps first."""
         while True:
             await asyncio.sleep(DISCOVERY_INTERVAL_SECONDS)
             try:
@@ -234,26 +239,42 @@ class DeviceManager:
             if not name:
                 continue
 
-            if name in self.devices:
-                d = self.devices[name]
-                d.address = entry.get("address") or f"{name}.local"
-                if entry.get("mac_address") and not d.mac_address:
-                    d.mac_address = entry["mac_address"]
-                continue
-
             address = entry.get("address") or f"{name}.local"
             configuration_file = entry.get("configuration", "")
             api_encrypted = entry.get("api_encrypted", False)
-            dashboard_online = entry.get("online", False)
+            dashboard_online = entry.get("online") or False
 
-            device = DeviceState(name=name, address=address, ping_index=self._ping_counter)
+            if name in self.devices:
+                device = self.devices[name]
+                device.address = address
+                if entry.get("mac_address") and not device.mac_address:
+                    device.mac_address = entry["mac_address"]
+                # Load PSK for stubs created by _load_heartbeat_history
+                if not device.initialized:
+                    device.configuration_file = configuration_file
+                    psk = self._read_noise_psk(configuration_file)
+                    device.noise_psk = psk
+                    device.initialized = True
+                    if psk:
+                        _LOGGER.info("Noise PSK loaded (stub) for %s", name)
+                    elif api_encrypted:
+                        _LOGGER.warning("No noise PSK for encrypted device %s", name)
+                continue
+
+            # Truly new device
+            psk = self._read_noise_psk(configuration_file)
+            device = DeviceState(
+                name=name,
+                address=address,
+                ping_index=self._ping_counter,
+                configuration_file=configuration_file,
+                noise_psk=psk,
+                initialized=True,
+            )
             self._ping_counter += 1
-            device.configuration_file = configuration_file
             if entry.get("mac_address"):
                 device.mac_address = entry["mac_address"]
 
-            psk = self._read_noise_psk(configuration_file)
-            device.noise_psk = psk
             if psk:
                 _LOGGER.info("Noise PSK loaded for %s", name)
             elif api_encrypted:
@@ -273,8 +294,6 @@ class DeviceManager:
             _LOGGER.info("Sequential init: %d online, %d offline skipped",
                          len(new_online), len(new_offline))
             asyncio.create_task(self._sequential_init(new_online))
-        elif new_offline:
-            _LOGGER.info("All %d new device(s) offline — waiting for mDNS", len(new_offline))
 
     async def _sequential_init(self, device_names: list[str]):
         total = len(device_names)
@@ -331,7 +350,12 @@ class DeviceManager:
         if not HAS_AIOESPHOMEAPI:
             return
         device = self.devices.get(device_name)
-        if not device or device.online or device.connecting:
+        if not device:
+            return
+        if not device.initialized:
+            _LOGGER.debug("mDNS connect for %s rejected: not yet initialized", device_name)
+            return
+        if device.online or device.connecting:
             return
 
         device.connecting = True
@@ -427,7 +451,8 @@ class DeviceManager:
                                .replace(f".{MDNS_SERVICE_TYPE}", "")
                                .replace(f".{type_}", "")
                                .rstrip("."))
-                if device_name in mgr.devices and not mgr.devices[device_name].online:
+                device = mgr.devices.get(device_name)
+                if device and device.initialized and not device.online:
                     _LOGGER.info("mDNS announce received: %s → triggering connect", device_name)
                     asyncio.run_coroutine_threadsafe(
                         mgr._connect_device(device_name, source="ESPHome/mDNS"),
