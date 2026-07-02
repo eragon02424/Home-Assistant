@@ -1,4 +1,31 @@
-"""Device Manager - handles ESPHome device discovery, connections, logs and heartbeat history."""
+"""Device Manager - handles ESPHome device discovery and heartbeat history.
+
+Architecture:
+─────────────
+STARTUP
+  1. _load_heartbeat_history() — creates stubs from disk (initialized=False)
+  2. run_initial_discovery() — fetches /devices from ESPHome dashboard:
+       - sets address, mac, psk for every device (stubs get initialized=True)
+       - devices with state=online get a keepalive task started
+  3. start_mdns_listener() — global ServiceBrowser for _esphomelib._tcp.local.
+
+ONLINE DETECTION
+  mDNS add_service fires for every announce (independent of previous state).
+  If device.initialized and not device.online:
+    → TCP ping port 6053 (200ms timeout, 2 retries)
+    → success → _mark_online + start keepalive task
+
+OFFLINE DETECTION
+  Per-device keepalive task (only for online devices).
+  Every keepalive_interval seconds: TCP ping port 6053.
+  All retries fail → _mark_offline, task ends.
+
+DISCOVERY LOOP (60s)
+  Only registers new devices. Never re-triggers connects for known devices.
+
+ZERO aioesphomeapi — no internal heartbeat conflicts.
+ZERO CPU for offline devices.
+"""
 import asyncio
 import json
 import logging
@@ -6,7 +33,6 @@ import re
 import secrets
 import string
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -14,23 +40,11 @@ from typing import Optional
 import aiohttp
 
 try:
-    from aioesphomeapi import APIClient
-    HAS_AIOESPHOMEAPI = True
-except ImportError:
-    APIClient = None
-    HAS_AIOESPHOMEAPI = False
-
-try:
     from zeroconf import ServiceBrowser
     from zeroconf.asyncio import AsyncZeroconf
     HAS_ZEROCONF = True
 except ImportError:
     HAS_ZEROCONF = False
-
-try:
-    import aiomqtt
-except ImportError:
-    aiomqtt = None
 
 _LOGGER = logging.getLogger("mcp_esphome.device_manager")
 
@@ -71,18 +85,13 @@ class DeviceState:
     configuration_file: str = ""
     noise_psk: Optional[str] = None
     mac_address: Optional[str] = None
-    model: Optional[str] = None
     online: bool = False
     last_seen: Optional[float] = None
     last_disconnect: Optional[float] = None
-    mqtt_discovery_published: bool = False
-    first_ping_done: bool = False
-    # False for stubs created by _load_heartbeat_history.
+    # False for stubs from _load_heartbeat_history.
     # mDNS connects are blocked until _discover_new_devices sets this True.
     initialized: bool = False
-    log_buffer: deque = field(default_factory=lambda: deque(maxlen=5000))
     heartbeat_events: list = field(default_factory=list)
-    client: Optional[object] = None
     keepalive_task: Optional[asyncio.Task] = None
     connecting: bool = False
 
@@ -95,20 +104,15 @@ class DeviceManager:
         heartbeat_retention_days: int,
         keepalive_interval: int = 10,
         keepalive_retries: int = 2,
-        keepalive_ping_timeout_ms: int = 100,
+        keepalive_ping_timeout_ms: int = 200,
         bearer_token: str = "",
-        mqtt_host: str = "core-mosquitto",
-        mqtt_port: int = 1883,
     ):
         self.esphome_dashboard_url = esphome_dashboard_url.rstrip("/")
-        self.log_retention_seconds = log_retention_hours * 3600
         self.heartbeat_retention_seconds = heartbeat_retention_days * 86400
         self.keepalive_interval = keepalive_interval
         self.keepalive_retries = keepalive_retries
         self.keepalive_ping_timeout = keepalive_ping_timeout_ms / 1000.0
         self.bearer_token = load_or_generate_bearer_token(bearer_token)
-        self.mqtt_host = mqtt_host
-        self.mqtt_port = mqtt_port
         self.devices: dict[str, DeviceState] = {}
         self._ping_counter = 0
         self._azeroconf: Optional[object] = None
@@ -116,13 +120,12 @@ class DeviceManager:
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
         self._load_heartbeat_history()
 
+    # ── Persistence ──────────────────────────────────────────────
+
     def _heartbeat_file(self, device_name: str) -> Path:
         return STORAGE_DIR / f"heartbeat_{device_name.replace('/', '_')}.json"
 
     def _load_heartbeat_history(self):
-        """Load heartbeat events from disk as stubs (initialized=False).
-        mDNS connects are blocked until _discover_new_devices sets initialized=True.
-        """
         for f in STORAGE_DIR.glob("heartbeat_*.json"):
             try:
                 device_name = f.stem.replace("heartbeat_", "")
@@ -149,6 +152,8 @@ class DeviceManager:
         cutoff = time.time() - self.heartbeat_retention_seconds
         device.heartbeat_events = [e for e in device.heartbeat_events if e[0] >= cutoff]
 
+    # ── Noise PSK ─────────────────────────────────────────────
+
     def _read_noise_psk(self, configuration_file: str) -> Optional[str]:
         if not configuration_file:
             return None
@@ -162,48 +167,30 @@ class DeviceManager:
         match = _NOISE_KEY_RE.search(content)
         return match.group(1) if match else None
 
-    async def _publish_mqtt_discovery(self, device: DeviceState):
-        if aiomqtt is None:
-            return
-        identifier = device.mac_address.replace(":", "") if device.mac_address else f"esphome_{device.name}"
-        unique_id = f"mcp_esphome_{identifier}_online"
-        state_topic = f"mcp_esphome/{device.name}/online"
-        config_topic = f"homeassistant/binary_sensor/{unique_id}/config"
-        device_block: dict = {"name": device.name, "identifiers": [identifier]}
-        if device.mac_address:
-            device_block["connections"] = [["mac", device.mac_address]]
-        if device.model:
-            device_block["model"] = device.model
-        payload = {
-            "name": "Online", "unique_id": unique_id, "device_class": "connectivity",
-            "state_topic": state_topic, "payload_on": "ON", "payload_off": "OFF",
-            "device": device_block,
-        }
-        try:
-            async with aiomqtt.Client(hostname=self.mqtt_host, port=self.mqtt_port) as client:
-                await client.publish(config_topic, payload=json.dumps(payload), retain=True)
-                await client.publish(state_topic, payload="ON" if device.online else "OFF", retain=True)
-            _LOGGER.info("MQTT Discovery published for %s", device.name)
-            device.mqtt_discovery_published = True
-        except Exception as err:
-            _LOGGER.error("MQTT discovery failed for %s: %s", device.name, err)
+    # ── TCP ping ──────────────────────────────────────────────
 
-    async def _publish_mqtt_state(self, device: DeviceState, online: bool):
-        if aiomqtt is None or not device.mqtt_discovery_published:
-            return
+    async def _tcp_ping(self, address: str, port: int = 6053) -> bool:
+        """Open a TCP connection to address:port and close it immediately.
+        Returns True if the connection was accepted, False on any error.
+        A successful TCP handshake proves the device is reachable.
+        We close immediately so the device sees a clean FIN — minimal load.
+        """
         try:
-            async with aiomqtt.Client(hostname=self.mqtt_host, port=self.mqtt_port) as client:
-                await client.publish(
-                    f"mcp_esphome/{device.name}/online",
-                    payload="ON" if online else "OFF",
-                    retain=True,
-                )
-        except Exception as err:
-            _LOGGER.warning("MQTT state publish failed for %s: %s", device.name, err)
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(address, port),
+                timeout=self.keepalive_ping_timeout,
+            )
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except Exception:
+            return False
+
+    # ── Discovery ──────────────────────────────────────────────
 
     async def run_initial_discovery(self):
-        """Run one complete discovery pass synchronously before mDNS starts.
-        After this all devices have initialized=True and noise_psk loaded.
+        """Fetch /devices once before mDNS starts so all devices have
+        initialized=True and noise_psk loaded before any mDNS announce fires.
         """
         try:
             await self._discover_new_devices()
@@ -211,7 +198,9 @@ class DeviceManager:
             _LOGGER.error("Initial discovery error: %s", err)
 
     async def run_discovery_loop(self):
-        """Poll for new devices every 60s — sleeps first."""
+        """Poll /devices every 60s for newly configured devices only.
+        Sleeps first — initial discovery already ran at startup.
+        """
         while True:
             await asyncio.sleep(DISCOVERY_INTERVAL_SECONDS)
             try:
@@ -222,7 +211,9 @@ class DeviceManager:
     async def _discover_new_devices(self):
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(f"{self.esphome_dashboard_url}/devices", timeout=10) as resp:
+                async with session.get(
+                    f"{self.esphome_dashboard_url}/devices", timeout=10
+                ) as resp:
                     if resp.status != 200:
                         return
                     data = await resp.json()
@@ -232,7 +223,6 @@ class DeviceManager:
 
         configured = data.get("configured", []) if isinstance(data, dict) else []
         new_online: list[str] = []
-        new_offline: list[str] = []
 
         for entry in configured:
             name = entry.get("name")
@@ -240,16 +230,18 @@ class DeviceManager:
                 continue
 
             address = entry.get("address") or f"{name}.local"
+            mac = entry.get("mac_address", "")
             configuration_file = entry.get("configuration", "")
             api_encrypted = entry.get("api_encrypted", False)
-            dashboard_online = entry.get("online") or False
+            # ESPHome reports state as string: "online"/"offline"/None
+            dashboard_online = entry.get("state") == "online"
 
             if name in self.devices:
                 device = self.devices[name]
                 device.address = address
-                if entry.get("mac_address") and not device.mac_address:
-                    device.mac_address = entry["mac_address"]
-                # Load PSK for stubs created by _load_heartbeat_history
+                if mac and not device.mac_address:
+                    device.mac_address = mac
+                # Initialize stubs created by _load_heartbeat_history
                 if not device.initialized:
                     device.configuration_file = configuration_file
                     psk = self._read_noise_psk(configuration_file)
@@ -259,9 +251,12 @@ class DeviceManager:
                         _LOGGER.info("Noise PSK loaded (stub) for %s", name)
                     elif api_encrypted:
                         _LOGGER.warning("No noise PSK for encrypted device %s", name)
+                    # If dashboard says online and we have no keepalive running, start one
+                    if dashboard_online and not device.online:
+                        new_online.append(name)
                 continue
 
-            # Truly new device
+            # New device
             psk = self._read_noise_psk(configuration_file)
             device = DeviceState(
                 name=name,
@@ -269,139 +264,65 @@ class DeviceManager:
                 ping_index=self._ping_counter,
                 configuration_file=configuration_file,
                 noise_psk=psk,
+                mac_address=mac or None,
                 initialized=True,
             )
             self._ping_counter += 1
-            if entry.get("mac_address"):
-                device.mac_address = entry["mac_address"]
 
             if psk:
                 _LOGGER.info("Noise PSK loaded for %s", name)
             elif api_encrypted:
-                _LOGGER.warning("No noise PSK found for encrypted device %s (config: %s)",
+                _LOGGER.warning("No noise PSK for encrypted device %s (config: %s)",
                                 name, configuration_file)
 
             self.devices[name] = device
 
             if dashboard_online:
                 new_online.append(name)
-                _LOGGER.info("New device (online): %s @ %s psk=%s", name, address, psk is not None)
+                _LOGGER.info("New device (online): %s @ %s", name, address)
             else:
-                new_offline.append(name)
                 _LOGGER.debug("New device (offline): %s — waiting for mDNS", name)
 
         if new_online:
-            _LOGGER.info("Sequential init: %d online, %d offline skipped",
-                         len(new_online), len(new_offline))
-            asyncio.create_task(self._sequential_init(new_online))
+            _LOGGER.info("Starting keepalive for %d online device(s)", len(new_online))
+            for name in new_online:
+                asyncio.create_task(self._bring_online(name, source="dashboard"))
 
-    async def _sequential_init(self, device_names: list[str]):
-        total = len(device_names)
-        for i, name in enumerate(device_names):
-            device = self.devices.get(name)
-            if not device or device.online:
-                continue
+    # ── Online / Keepalive ───────────────────────────────────────
 
-            _LOGGER.info("Init [%d/%d] %s @ %s (psk=%s)",
-                         i + 1, total, name, device.address, device.noise_psk is not None)
-            connected = False
-
-            for attempt in range(1, self.keepalive_retries + 1):
-                if device.online:
-                    break
-                try:
-                    client = APIClient(device.address, 6053, None, noise_psk=device.noise_psk)
-                    await client.connect(login=False)
-                    device.client = client
-                    _LOGGER.info("ONLINE (dashboard): %s (attempt %d/%d)",
-                                 name, attempt, self.keepalive_retries)
-                    self._mark_online(name)
-                    client.subscribe_logs(lambda msg, dn=name: self._on_log_message(dn, msg))
-                    try:
-                        info = await asyncio.wait_for(
-                            client.device_info(), timeout=self.keepalive_ping_timeout
-                        )
-                        device.first_ping_done = True
-                        if not device.mac_address and hasattr(info, "mac_address"):
-                            device.mac_address = info.mac_address
-                        if not device.model and hasattr(info, "model"):
-                            device.model = info.model
-                        if not device.mqtt_discovery_published:
-                            asyncio.create_task(self._publish_mqtt_discovery(device))
-                    except Exception:
-                        pass
-                    num = max(len(self.devices), 1)
-                    stagger = (device.ping_index % num) * (self.keepalive_interval / num)
-                    device.keepalive_task = asyncio.create_task(
-                        self._keepalive_loop(name, client, stagger)
-                    )
-                    connected = True
-                    break
-                except Exception as err:
-                    _LOGGER.info("Init failed [%d/%d] %s: %s",
-                                 attempt, self.keepalive_retries, name, err)
-                    if attempt < self.keepalive_retries:
-                        await asyncio.sleep(self.keepalive_ping_timeout)
-
-            if not connected:
-                _LOGGER.info("Init: %s unreachable — mDNS will reconnect", name)
-
-    async def _connect_device(self, device_name: str, source: str):
-        if not HAS_AIOESPHOMEAPI:
-            return
+    async def _bring_online(self, device_name: str, source: str):
+        """Confirm device is reachable via TCP ping, then mark online and
+        start the keepalive task. Called from both mDNS and dashboard init.
+        Uses connecting flag to prevent simultaneous attempts.
+        """
         device = self.devices.get(device_name)
-        if not device:
-            return
-        if not device.initialized:
-            _LOGGER.debug("mDNS connect for %s rejected: not yet initialized", device_name)
+        if not device or not device.initialized:
             return
         if device.online or device.connecting:
             return
 
         device.connecting = True
         try:
-            _LOGGER.info("Connecting [%s] %s @ %s (psk=%s)",
-                         source, device_name, device.address, device.noise_psk is not None)
-            client = APIClient(device.address, 6053, None, noise_psk=device.noise_psk)
-            try:
-                await client.connect(login=False)
-            except Exception as err:
-                _LOGGER.info("Connect failed [%s] %s: %s", source, device_name, err)
+            ok = await self._tcp_ping(device.address)
+            if not ok:
+                _LOGGER.info("TCP ping failed [%s] %s — staying offline", source, device_name)
                 return
-
-            device.client = client
             _LOGGER.info("ONLINE (%s): %s", source, device_name)
             self._mark_online(device_name)
-            client.subscribe_logs(lambda msg, dn=device_name: self._on_log_message(dn, msg))
-
-            if not device.first_ping_done:
-                try:
-                    info = await asyncio.wait_for(
-                        client.device_info(), timeout=self.keepalive_ping_timeout
-                    )
-                    device.first_ping_done = True
-                    if not device.mac_address and hasattr(info, "mac_address"):
-                        device.mac_address = info.mac_address
-                    if not device.model and hasattr(info, "model"):
-                        device.model = info.model
-                    if not device.mqtt_discovery_published:
-                        asyncio.create_task(self._publish_mqtt_discovery(device))
-                except Exception:
-                    pass
-
             device.keepalive_task = asyncio.create_task(
-                self._keepalive_loop(device_name, client, 0)
+                self._keepalive_loop(device_name)
             )
         finally:
             device.connecting = False
 
-    async def _keepalive_loop(self, device_name: str, client: object, initial_stagger: float):
+    async def _keepalive_loop(self, device_name: str):
+        """TCP-ping device every keepalive_interval seconds.
+        All retries exhausted → mark offline, task ends.
+        No aioesphomeapi involved — no internal heartbeat conflicts.
+        """
         device = self.devices.get(device_name)
         if not device:
             return
-
-        if initial_stagger > 0:
-            await asyncio.sleep(initial_stagger)
 
         while True:
             await asyncio.sleep(self.keepalive_interval)
@@ -411,31 +332,30 @@ class DeviceManager:
 
             success = False
             for attempt in range(1, self.keepalive_retries + 1):
-                try:
-                    await asyncio.wait_for(
-                        client.device_info(),  # type: ignore[arg-type]
-                        timeout=self.keepalive_ping_timeout,
-                    )
+                ok = await self._tcp_ping(device.address)
+                if ok:
                     device.last_seen = time.time()
                     _LOGGER.info("Keepalive OK: %s (attempt %d/%d)",
                                  device_name, attempt, self.keepalive_retries)
                     success = True
                     break
-                except asyncio.CancelledError:
-                    raise
-                except Exception as err:
-                    _LOGGER.info("Keepalive attempt %d/%d failed: %s — %s",
-                                 attempt, self.keepalive_retries, device_name, err)
-                    if attempt < self.keepalive_retries:
-                        await asyncio.sleep(self.keepalive_ping_timeout)
+                _LOGGER.info("Keepalive attempt %d/%d failed: %s",
+                             attempt, self.keepalive_retries, device_name)
+                if attempt < self.keepalive_retries:
+                    await asyncio.sleep(self.keepalive_ping_timeout)
 
             if not success:
                 _LOGGER.info("OFFLINE (Keepalive): %s", device_name)
                 self._mark_offline(device_name)
-                device.client = None
                 break
 
+    # ── mDNS listener ──────────────────────────────────────────
+
     async def start_mdns_listener(self):
+        """One global Zeroconf browser for all ESPHome devices.
+        add_service fires on every mDNS announce regardless of prior state.
+        We check device.online internally to avoid starting duplicate tasks.
+        """
         if not HAS_ZEROCONF:
             _LOGGER.warning("zeroconf not available — mDNS wakeup disabled")
             return
@@ -445,7 +365,7 @@ class DeviceManager:
         zc = self._azeroconf.zeroconf  # type: ignore[attr-defined]
         mgr = self
 
-        class _ESPHomeListener:
+        class _Listener:
             def add_service(self, zc, type_, name):
                 device_name = (name
                                .replace(f".{MDNS_SERVICE_TYPE}", "")
@@ -453,48 +373,32 @@ class DeviceManager:
                                .rstrip("."))
                 device = mgr.devices.get(device_name)
                 if device and device.initialized and not device.online:
-                    _LOGGER.info("mDNS announce received: %s → triggering connect", device_name)
+                    _LOGGER.info("mDNS announce: %s → TCP ping", device_name)
                     asyncio.run_coroutine_threadsafe(
-                        mgr._connect_device(device_name, source="ESPHome/mDNS"),
+                        mgr._bring_online(device_name, source="ESPHome/mDNS"),
                         mgr._loop,
                     )
 
             def remove_service(self, zc, type_, name):
-                pass
+                pass  # offline detection via keepalive only
 
             def update_service(self, zc, type_, name):
                 self.add_service(zc, type_, name)
 
-        ServiceBrowser(zc, MDNS_SERVICE_TYPE, _ESPHomeListener())
-        _LOGGER.info("Global mDNS listener started for %s", MDNS_SERVICE_TYPE)
+        ServiceBrowser(zc, MDNS_SERVICE_TYPE, _Listener())
+        _LOGGER.info("Global mDNS listener started")
 
-    def _on_log_message(self, device_name: str, msg):
-        device = self.devices.get(device_name)
-        if not device:
-            return
-        line = getattr(msg, "message", str(msg))
-        if isinstance(line, bytes):
-            line = line.decode("utf-8", errors="replace")
-        device.log_buffer.append((time.time(), line))
-        self._mark_online(device_name)
-        self._prune_logs(device_name)
-
-    def _prune_logs(self, device_name: str):
-        device = self.devices[device_name]
-        cutoff = time.time() - self.log_retention_seconds
-        while device.log_buffer and device.log_buffer[0][0] < cutoff:
-            device.log_buffer.popleft()
+    # ── State transitions ────────────────────────────────────────
 
     def _mark_online(self, device_name: str):
         device = self.devices[device_name]
         now = time.time()
         if not device.online:
             device.online = True
+            device.last_seen = now
             device.heartbeat_events.append((now, "connected"))
             self._prune_heartbeat(device_name)
             self._save_heartbeat_history(device_name)
-            asyncio.create_task(self._publish_mqtt_state(device, True))
-        device.last_seen = now
 
     def _mark_offline(self, device_name: str):
         device = self.devices.get(device_name)
@@ -507,9 +411,10 @@ class DeviceManager:
             device.heartbeat_events.append((now, "disconnected"))
             self._prune_heartbeat(device_name)
             self._save_heartbeat_history(device_name)
-            asyncio.create_task(self._publish_mqtt_state(device, False))
         if device.keepalive_task and not device.keepalive_task.done():
             device.keepalive_task.cancel()
+
+    # ── Public query API ───────────────────────────────────────
 
     def get_bearer_token(self) -> str:
         return self.bearer_token
@@ -525,13 +430,8 @@ class DeviceManager:
                 "mac_address": device.mac_address,
             }
             for name, device in self.devices.items()
+            if device.initialized
         ]
-
-    def get_device_logs(self, device_name: str) -> list[dict]:
-        device = self.devices.get(device_name)
-        if not device:
-            return []
-        return [{"timestamp": ts, "message": msg} for ts, msg in device.log_buffer]
 
     def get_last_seen(self, device_name: str) -> Optional[dict]:
         device = self.devices.get(device_name)
