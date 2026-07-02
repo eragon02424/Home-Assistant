@@ -1,6 +1,6 @@
 name: "Grocy Barcode Buddy"
 description: "Barcode scanning frontend for Grocy - scan products to manage your inventory"
-version: "1.0.2"
+version: "1.0.3"
 slug: "grocy_barcode_buddy"
 init: false
 arch:
