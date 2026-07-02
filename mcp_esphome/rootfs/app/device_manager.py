@@ -6,19 +6,20 @@ STARTUP
   1. _load_heartbeat_history() — creates stubs from disk (initialized=False)
   2. run_initial_discovery() — fetches /devices from ESPHome dashboard:
        - sets address, mac, psk for every device (stubs get initialized=True)
-       - devices with state=online get a keepalive task started
+       - devices with state=online: TCP ping to confirm reachability,
+         then _mark_online + keepalive task
   3. start_mdns_listener() — global ServiceBrowser for _esphomelib._tcp.local.
 
-ONLINE DETECTION
+ONLINE DETECTION (after startup)
   mDNS add_service fires for every announce (independent of previous state).
-  If device.initialized and not device.online:
-    → TCP ping port 6053 (200ms timeout, 2 retries)
-    → success → _mark_online + start keepalive task
+  mDNS announce = device is on WiFi = sufficient proof of online.
+  No TCP ping needed — _mark_online immediately + start keepalive task.
 
 OFFLINE DETECTION
   Per-device keepalive task (only for online devices).
   Every keepalive_interval seconds: TCP ping port 6053.
   All retries fail → _mark_offline, task ends.
+  Worst-case detection: keepalive_interval + retries * (timeout + timeout)
 
 DISCOVERY LOOP (60s)
   Only registers new devices. Never re-triggers connects for known devices.
@@ -88,8 +89,6 @@ class DeviceState:
     online: bool = False
     last_seen: Optional[float] = None
     last_disconnect: Optional[float] = None
-    # False for stubs from _load_heartbeat_history.
-    # mDNS connects are blocked until _discover_new_devices sets this True.
     initialized: bool = False
     heartbeat_events: list = field(default_factory=list)
     keepalive_task: Optional[asyncio.Task] = None
@@ -170,10 +169,8 @@ class DeviceManager:
     # ── TCP ping ──────────────────────────────────────────────
 
     async def _tcp_ping(self, address: str, port: int = 6053) -> bool:
-        """Open a TCP connection to address:port and close it immediately.
-        Returns True if the connection was accepted, False on any error.
-        A successful TCP handshake proves the device is reachable.
-        We close immediately so the device sees a clean FIN — minimal load.
+        """Open TCP connection to address:port and close immediately.
+        Returns True if TCP handshake succeeded (device reachable).
         """
         try:
             _, writer = await asyncio.wait_for(
@@ -189,18 +186,12 @@ class DeviceManager:
     # ── Discovery ──────────────────────────────────────────────
 
     async def run_initial_discovery(self):
-        """Fetch /devices once before mDNS starts so all devices have
-        initialized=True and noise_psk loaded before any mDNS announce fires.
-        """
         try:
             await self._discover_new_devices()
         except Exception as err:
             _LOGGER.error("Initial discovery error: %s", err)
 
     async def run_discovery_loop(self):
-        """Poll /devices every 60s for newly configured devices only.
-        Sleeps first — initial discovery already ran at startup.
-        """
         while True:
             await asyncio.sleep(DISCOVERY_INTERVAL_SECONDS)
             try:
@@ -233,7 +224,6 @@ class DeviceManager:
             mac = entry.get("mac_address", "")
             configuration_file = entry.get("configuration", "")
             api_encrypted = entry.get("api_encrypted", False)
-            # ESPHome reports state as string: "online"/"offline"/None
             dashboard_online = entry.get("state") == "online"
 
             if name in self.devices:
@@ -241,7 +231,6 @@ class DeviceManager:
                 device.address = address
                 if mac and not device.mac_address:
                     device.mac_address = mac
-                # Initialize stubs created by _load_heartbeat_history
                 if not device.initialized:
                     device.configuration_file = configuration_file
                     psk = self._read_noise_psk(configuration_file)
@@ -251,21 +240,15 @@ class DeviceManager:
                         _LOGGER.info("Noise PSK loaded (stub) for %s", name)
                     elif api_encrypted:
                         _LOGGER.warning("No noise PSK for encrypted device %s", name)
-                    # If dashboard says online and we have no keepalive running, start one
                     if dashboard_online and not device.online:
                         new_online.append(name)
                 continue
 
-            # New device
             psk = self._read_noise_psk(configuration_file)
             device = DeviceState(
-                name=name,
-                address=address,
-                ping_index=self._ping_counter,
-                configuration_file=configuration_file,
-                noise_psk=psk,
-                mac_address=mac or None,
-                initialized=True,
+                name=name, address=address, ping_index=self._ping_counter,
+                configuration_file=configuration_file, noise_psk=psk,
+                mac_address=mac or None, initialized=True,
             )
             self._ping_counter += 1
 
@@ -284,41 +267,55 @@ class DeviceManager:
                 _LOGGER.debug("New device (offline): %s — waiting for mDNS", name)
 
         if new_online:
-            _LOGGER.info("Starting keepalive for %d online device(s)", len(new_online))
+            _LOGGER.info("Dashboard init: TCP ping for %d online device(s)", len(new_online))
             for name in new_online:
-                asyncio.create_task(self._bring_online(name, source="dashboard"))
+                # Use TCP ping to confirm dashboard-reported online devices
+                # are actually reachable before starting keepalive
+                asyncio.create_task(self._bring_online_with_ping(name))
 
     # ── Online / Keepalive ───────────────────────────────────────
 
-    async def _bring_online(self, device_name: str, source: str):
-        """Confirm device is reachable via TCP ping, then mark online and
-        start the keepalive task. Called from both mDNS and dashboard init.
-        Uses connecting flag to prevent simultaneous attempts.
+    async def _bring_online_with_ping(self, device_name: str):
+        """Used at startup for dashboard-reported online devices.
+        TCP ping confirms reachability before marking online.
+        """
+        device = self.devices.get(device_name)
+        if not device or device.online or device.connecting:
+            return
+        device.connecting = True
+        try:
+            ok = await self._tcp_ping(device.address)
+            if not ok:
+                _LOGGER.info("TCP ping failed (dashboard) %s — staying offline", device_name)
+                return
+            _LOGGER.info("ONLINE (dashboard): %s", device_name)
+            self._mark_online(device_name)
+            device.keepalive_task = asyncio.create_task(self._keepalive_loop(device_name))
+        finally:
+            device.connecting = False
+
+    def _bring_online_from_mdns(self, device_name: str):
+        """Called from mDNS add_service.
+        mDNS announce = device is on WiFi = sufficient proof.
+        No TCP ping — mark online immediately and let keepalive verify.
+        Uses connecting flag to prevent duplicate calls.
         """
         device = self.devices.get(device_name)
         if not device or not device.initialized:
             return
         if device.online or device.connecting:
             return
-
         device.connecting = True
         try:
-            ok = await self._tcp_ping(device.address)
-            if not ok:
-                _LOGGER.info("TCP ping failed [%s] %s — staying offline", source, device_name)
-                return
-            _LOGGER.info("ONLINE (%s): %s", source, device_name)
+            _LOGGER.info("ONLINE (ESPHome/mDNS): %s", device_name)
             self._mark_online(device_name)
-            device.keepalive_task = asyncio.create_task(
-                self._keepalive_loop(device_name)
-            )
+            device.keepalive_task = asyncio.create_task(self._keepalive_loop(device_name))
         finally:
             device.connecting = False
 
     async def _keepalive_loop(self, device_name: str):
         """TCP-ping device every keepalive_interval seconds.
         All retries exhausted → mark offline, task ends.
-        No aioesphomeapi involved — no internal heartbeat conflicts.
         """
         device = self.devices.get(device_name)
         if not device:
@@ -352,10 +349,6 @@ class DeviceManager:
     # ── mDNS listener ──────────────────────────────────────────
 
     async def start_mdns_listener(self):
-        """One global Zeroconf browser for all ESPHome devices.
-        add_service fires on every mDNS announce regardless of prior state.
-        We check device.online internally to avoid starting duplicate tasks.
-        """
         if not HAS_ZEROCONF:
             _LOGGER.warning("zeroconf not available — mDNS wakeup disabled")
             return
@@ -373,14 +366,15 @@ class DeviceManager:
                                .rstrip("."))
                 device = mgr.devices.get(device_name)
                 if device and device.initialized and not device.online:
-                    _LOGGER.info("mDNS announce: %s → TCP ping", device_name)
+                    _LOGGER.info("mDNS announce: %s → marking online", device_name)
+                    # Call synchronously — no TCP ping needed, mDNS = WiFi connected
                     asyncio.run_coroutine_threadsafe(
-                        mgr._bring_online(device_name, source="ESPHome/mDNS"),
+                        asyncio.coroutine(lambda: mgr._bring_online_from_mdns(device_name))(),
                         mgr._loop,
                     )
 
             def remove_service(self, zc, type_, name):
-                pass  # offline detection via keepalive only
+                pass
 
             def update_service(self, zc, type_, name):
                 self.add_service(zc, type_, name)
