@@ -1,6 +1,6 @@
 name: "MCP ESPHome"
 description: "Vermittler-Service zwischen Claude und ESPHome-Geräten via native API."
-version: "0.5.2"
+version: "0.5.3"
 slug: "mcp_esphome"
 init: false
 arch:
@@ -19,8 +19,8 @@ options:
   log_retention_hours: 24
   heartbeat_retention_days: 30
   keepalive_interval: 10
-  keepalive_retries: 2
-  keepalive_ping_timeout_ms: 200
+  keepalive_retries: 5
+  keepalive_ping_timeout_ms: 500
 schema:
   esphome_dashboard_url: str
   bearer_token: str
