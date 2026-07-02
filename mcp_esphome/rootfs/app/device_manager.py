@@ -19,7 +19,6 @@ OFFLINE DETECTION
   Per-device keepalive task (only for online devices).
   Every keepalive_interval seconds: TCP ping port 6053.
   All retries fail → _mark_offline, task ends.
-  Worst-case detection: keepalive_interval + retries * (timeout + timeout)
 
 DISCOVERY LOOP (60s)
   Only registers new devices. Never re-triggers connects for known devices.
@@ -183,7 +182,7 @@ class DeviceManager:
         except Exception:
             return False
 
-    # ── Discovery ──────────────────────────────────────────────
+    # ── Discovery ─────────────────────────────────────────────
 
     async def run_initial_discovery(self):
         try:
@@ -269,15 +268,13 @@ class DeviceManager:
         if new_online:
             _LOGGER.info("Dashboard init: TCP ping for %d online device(s)", len(new_online))
             for name in new_online:
-                # Use TCP ping to confirm dashboard-reported online devices
-                # are actually reachable before starting keepalive
                 asyncio.create_task(self._bring_online_with_ping(name))
 
-    # ── Online / Keepalive ───────────────────────────────────────
+    # ── Online / Keepalive ────────────────────────────────────
 
     async def _bring_online_with_ping(self, device_name: str):
-        """Used at startup for dashboard-reported online devices.
-        TCP ping confirms reachability before marking online.
+        """Startup only: TCP ping confirms dashboard-reported online devices
+        are actually reachable before starting keepalive.
         """
         device = self.devices.get(device_name)
         if not device or device.online or device.connecting:
@@ -295,10 +292,9 @@ class DeviceManager:
             device.connecting = False
 
     def _bring_online_from_mdns(self, device_name: str):
-        """Called from mDNS add_service.
-        mDNS announce = device is on WiFi = sufficient proof.
-        No TCP ping — mark online immediately and let keepalive verify.
-        Uses connecting flag to prevent duplicate calls.
+        """Called via loop.call_soon_threadsafe from Zeroconf thread.
+        mDNS announce = device is on WiFi = sufficient proof of online.
+        No TCP ping — mark online immediately, keepalive verifies via TCP.
         """
         device = self.devices.get(device_name)
         if not device or not device.initialized:
@@ -346,7 +342,7 @@ class DeviceManager:
                 self._mark_offline(device_name)
                 break
 
-    # ── mDNS listener ──────────────────────────────────────────
+    # ── mDNS listener ─────────────────────────────────────────
 
     async def start_mdns_listener(self):
         if not HAS_ZEROCONF:
@@ -367,10 +363,9 @@ class DeviceManager:
                 device = mgr.devices.get(device_name)
                 if device and device.initialized and not device.online:
                     _LOGGER.info("mDNS announce: %s → marking online", device_name)
-                    # Call synchronously — no TCP ping needed, mDNS = WiFi connected
-                    asyncio.run_coroutine_threadsafe(
-                        asyncio.coroutine(lambda: mgr._bring_online_from_mdns(device_name))(),
-                        mgr._loop,
+                    # call_soon_threadsafe schedules the sync method on the event loop
+                    mgr._loop.call_soon_threadsafe(
+                        mgr._bring_online_from_mdns, device_name
                     )
 
             def remove_service(self, zc, type_, name):
@@ -382,7 +377,7 @@ class DeviceManager:
         ServiceBrowser(zc, MDNS_SERVICE_TYPE, _Listener())
         _LOGGER.info("Global mDNS listener started")
 
-    # ── State transitions ────────────────────────────────────────
+    # ── State transitions ─────────────────────────────────────
 
     def _mark_online(self, device_name: str):
         device = self.devices[device_name]
@@ -408,7 +403,7 @@ class DeviceManager:
         if device.keepalive_task and not device.keepalive_task.done():
             device.keepalive_task.cancel()
 
-    # ── Public query API ───────────────────────────────────────
+    # ── Public query API ──────────────────────────────────────
 
     def get_bearer_token(self) -> str:
         return self.bearer_token
