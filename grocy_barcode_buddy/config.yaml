@@ -1,0 +1,22 @@
+name: "Grocy Barcode Buddy"
+description: "Barcode scanning frontend for Grocy - scan products to manage your inventory"
+version: "1.0.0"
+slug: "grocy_barcode_buddy"
+init: false
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+startup: services
+boot: auto
+host_network: true
+ports:
+  80/tcp: 7080
+map:
+  - type: config
+    path: /config
+    read_only: false
+options: {}
+schema: {}
