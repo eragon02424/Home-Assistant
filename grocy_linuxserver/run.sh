@@ -1,5 +1,6 @@
 #!/bin/sh
 OPTIONS="/data/options.json"
+INGRESS_PATH="/57f327aa_grocy_linuxserver"
 
 if [ -f "$OPTIONS" ]; then
     CULTURE=$(jq -r '.culture // "de"' "$OPTIONS")
@@ -40,6 +41,8 @@ fi
     echo "GROCY_ENTRY_PAGE=${ENTRY_PAGE}"
     echo "GROCY_GROCYCODE_TYPE=${GROCYCODE_TYPE}"
     echo "GROCY_AUTH_CLASS=Grocy\\Middleware\\ReverseProxyAuthMiddleware"
+    echo "GROCY_BASE_PATH=${INGRESS_PATH}"
+    echo "GROCY_BASE_URL=${INGRESS_PATH}"
     echo "GROCY_FEATURE_FLAG_BATTERIES=${FEAT_BATTERIES}"
     echo "GROCY_FEATURE_FLAG_CALENDAR=${FEAT_CALENDAR}"
     echo "GROCY_FEATURE_FLAG_CHORES=${FEAT_CHORES}"
@@ -52,8 +55,7 @@ fi
     echo "GROCY_FEATURE_SETTING_STOCK_COUNT_OPENED_PRODUCTS_AGAINST_MINIMUM_STOCK_AMOUNT=${TWEAK_COUNT_OPENED}"
 } >> /etc/environment
 
-# default.conf patchen: GROCY_AUTH_CLASS und REMOTE_USER zu PHP-FPM hinzufügen
-# Warten bis /config/nginx/site-confs/default.conf vom s6-init angelegt wurde
+# default.conf patchen: Subpfad + Auth-Header zu PHP-FPM
 CONF="/config/nginx/site-confs/default.conf"
 TRIES=0
 while [ ! -f "$CONF" ] && [ $TRIES -lt 10 ]; do
@@ -61,14 +63,42 @@ while [ ! -f "$CONF" ] && [ $TRIES -lt 10 ]; do
     TRIES=$((TRIES+1))
 done
 
-if [ -f "$CONF" ]; then
-    # Nur patchen wenn noch nicht gepatcht
-    if ! grep -q "GROCY_AUTH_CLASS" "$CONF"; then
-        sed -i 's|include /etc/nginx/fastcgi_params;|fastcgi_param GROCY_AUTH_CLASS "Grocy\\Middleware\\ReverseProxyAuthMiddleware";\n        fastcgi_param HTTP_REMOTE_USER admin;\n        include /etc/nginx/fastcgi_params;|' "$CONF"
-        echo "[grocy-ha] nginx default.conf gepatcht"
-        # nginx neu laden falls bereits läuft
-        nginx -s reload 2>/dev/null || true
-    fi
+if [ -f "$CONF" ] && ! grep -q "GROCY_AUTH_CLASS" "$CONF"; then
+    # location block auf Subpfad umschreiben
+    cat > "$CONF" << 'EOF'
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+
+    server_name _;
+
+    set $root /app/www/public;
+    root $root;
+    index index.php;
+
+    client_max_body_size 0;
+
+    location /57f327aa_grocy_linuxserver {
+        try_files $uri $uri/ /57f327aa_grocy_linuxserver/index.php$is_args$args;
+    }
+
+    location ~ ^/57f327aa_grocy_linuxserver(.+\.php)(.*)$ {
+        fastcgi_split_path_info ^/57f327aa_grocy_linuxserver(.+\.php)(.*)$;
+        fastcgi_pass 127.0.0.1:9000;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param GROCY_AUTH_CLASS "Grocy\Middleware\ReverseProxyAuthMiddleware";
+        fastcgi_param HTTP_REMOTE_USER admin;
+        include /etc/nginx/fastcgi_params;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+    echo "[grocy-ha] nginx auf Ingress-Subpfad ${INGRESS_PATH} konfiguriert"
+    nginx -s reload 2>/dev/null || true
 fi
 
 echo "[grocy-ha] culture=${CULTURE} currency=${CURRENCY} entry=${ENTRY_PAGE}"
