@@ -1,6 +1,6 @@
 """Device Manager - handles ESPHome device discovery and heartbeat history.
 
-Architecture (v0.7.0):
+Architecture (v0.7.1):
 ──────────────────────
 DISCOVERY (at startup, then every DISCOVERY_INTERVAL_SECONDS)
   Fetch /devices. For every device not yet known: register it (address,
@@ -34,6 +34,9 @@ mDNS LISTENER (global)
   add_service/update_service fires for every announce. If the device is
   known, its wake_event is set via loop.call_soon_threadsafe. This does
   NOT start a new task -- it only wakes an already-sleeping task early.
+
+Every TCP ping attempt logs its duration in ms, to help tune
+keepalive_ping_timeout_ms.
 
 ZERO aioesphomeapi.
 """
@@ -116,9 +119,6 @@ class DeviceState:
     keepalive_task: Optional[asyncio.Task] = None
     backoff_multiplier: int = 1
     wake_event: Optional[asyncio.Event] = None
-    # What ESPHome's own dashboard currently reports ("state" field),
-    # refreshed every DISCOVERY_INTERVAL_SECONDS. Used only to decide
-    # whether a failed ping should trigger backoff growth or not.
     esphome_reports_online: bool = True
 
 
@@ -205,17 +205,21 @@ class DeviceManager:
 
     # ── TCP ping ──────────────────────────────────────────────
 
-    async def _tcp_ping(self, address: str, port: int = 6053) -> bool:
+    async def _tcp_ping(self, address: str, port: int = 6053) -> tuple[bool, float]:
+        """Returns (success, duration_ms)."""
+        start = time.monotonic()
         try:
             _, writer = await asyncio.wait_for(
                 asyncio.open_connection(address, port),
                 timeout=self.keepalive_ping_timeout,
             )
+            duration_ms = (time.monotonic() - start) * 1000
             writer.close()
             await writer.wait_closed()
-            return True
+            return True, duration_ms
         except Exception:
-            return False
+            duration_ms = (time.monotonic() - start) * 1000
+            return False, duration_ms
 
     # ── Discovery ─────────────────────────────────────────────
 
@@ -226,10 +230,6 @@ class DeviceManager:
             _LOGGER.error("Initial discovery error: %s", err)
 
     async def run_discovery_loop(self):
-        """Every DISCOVERY_INTERVAL_SECONDS: register new devices, start
-        their keepalive tasks, and refresh esphome_reports_online for all
-        already-known devices. Does NOT touch already-running tasks.
-        """
         while True:
             await asyncio.sleep(DISCOVERY_INTERVAL_SECONDS)
             try:
@@ -293,7 +293,6 @@ class DeviceManager:
                 self._ensure_keepalive_task(name)
                 continue
 
-            # Truly new device
             psk = self._read_noise_psk(configuration_file)
             device = DeviceState(
                 name=name, address=address, ping_index=self._ping_counter,
@@ -315,15 +314,11 @@ class DeviceManager:
             self._ensure_keepalive_task(name)
 
     def _ensure_keepalive_task(self, device_name: str):
-        """Start the permanent keepalive task for a device if it isn't
-        already running. Once started, a task runs forever until the
-        addon stops.
-        """
         device = self.devices.get(device_name)
         if not device or not device.initialized:
             return
         if device.keepalive_task is not None and not device.keepalive_task.done():
-            return  # already running
+            return
         if device.wake_event is None:
             device.wake_event = asyncio.Event()
         _LOGGER.info("Starting permanent keepalive task for %s", device_name)
@@ -332,14 +327,6 @@ class DeviceManager:
     # ── Keepalive (permanent, per-device, conditional exponential backoff) ─
 
     async def _keepalive_loop(self, device_name: str):
-        """Runs forever for the device's lifetime in the addon.
-        On success: mark online, reset backoff, wait base interval.
-        On failure: mark offline. Backoff only grows if ESPHome's own
-        dashboard also reports this device as offline. If ESPHome still
-        thinks it's online, our failed ping is treated as a fluke and we
-        just wait the base interval without growing the backoff.
-        Wait is interruptible by mDNS wake_event (resets backoff to 1).
-        """
         device = self.devices.get(device_name)
         if not device:
             return
@@ -349,14 +336,14 @@ class DeviceManager:
         while True:
             success = False
             for attempt in range(1, self.keepalive_retries + 1):
-                ok = await self._tcp_ping(device.address)
+                ok, duration_ms = await self._tcp_ping(device.address)
                 if ok:
                     success = True
-                    _LOGGER.info("Ping OK: %s (attempt %d/%d)",
-                                 device_name, attempt, self.keepalive_retries)
+                    _LOGGER.info("Ping OK: %s (attempt %d/%d) %.1fms",
+                                 device_name, attempt, self.keepalive_retries, duration_ms)
                     break
-                _LOGGER.info("Ping failed %d/%d: %s",
-                             attempt, self.keepalive_retries, device_name)
+                _LOGGER.info("Ping failed %d/%d: %s %.1fms",
+                             attempt, self.keepalive_retries, device_name, duration_ms)
                 if attempt < self.keepalive_retries:
                     await asyncio.sleep(self.keepalive_ping_timeout)
 
@@ -371,8 +358,6 @@ class DeviceManager:
             else:
                 self._mark_offline(device_name)
                 if device.esphome_reports_online:
-                    # ESPHome still thinks it's online -> treat our ping
-                    # failure as a fluke, no backoff growth.
                     wait_seconds = self.keepalive_interval
                     _LOGGER.info(
                         "Ping failed for %s but ESPHome still reports online — "
@@ -402,10 +387,6 @@ class DeviceManager:
     # ── mDNS listener ─────────────────────────────────────────
 
     def _on_mdns_event(self, device_name: str, kind: str):
-        """Called via loop.call_soon_threadsafe from the Zeroconf thread.
-        Wakes an already-running keepalive task early. Does not start a
-        new task -- every known device already has a permanent task.
-        """
         device = self.devices.get(device_name)
         if not device:
             _LOGGER.info("mDNS %s [%s]: device not registered yet, ignoring", kind, device_name)
