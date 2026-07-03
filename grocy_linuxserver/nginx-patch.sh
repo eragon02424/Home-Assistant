@@ -1,16 +1,10 @@
 #!/bin/sh
 # Patcht nginx default.conf für Ingress-Subpfad
-# Läuft nach ls.io-init (custom-cont-init.d), default.conf existiert bereits
-INGRESS_PATH="/57f327aa_grocy_linuxserver"
+# Läuft nach ls.io-init (custom-cont-init.d)
 CONF="/config/nginx/site-confs/default.conf"
 
 if [ ! -f "$CONF" ]; then
     echo "[grocy-ha] FEHLER: ${CONF} nicht gefunden"
-    exit 0
-fi
-
-if grep -q "GROCY_AUTH_CLASS" "$CONF"; then
-    echo "[grocy-ha] nginx bereits gepatcht, überspringe"
     exit 0
 fi
 
