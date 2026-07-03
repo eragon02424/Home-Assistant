@@ -22,6 +22,7 @@ OFFLINE DETECTION
 
 DISCOVERY LOOP (60s)
   Only registers new devices. Never re-triggers connects for known devices.
+  Also checks if ESPHome reports state=online for devices we think are offline.
 
 ZERO aioesphomeapi — no internal heartbeat conflicts.
 ZERO CPU for offline devices.
@@ -168,9 +169,6 @@ class DeviceManager:
     # ── TCP ping ──────────────────────────────────────────────
 
     async def _tcp_ping(self, address: str, port: int = 6053) -> bool:
-        """Open TCP connection to address:port and close immediately.
-        Returns True if TCP handshake succeeded (device reachable).
-        """
         try:
             _, writer = await asyncio.wait_for(
                 asyncio.open_connection(address, port),
@@ -191,6 +189,9 @@ class DeviceManager:
             _LOGGER.error("Initial discovery error: %s", err)
 
     async def run_discovery_loop(self):
+        """Every 60s: register new devices AND recover offline devices
+        that ESPHome reports as online (fallback for missed mDNS announces).
+        """
         while True:
             await asyncio.sleep(DISCOVERY_INTERVAL_SECONDS)
             try:
@@ -213,6 +214,7 @@ class DeviceManager:
 
         configured = data.get("configured", []) if isinstance(data, dict) else []
         new_online: list[str] = []
+        recover_online: list[str] = []
 
         for entry in configured:
             name = entry.get("name")
@@ -241,6 +243,18 @@ class DeviceManager:
                         _LOGGER.warning("No noise PSK for encrypted device %s", name)
                     if dashboard_online and not device.online:
                         new_online.append(name)
+                else:
+                    # Fallback: ESPHome says online but we think offline
+                    if dashboard_online and not device.online and not device.connecting:
+                        task_done = (device.keepalive_task is None
+                                     or device.keepalive_task.done())
+                        _LOGGER.info(
+                            "Dashboard recovery check: %s online=%s connecting=%s "
+                            "task_done=%s",
+                            name, device.online, device.connecting, task_done
+                        )
+                        if task_done:
+                            recover_online.append(name)
                 continue
 
             psk = self._read_noise_psk(configuration_file)
@@ -270,11 +284,16 @@ class DeviceManager:
             for name in new_online:
                 asyncio.create_task(self._bring_online_with_ping(name))
 
+        if recover_online:
+            _LOGGER.info("Dashboard recovery: %d device(s) missed mDNS", len(recover_online))
+            for name in recover_online:
+                asyncio.create_task(self._bring_online_with_ping(name))
+
     # ── Online / Keepalive ────────────────────────────────────
 
     async def _bring_online_with_ping(self, device_name: str):
-        """Startup only: TCP ping confirms dashboard-reported online devices
-        are actually reachable before starting keepalive.
+        """TCP ping confirms reachability before marking online.
+        Used at startup and as dashboard recovery fallback.
         """
         device = self.devices.get(device_name)
         if not device or device.online or device.connecting:
@@ -288,6 +307,7 @@ class DeviceManager:
             _LOGGER.info("ONLINE (dashboard): %s", device_name)
             self._mark_online(device_name)
             device.keepalive_task = asyncio.create_task(self._keepalive_loop(device_name))
+            _LOGGER.info("Keepalive task started for %s", device_name)
         finally:
             device.connecting = False
 
@@ -297,30 +317,44 @@ class DeviceManager:
         No TCP ping — mark online immediately, keepalive verifies via TCP.
         """
         device = self.devices.get(device_name)
-        if not device or not device.initialized:
+        if not device:
+            _LOGGER.info("mDNS [%s]: device not registered yet", device_name)
             return
-        if device.online or device.connecting:
+        if not device.initialized:
+            _LOGGER.info("mDNS [%s]: not yet initialized, ignoring", device_name)
             return
+        if device.online:
+            _LOGGER.debug("mDNS [%s]: already online, ignoring", device_name)
+            return
+        if device.connecting:
+            _LOGGER.info("mDNS [%s]: connect already in progress, ignoring", device_name)
+            return
+
+        task_done = device.keepalive_task is None or device.keepalive_task.done()
+        _LOGGER.info(
+            "mDNS [%s]: marking online (connecting=%s task_done=%s)",
+            device_name, device.connecting, task_done
+        )
+
         device.connecting = True
         try:
-            _LOGGER.info("ONLINE (ESPHome/mDNS): %s", device_name)
             self._mark_online(device_name)
             device.keepalive_task = asyncio.create_task(self._keepalive_loop(device_name))
+            _LOGGER.info("Keepalive task started for %s (mDNS)", device_name)
         finally:
             device.connecting = False
 
     async def _keepalive_loop(self, device_name: str):
-        """TCP-ping device every keepalive_interval seconds.
-        All retries exhausted → mark offline, task ends.
-        """
         device = self.devices.get(device_name)
         if not device:
             return
 
+        _LOGGER.info("Keepalive loop running for %s", device_name)
         while True:
             await asyncio.sleep(self.keepalive_interval)
 
             if not device.online:
+                _LOGGER.info("Keepalive loop: %s is offline, exiting", device_name)
                 break
 
             success = False
@@ -342,6 +376,10 @@ class DeviceManager:
                 self._mark_offline(device_name)
                 break
 
+        _LOGGER.info("Keepalive loop ended for %s (task_done=%s)",
+                     device_name,
+                     device.keepalive_task.done() if device.keepalive_task else True)
+
     # ── mDNS listener ─────────────────────────────────────────
 
     async def start_mdns_listener(self):
@@ -360,19 +398,27 @@ class DeviceManager:
                                .replace(f".{MDNS_SERVICE_TYPE}", "")
                                .replace(f".{type_}", "")
                                .rstrip("."))
-                device = mgr.devices.get(device_name)
-                if device and device.initialized and not device.online:
-                    _LOGGER.info("mDNS announce: %s → marking online", device_name)
-                    # call_soon_threadsafe schedules the sync method on the event loop
-                    mgr._loop.call_soon_threadsafe(
-                        mgr._bring_online_from_mdns, device_name
-                    )
+                _LOGGER.info("mDNS add_service fired: %s", device_name)
+                mgr._loop.call_soon_threadsafe(
+                    mgr._bring_online_from_mdns, device_name
+                )
 
             def remove_service(self, zc, type_, name):
-                pass
+                device_name = (name
+                               .replace(f".{MDNS_SERVICE_TYPE}", "")
+                               .replace(f".{type_}", "")
+                               .rstrip("."))
+                _LOGGER.debug("mDNS remove_service fired: %s", device_name)
 
             def update_service(self, zc, type_, name):
-                self.add_service(zc, type_, name)
+                device_name = (name
+                               .replace(f".{MDNS_SERVICE_TYPE}", "")
+                               .replace(f".{type_}", "")
+                               .rstrip("."))
+                _LOGGER.info("mDNS update_service fired: %s", device_name)
+                mgr._loop.call_soon_threadsafe(
+                    mgr._bring_online_from_mdns, device_name
+                )
 
         ServiceBrowser(zc, MDNS_SERVICE_TYPE, _Listener())
         _LOGGER.info("Global mDNS listener started")
@@ -388,6 +434,7 @@ class DeviceManager:
             device.heartbeat_events.append((now, "connected"))
             self._prune_heartbeat(device_name)
             self._save_heartbeat_history(device_name)
+            _LOGGER.info("State → ONLINE: %s", device_name)
 
     def _mark_offline(self, device_name: str):
         device = self.devices.get(device_name)
@@ -400,8 +447,11 @@ class DeviceManager:
             device.heartbeat_events.append((now, "disconnected"))
             self._prune_heartbeat(device_name)
             self._save_heartbeat_history(device_name)
+            _LOGGER.info("State → OFFLINE: %s", device_name)
         if device.keepalive_task and not device.keepalive_task.done():
             device.keepalive_task.cancel()
+            _LOGGER.info("Keepalive task cancelled for %s", device_name)
+        device.keepalive_task = None
 
     # ── Public query API ──────────────────────────────────────
 
