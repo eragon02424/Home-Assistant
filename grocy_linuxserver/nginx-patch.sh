@@ -13,9 +13,14 @@
 # baut zwingend BasePath+Pfad zusammen, nie relativ - siehe UrlManager.php).
 # Dieser absolute Redirect wird vom HA-Ingress-Frontend als eigene interne Route
 # fehlinterpretiert und laedt die normale HA-Oberflaeche statt Grocy nachzuladen.
-# Fix: GET / wird per nginx-internem rewrite (kein Redirect zum Client) direkt
-# auf die Entry-Page-Route umgeschrieben, damit Grocys Root-Redirect nie ausgeloest
-# wird. Mapping laut SystemController::GetEntryPageRelative().
+#
+# Fix: location = / ruft PHP-FPM DIREKT auf (nicht ueber try_files/rewrite) und
+# setzt REQUEST_URI hart auf die Entry-Page-Route. Ein nginx "rewrite ... last"
+# reicht NICHT, weil $request_uri (das fastcgi_params per Default fuer
+# REQUEST_URI nutzt) bei internen Rewrites unveraendert bleibt - $uri aendert
+# sich zwar, wird aber durch das nachfolgende try_files$-Fallback auf /index.php
+# wieder ueberschrieben. Deshalb REQUEST_URI hier fest auf die Zielroute setzen.
+# Mapping laut SystemController::GetEntryPageRelative().
 OPTIONS="/data/options.json"
 INGRESS_PATH="/57f327aa_grocy_linuxserver"
 CONF="/config/nginx/site-confs/default.conf"
@@ -77,7 +82,33 @@ server {
     client_max_body_size 0;
 
     location = / {
-        rewrite ^ ${ENTRY_ROUTE} last;
+        fastcgi_pass 127.0.0.1:9000;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root/index.php;
+        fastcgi_param HTTP_REMOTE_USER admin;
+        fastcgi_param GROCY_AUTH_CLASS 'Grocy\\Middleware\\ReverseProxyAuthMiddleware';
+        fastcgi_param GROCY_BASE_URL '${INGRESS_PATH}';
+        fastcgi_param GROCY_CULTURE '${CULTURE}';
+        fastcgi_param GROCY_CURRENCY '${CURRENCY}';
+        fastcgi_param GROCY_ENTRY_PAGE '${ENTRY_PAGE}';
+        fastcgi_param GROCY_GROCYCODE_TYPE '${GROCYCODE_TYPE}';
+        fastcgi_param GROCY_FEATURE_FLAG_BATTERIES '${FEAT_BATTERIES}';
+        fastcgi_param GROCY_FEATURE_FLAG_CALENDAR '${FEAT_CALENDAR}';
+        fastcgi_param GROCY_FEATURE_FLAG_CHORES '${FEAT_CHORES}';
+        fastcgi_param GROCY_FEATURE_FLAG_EQUIPMENT '${FEAT_EQUIPMENT}';
+        fastcgi_param GROCY_FEATURE_FLAG_RECIPES '${FEAT_RECIPES}';
+        fastcgi_param GROCY_FEATURE_FLAG_SHOPPINGLIST '${FEAT_SHOPPINGLIST}';
+        fastcgi_param GROCY_FEATURE_FLAG_STOCK '${FEAT_STOCK}';
+        fastcgi_param GROCY_FEATURE_FLAG_TASKS '${FEAT_TASKS}';
+        fastcgi_param GROCY_FEATURE_FLAG_CHORES_ASSIGNMENTS '${TWEAK_CHORES_ASSIGN}';
+        fastcgi_param GROCY_FEATURE_FLAG_SHOPPINGLIST_MULTIPLE_LISTS '${TWEAK_MULTI_SHOP}';
+        fastcgi_param GROCY_FEATURE_FLAG_STOCK_BEST_BEFORE_DATE_TRACKING '${TWEAK_BBD}';
+        fastcgi_param GROCY_FEATURE_FLAG_STOCK_LOCATION_TRACKING '${TWEAK_LOCATION}';
+        fastcgi_param GROCY_FEATURE_FLAG_STOCK_PRICE_TRACKING '${TWEAK_PRICE}';
+        fastcgi_param GROCY_FEATURE_FLAG_STOCK_PRODUCT_FREEZING '${TWEAK_FREEZE}';
+        fastcgi_param GROCY_FEATURE_FLAG_STOCK_PRODUCT_OPENED_TRACKING '${TWEAK_OPENED}';
+        include /etc/nginx/fastcgi_params;
+        fastcgi_param REQUEST_URI ${ENTRY_ROUTE};
     }
 
     location / {
