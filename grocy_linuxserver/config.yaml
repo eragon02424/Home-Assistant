@@ -1,6 +1,6 @@
 name: "Grocy"
 description: "Grocy - ERP beyond your fridge. Groceries & household management."
-version: "1.0.2"
+version: "1.0.3"
 slug: "grocy_linuxserver"
 init: false
 arch:
@@ -22,7 +22,6 @@ map:
     path: /config
     read_only: false
 options:
-  log_level: info
   culture: de
   currency: EUR
   entry_page: stock
@@ -45,9 +44,7 @@ options:
     stock_product_freezing: true
     stock_product_opened_tracking: true
     stock_count_opened_products_against_minimum_stock_amount: true
-  grocy_ingress_user: admin
 schema:
-  log_level: "select(trace|debug|info|notice|warning|error|fatal)"
   culture: "select(ca|cs|da|de|el_GR|en|en_GB|es|et|fi|fr|he_IL|hu|it|ja|ko_KR|lt|nl|no|pl|pt_BR|pt_PT|ro|ru|sk|sl|sv|ta|tr|uk|zh_CN|zh_TW)"
   currency: str
   entry_page: "select(stock|shoppinglist|recipes|chores|tasks|calendar|batteries|equipment)"
@@ -70,4 +67,3 @@ schema:
     stock_product_freezing: bool
     stock_product_opened_tracking: bool
     stock_count_opened_products_against_minimum_stock_amount: bool
-  grocy_ingress_user: str

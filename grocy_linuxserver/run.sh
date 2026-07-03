@@ -9,7 +9,6 @@ CULTURE=$(bashio::config 'culture')
 CURRENCY=$(bashio::config 'currency')
 ENTRY_PAGE=$(bashio::config 'entry_page')
 GROCYCODE_TYPE=$(bashio::config 'grocycode_type')
-INGRESS_USER=$(bashio::config 'grocy_ingress_user')
 
 # Features
 FEAT_BATTERIES=$(bashio::config 'features.batteries')
