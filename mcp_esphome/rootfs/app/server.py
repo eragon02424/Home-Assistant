@@ -36,8 +36,9 @@ async def main():
     log_retention_hours = opts.get("log_retention_hours", 24)
     heartbeat_retention_days = opts.get("heartbeat_retention_days", 30)
     keepalive_interval = opts.get("keepalive_interval", 10)
-    keepalive_retries = opts.get("keepalive_retries", 2)
-    keepalive_ping_timeout_ms = opts.get("keepalive_ping_timeout_ms", 200)
+    keepalive_retries = opts.get("keepalive_retries", 5)
+    keepalive_ping_timeout_ms = opts.get("keepalive_ping_timeout_ms", 500)
+    keepalive_max_backoff_seconds = opts.get("keepalive_max_backoff_seconds", 21600)
 
     device_manager = DeviceManager(
         esphome_dashboard_url=esphome_dashboard_url,
@@ -46,6 +47,7 @@ async def main():
         keepalive_interval=keepalive_interval,
         keepalive_retries=keepalive_retries,
         keepalive_ping_timeout_ms=keepalive_ping_timeout_ms,
+        keepalive_max_backoff_seconds=keepalive_max_backoff_seconds,
         bearer_token=bearer_token,
     )
 
@@ -53,17 +55,21 @@ async def main():
     _LOGGER.info("MCP ESPHome starting")
     _LOGGER.info("Dashboard URL: %s", esphome_dashboard_url)
     _LOGGER.info("Port: %s", port)
-    _LOGGER.info("Keepalive: interval=%ds retries=%d timeout=%dms",
-                 keepalive_interval, keepalive_retries, keepalive_ping_timeout_ms)
+    _LOGGER.info("Keepalive: interval=%ds retries=%d timeout=%dms max_backoff=%ds",
+                 keepalive_interval, keepalive_retries, keepalive_ping_timeout_ms,
+                 keepalive_max_backoff_seconds)
     _LOGGER.info("Bearer Token: %s", device_manager.bearer_token)
     _LOGGER.info("=" * 60)
 
-    # Initial discovery before mDNS: ensures all devices have psk loaded
+    # mDNS listener must be running before discovery starts tasks, so that
+    # wake_events exist and announces during discovery aren't lost.
+    await device_manager.start_mdns_listener()
+
     _LOGGER.info("Running initial device discovery...")
     await device_manager.run_initial_discovery()
-    _LOGGER.info("Initial discovery complete — starting mDNS listener")
+    _LOGGER.info("Initial discovery complete — %d device(s) with keepalive tasks",
+                 len(device_manager.devices))
 
-    await device_manager.start_mdns_listener()
     asyncio.create_task(device_manager.run_discovery_loop())
 
     app = web.Application()
