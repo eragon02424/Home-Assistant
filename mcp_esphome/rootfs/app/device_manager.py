@@ -1,27 +1,28 @@
 """Device Manager - handles ESPHome device discovery and heartbeat history.
 
-Architecture (v0.6.0):
+Architecture (v0.7.0):
 ──────────────────────
-We do not rely on ESPHome's own online/offline detection at all. ESPHome's
-mDNS-TTL-based offline detection can take up to ~75 minutes, which is
-useless for our purposes. We only use /devices at discovery time to learn
-which devices exist and their address/mac/psk.
-
 DISCOVERY (at startup, then every DISCOVERY_INTERVAL_SECONDS)
   Fetch /devices. For every device not yet known: register it (address,
   mac, psk) and start ONE keepalive task that runs forever for the
-  lifetime of the addon.
+  lifetime of the addon. Also updates device.esphome_reports_online from
+  ESPHome's own "state" field on every cycle for already-known devices.
 
 PER-DEVICE KEEPALIVE TASK (never dies once started)
   Loop forever:
     - TCP ping port 6053 (keepalive_retries attempts, keepalive_ping_timeout each)
     - success -> mark online, backoff_multiplier resets to 1, wait base interval
-    - failure -> mark offline, wait interval * backoff_multiplier,
-                 then backoff_multiplier = min(backoff_multiplier * 2, cap_multiplier)
+    - failure -> mark offline. Wait time depends on what ESPHome itself
+                 currently reports for this device (esphome_reports_online,
+                 refreshed every DISCOVERY_INTERVAL_SECONDS by discovery):
+                   * ESPHome still says online -> our ping just missed it,
+                     wait only the base interval, backoff stays at 1.
+                   * ESPHome says offline -> apply exponential backoff:
+                     wait interval*backoff_multiplier, then double
+                     (capped at cap_multiplier).
   The wait is interruptible: an mDNS announce for this device sets an
   asyncio.Event which wakes the task immediately, resets backoff to 1,
-  and triggers an immediate re-ping. This gives fast online detection
-  without depending on ESPHome's state field.
+  and triggers an immediate re-ping.
 
 BACKOFF CAP
   cap_multiplier is the smallest power of two such that
@@ -32,11 +33,9 @@ BACKOFF CAP
 mDNS LISTENER (global)
   add_service/update_service fires for every announce. If the device is
   known, its wake_event is set via loop.call_soon_threadsafe. This does
-  NOT start a new task (a task always already exists for every known
-  device) -- it only wakes an already-sleeping task early.
+  NOT start a new task -- it only wakes an already-sleeping task early.
 
-ZERO aioesphomeapi. ZERO dependency on ESPHome's own state field for
-task lifetime.
+ZERO aioesphomeapi.
 """
 import asyncio
 import json
@@ -117,6 +116,10 @@ class DeviceState:
     keepalive_task: Optional[asyncio.Task] = None
     backoff_multiplier: int = 1
     wake_event: Optional[asyncio.Event] = None
+    # What ESPHome's own dashboard currently reports ("state" field),
+    # refreshed every DISCOVERY_INTERVAL_SECONDS. Used only to decide
+    # whether a failed ping should trigger backoff growth or not.
+    esphome_reports_online: bool = True
 
 
 class DeviceManager:
@@ -223,9 +226,9 @@ class DeviceManager:
             _LOGGER.error("Initial discovery error: %s", err)
 
     async def run_discovery_loop(self):
-        """Every DISCOVERY_INTERVAL_SECONDS: register new devices and start
-        a keepalive task for each. Also restarts any task that crashed.
-        Does NOT touch already-running tasks.
+        """Every DISCOVERY_INTERVAL_SECONDS: register new devices, start
+        their keepalive tasks, and refresh esphome_reports_online for all
+        already-known devices. Does NOT touch already-running tasks.
         """
         while True:
             await asyncio.sleep(DISCOVERY_INTERVAL_SECONDS)
@@ -260,12 +263,22 @@ class DeviceManager:
             mac = entry.get("mac_address", "")
             configuration_file = entry.get("configuration", "")
             api_encrypted = entry.get("api_encrypted", False)
+            esphome_online = entry.get("state") == "online"
 
             if name in self.devices:
                 device = self.devices[name]
                 device.address = address
                 if mac and not device.mac_address:
                     device.mac_address = mac
+
+                if device.esphome_reports_online != esphome_online:
+                    _LOGGER.info(
+                        "ESPHome state changed for %s: %s -> %s",
+                        name,
+                        "online" if device.esphome_reports_online else "offline",
+                        "online" if esphome_online else "offline",
+                    )
+                device.esphome_reports_online = esphome_online
 
                 if not device.initialized:
                     device.configuration_file = configuration_file
@@ -286,6 +299,7 @@ class DeviceManager:
                 name=name, address=address, ping_index=self._ping_counter,
                 configuration_file=configuration_file, noise_psk=psk,
                 mac_address=mac or None, initialized=True,
+                esphome_reports_online=esphome_online,
             )
             self._ping_counter += 1
 
@@ -296,13 +310,14 @@ class DeviceManager:
                                 name, configuration_file)
 
             self.devices[name] = device
-            _LOGGER.info("New device discovered: %s @ %s", name, address)
+            _LOGGER.info("New device discovered: %s @ %s (esphome_state=%s)",
+                         name, address, "online" if esphome_online else "offline")
             self._ensure_keepalive_task(name)
 
     def _ensure_keepalive_task(self, device_name: str):
         """Start the permanent keepalive task for a device if it isn't
-        already running. Called at discovery time. Once started, a task
-        runs forever until the addon stops.
+        already running. Once started, a task runs forever until the
+        addon stops.
         """
         device = self.devices.get(device_name)
         if not device or not device.initialized:
@@ -314,14 +329,16 @@ class DeviceManager:
         _LOGGER.info("Starting permanent keepalive task for %s", device_name)
         device.keepalive_task = asyncio.create_task(self._keepalive_loop(device_name))
 
-    # ── Keepalive (permanent, per-device, exponential backoff) ─────
+    # ── Keepalive (permanent, per-device, conditional exponential backoff) ─
 
     async def _keepalive_loop(self, device_name: str):
         """Runs forever for the device's lifetime in the addon.
         On success: mark online, reset backoff, wait base interval.
-        On failure: mark offline, wait interval*backoff, then double backoff
-                    (capped). Wait is interruptible by mDNS wake_event,
-                    which also resets backoff to 1 for an immediate re-ping.
+        On failure: mark offline. Backoff only grows if ESPHome's own
+        dashboard also reports this device as offline. If ESPHome still
+        thinks it's online, our failed ping is treated as a fluke and we
+        just wait the base interval without growing the backoff.
+        Wait is interruptible by mDNS wake_event (resets backoff to 1).
         """
         device = self.devices.get(device_name)
         if not device:
@@ -353,13 +370,26 @@ class DeviceManager:
                 wait_seconds = self.keepalive_interval
             else:
                 self._mark_offline(device_name)
-                wait_seconds = self.keepalive_interval * device.backoff_multiplier
-                next_multiplier = min(device.backoff_multiplier * 2, self.backoff_cap_multiplier)
-                _LOGGER.info(
-                    "Offline wait for %s: %ds (backoff x%d -> next x%d)",
-                    device_name, wait_seconds, device.backoff_multiplier, next_multiplier
-                )
-                device.backoff_multiplier = next_multiplier
+                if device.esphome_reports_online:
+                    # ESPHome still thinks it's online -> treat our ping
+                    # failure as a fluke, no backoff growth.
+                    wait_seconds = self.keepalive_interval
+                    _LOGGER.info(
+                        "Ping failed for %s but ESPHome still reports online — "
+                        "staying at base interval %ds, no backoff growth",
+                        device_name, wait_seconds
+                    )
+                else:
+                    wait_seconds = self.keepalive_interval * device.backoff_multiplier
+                    next_multiplier = min(
+                        device.backoff_multiplier * 2, self.backoff_cap_multiplier
+                    )
+                    _LOGGER.info(
+                        "ESPHome reports %s offline — backoff wait %ds "
+                        "(backoff x%d -> next x%d)",
+                        device_name, wait_seconds, device.backoff_multiplier, next_multiplier
+                    )
+                    device.backoff_multiplier = next_multiplier
 
             device.wake_event.clear()
             try:
@@ -463,6 +493,7 @@ class DeviceManager:
                 "has_noise_key": device.noise_psk is not None,
                 "mac_address": device.mac_address,
                 "backoff_multiplier": device.backoff_multiplier,
+                "esphome_reports_online": device.esphome_reports_online,
             }
             for name, device in self.devices.items()
             if device.initialized
