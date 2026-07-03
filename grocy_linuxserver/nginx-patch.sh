@@ -8,22 +8,33 @@
 # WICHTIG 2: GROCY_BASE_PATH darf NICHT gesetzt werden (bricht Slim-Routing, da
 # der Supervisor Ingress-Requests OHNE Praefix weiterleitet).
 #
-# WICHTIG 3: Grocys eigener Root-Controller (SystemController::Root) macht bei
-# GET / IMMER einen HTTP 302 auf einen absoluten Pfad (UrlManager::ConstructUrl
-# baut zwingend BasePath+Pfad zusammen, nie relativ - siehe UrlManager.php).
-# Dieser absolute Redirect wird vom HA-Ingress-Frontend als eigene interne Route
-# fehlinterpretiert und laedt die normale HA-Oberflaeche statt Grocy nachzuladen.
+# WICHTIG 3: Der Ingress-Panel wird als echtes <iframe> gerendert (bestaetigt
+# per DOM-Inspektion) mit src="/api/hassio_ingress/<TOKEN>/". Root-relative
+# Links (href="/xyz") in Grocys HTML werden vom Browser gegen die ORIGIN
+# aufgeloest, nicht gegen den aktuellen iframe-Pfad - das fuehrt bei falschem
+# GROCY_BASE_URL dazu, dass alle CSS/JS/Bild-Requests am Ingress-Proxy
+# vorbeigehen und von HAs eigenem Frontend abgefangen werden (unstylte Seite).
+# Fix: GROCY_BASE_URL wird bei jedem Container-Start per Supervisor-API
+# (ingress_entry aus /addons/self/info) dynamisch ermittelt, da der Token sich
+# bei Neustarts aendern kann.
 #
-# Fix: location = / ruft PHP-FPM DIREKT auf (nicht ueber try_files/rewrite) und
-# setzt REQUEST_URI hart auf die Entry-Page-Route. Ein nginx "rewrite ... last"
-# reicht NICHT, weil $request_uri (das fastcgi_params per Default fuer
-# REQUEST_URI nutzt) bei internen Rewrites unveraendert bleibt - $uri aendert
-# sich zwar, wird aber durch das nachfolgende try_files$-Fallback auf /index.php
-# wieder ueberschrieben. Deshalb REQUEST_URI hier fest auf die Zielroute setzen.
-# Mapping laut SystemController::GetEntryPageRelative().
+# WICHTIG 4: Grocys eigener Root-Controller (SystemController::Root) macht bei
+# GET / IMMER einen HTTP 302 auf einen absoluten Pfad. Fix: location = / ruft
+# PHP-FPM DIREKT auf mit hart gesetztem REQUEST_URI auf die Entry-Page-Route,
+# da $request_uri bei internen Rewrites unveraendert bleibt und $uri durch
+# das nachfolgende try_files-Fallback auf /index.php ueberschrieben wird.
 OPTIONS="/data/options.json"
-INGRESS_PATH="/57f327aa_grocy_linuxserver"
 CONF="/config/nginx/site-confs/default.conf"
+
+# Ingress-Pfad dynamisch von der Supervisor API holen (Token kann wechseln)
+INGRESS_PATH=""
+if [ -n "$SUPERVISOR_TOKEN" ]; then
+    INGRESS_PATH=$(wget -q -O- --header="Authorization: Bearer ${SUPERVISOR_TOKEN}" http://supervisor/addons/self/info 2>/dev/null | jq -r '.data.ingress_entry // empty')
+fi
+if [ -z "$INGRESS_PATH" ]; then
+    INGRESS_PATH="/57f327aa_grocy_linuxserver"
+    echo "[grocy-ha] WARNUNG: ingress_entry nicht von Supervisor API abrufbar, Fallback auf Slug-Pfad"
+fi
 
 if [ -f "$OPTIONS" ]; then
     CULTURE=$(jq -r '.culture // "de"' "$OPTIONS")
@@ -151,4 +162,4 @@ server {
 EOF
 
 nginx -s reload 2>/dev/null || true
-echo "[grocy-ha] nginx gepatcht: culture=${CULTURE} entry_route=${ENTRY_ROUTE}"
+echo "[grocy-ha] nginx gepatcht: culture=${CULTURE} entry_route=${ENTRY_ROUTE} ingress_path=${INGRESS_PATH}"
