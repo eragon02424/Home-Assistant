@@ -1,6 +1,5 @@
 #!/bin/sh
 # Patcht nginx default.conf für Ingress-Subpfad
-# Läuft nach ls.io-init (custom-cont-init.d)
 CONF="/config/nginx/site-confs/default.conf"
 
 if [ ! -f "$CONF" ]; then
@@ -15,21 +14,30 @@ server {
 
     server_name _;
 
-    set $root /app/www/public;
-    root $root;
+    root /app/www/public;
     index index.php;
 
     client_max_body_size 0;
 
-    location /57f327aa_grocy_linuxserver {
-        try_files $uri $uri/ /57f327aa_grocy_linuxserver/index.php$is_args$args;
+    # Subpfad-Strip: /57f327aa_grocy_linuxserver/... -> /...
+    location /57f327aa_grocy_linuxserver/ {
+        alias /app/www/public/;
+        try_files $uri $uri/ @grocy_php;
     }
 
-    location ~ ^/57f327aa_grocy_linuxserver/(.+\.php)(.*)$ {
+    location @grocy_php {
         fastcgi_pass 127.0.0.1:9000;
         fastcgi_index index.php;
-        fastcgi_param SCRIPT_FILENAME $document_root/$1;
-        fastcgi_param PATH_INFO $2;
+        fastcgi_param SCRIPT_FILENAME /app/www/public/index.php;
+        fastcgi_param GROCY_AUTH_CLASS "Grocy\Middleware\ReverseProxyAuthMiddleware";
+        fastcgi_param HTTP_REMOTE_USER admin;
+        include /etc/nginx/fastcgi_params;
+    }
+
+    location ~ ^/57f327aa_grocy_linuxserver/(.+\.php)$ {
+        alias /app/www/public/;
+        fastcgi_pass 127.0.0.1:9000;
+        fastcgi_param SCRIPT_FILENAME /app/www/public/$1;
         fastcgi_param GROCY_AUTH_CLASS "Grocy\Middleware\ReverseProxyAuthMiddleware";
         fastcgi_param HTTP_REMOTE_USER admin;
         include /etc/nginx/fastcgi_params;
