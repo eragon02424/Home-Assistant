@@ -1,13 +1,11 @@
 name: "Grocy"
 description: "Grocy - ERP beyond your fridge. Groceries & household management."
-version: "1.0.3"
+version: "1.0.4"
 slug: "grocy_linuxserver"
 init: false
 arch:
   - aarch64
   - amd64
-  - armhf
-  - armv7
 startup: services
 boot: auto
 ports:
@@ -45,10 +43,10 @@ options:
     stock_product_opened_tracking: true
     stock_count_opened_products_against_minimum_stock_amount: true
 schema:
-  culture: "select(ca|cs|da|de|el_GR|en|en_GB|es|et|fi|fr|he_IL|hu|it|ja|ko_KR|lt|nl|no|pl|pt_BR|pt_PT|ro|ru|sk|sl|sv|ta|tr|uk|zh_CN|zh_TW)"
+  culture: str
   currency: str
-  entry_page: "select(stock|shoppinglist|recipes|chores|tasks|calendar|batteries|equipment)"
-  grocycode_type: "select(1D|2D)"
+  entry_page: str
+  grocycode_type: str
   features:
     batteries: bool
     calendar: bool
