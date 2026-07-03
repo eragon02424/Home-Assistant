@@ -1,14 +1,21 @@
 #!/bin/sh
 # Patcht nginx default.conf: Ingress-Subpfad, Auth, Feature-Flags als fastcgi_param.
-# /etc/environment wird von PHP-FPM (s6-overlay) NICHT eingelesen - deshalb muessen
-# alle GROCY_* Werte als fastcgi_param uebergeben werden (bestaetigt via
+#
+# WICHTIG 1: /etc/environment wird von PHP-FPM (s6-overlay) NICHT eingelesen -
+# alle GROCY_* Werte muessen als fastcgi_param uebergeben werden (bestaetigt via
 # /app/www/helpers/extensions.php: Setting() liest getenv('GROCY_' . $name)).
 #
-# WICHTIG: GROCY_BASE_PATH darf NICHT gesetzt werden. Grocy nutzt es in app.php
-# fuer $app->setBasePath() (Slim-Routing) - schneidet diesen Praefix von der
-# eingehenden Anfrage ab. Der HA Supervisor leitet Ingress-Requests aber OHNE
-# Praefix weiter (Container sieht nur "/"), daher wuerde das Routing brechen.
-# GROCY_BASE_URL wird dagegen nur fuer die Link-Generierung im HTML gebraucht.
+# WICHTIG 2: GROCY_BASE_PATH darf NICHT gesetzt werden (bricht Slim-Routing, da
+# der Supervisor Ingress-Requests OHNE Praefix weiterleitet).
+#
+# WICHTIG 3: Grocys eigener Root-Controller (SystemController::Root) macht bei
+# GET / IMMER einen HTTP 302 auf einen absoluten Pfad (UrlManager::ConstructUrl
+# baut zwingend BasePath+Pfad zusammen, nie relativ - siehe UrlManager.php).
+# Dieser absolute Redirect wird vom HA-Ingress-Frontend als eigene interne Route
+# fehlinterpretiert und laedt die normale HA-Oberflaeche statt Grocy nachzuladen.
+# Fix: GET / wird per nginx-internem rewrite (kein Redirect zum Client) direkt
+# auf die Entry-Page-Route umgeschrieben, damit Grocys Root-Redirect nie ausgeloest
+# wird. Mapping laut SystemController::GetEntryPageRelative().
 OPTIONS="/data/options.json"
 INGRESS_PATH="/57f327aa_grocy_linuxserver"
 CONF="/config/nginx/site-confs/default.conf"
@@ -42,6 +49,19 @@ else
     TWEAK_LOCATION="true"; TWEAK_PRICE="true"; TWEAK_FREEZE="true"; TWEAK_OPENED="true"
 fi
 
+# Mapping entry_page -> interner Grocy-Pfad (siehe SystemController::GetEntryPageRelative)
+case "$ENTRY_PAGE" in
+    stock) ENTRY_ROUTE="/stockoverview" ;;
+    shoppinglist) ENTRY_ROUTE="/shoppinglist" ;;
+    recipes) ENTRY_ROUTE="/recipes" ;;
+    chores) ENTRY_ROUTE="/choresoverview" ;;
+    tasks) ENTRY_ROUTE="/tasks" ;;
+    batteries) ENTRY_ROUTE="/batteriesoverview" ;;
+    equipment) ENTRY_ROUTE="/equipment" ;;
+    calendar) ENTRY_ROUTE="/calendar" ;;
+    *) ENTRY_ROUTE="/stockoverview" ;;
+esac
+
 if [ ! -f "$CONF" ]; then
     echo "[grocy-ha] FEHLER: ${CONF} nicht gefunden"
     exit 0
@@ -55,6 +75,10 @@ server {
     root /app/www/public;
     index index.php;
     client_max_body_size 0;
+
+    location = / {
+        rewrite ^ ${ENTRY_ROUTE} last;
+    }
 
     location / {
         try_files \$uri /index.php\$is_args\$args;
@@ -96,4 +120,4 @@ server {
 EOF
 
 nginx -s reload 2>/dev/null || true
-echo "[grocy-ha] nginx gepatcht: culture=${CULTURE} batteries=${FEAT_BATTERIES}"
+echo "[grocy-ha] nginx gepatcht: culture=${CULTURE} entry_route=${ENTRY_ROUTE}"
