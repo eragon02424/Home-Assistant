@@ -3,6 +3,12 @@
 # /etc/environment wird von PHP-FPM (s6-overlay) NICHT eingelesen - deshalb muessen
 # alle GROCY_* Werte als fastcgi_param uebergeben werden (bestaetigt via
 # /app/www/helpers/extensions.php: Setting() liest getenv('GROCY_' . $name)).
+#
+# WICHTIG: GROCY_BASE_PATH darf NICHT gesetzt werden. Grocy nutzt es in app.php
+# fuer $app->setBasePath() (Slim-Routing) - schneidet diesen Praefix von der
+# eingehenden Anfrage ab. Der HA Supervisor leitet Ingress-Requests aber OHNE
+# Praefix weiter (Container sieht nur "/"), daher wuerde das Routing brechen.
+# GROCY_BASE_URL wird dagegen nur fuer die Link-Generierung im HTML gebraucht.
 OPTIONS="/data/options.json"
 INGRESS_PATH="/57f327aa_grocy_linuxserver"
 CONF="/config/nginx/site-confs/default.conf"
@@ -60,7 +66,6 @@ server {
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         fastcgi_param HTTP_REMOTE_USER admin;
         fastcgi_param GROCY_AUTH_CLASS 'Grocy\\Middleware\\ReverseProxyAuthMiddleware';
-        fastcgi_param GROCY_BASE_PATH '${INGRESS_PATH}';
         fastcgi_param GROCY_BASE_URL '${INGRESS_PATH}';
         fastcgi_param GROCY_CULTURE '${CULTURE}';
         fastcgi_param GROCY_CURRENCY '${CURRENCY}';
