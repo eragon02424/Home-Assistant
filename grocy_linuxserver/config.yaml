@@ -1,6 +1,6 @@
 name: "Grocy"
 description: "Grocy - ERP beyond your fridge. Groceries & household management."
-version: "1.0.9"
+version: "1.1.0"
 slug: "grocy_linuxserver"
 init: false
 arch:
