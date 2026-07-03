@@ -1,6 +1,6 @@
 name: "Grocy"
 description: "Grocy - ERP beyond your fridge. Groceries & household management."
-version: "1.0.0"
+version: "1.0.1"
 slug: "grocy_linuxserver"
 init: false
 arch:
@@ -15,7 +15,7 @@ ports:
 ports_description:
   80/tcp: "Grocy Web UI & API"
 ingress: true
-ingress_port: 9283
+ingress_port: 80
 ingress_stream: false
 map:
   - type: config
@@ -24,36 +24,4 @@ map:
 options:
   culture: "de"
 schema:
-  culture:
-    - "ca"
-    - "cs"
-    - "da"
-    - "de"
-    - "el_GR"
-    - "en"
-    - "en_GB"
-    - "es"
-    - "et"
-    - "fi"
-    - "fr"
-    - "he_IL"
-    - "hu"
-    - "it"
-    - "ja"
-    - "ko_KR"
-    - "lt"
-    - "nl"
-    - "no"
-    - "pl"
-    - "pt_BR"
-    - "pt_PT"
-    - "ro"
-    - "ru"
-    - "sk"
-    - "sl"
-    - "sv"
-    - "ta"
-    - "tr"
-    - "uk"
-    - "zh_CN"
-    - "zh_TW"
+  culture: str

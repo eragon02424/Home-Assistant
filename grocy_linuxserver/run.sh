@@ -1,10 +1,14 @@
 #!/usr/bin/with-contenv bashio
 
-# Set Grocy culture from HA addon config
+# Warte bis /config/nginx/site-confs existiert (s6 init legt es an)
+mkdir -p /config/nginx/site-confs
+
+# Ingress nginx config kopieren
+cp /ingress.conf.tpl /config/nginx/site-confs/ingress.conf
+
+# Grocy Sprache aus HA Addon Config
 CULTURE=$(bashio::config 'culture')
-export GROCY_CULTURE="${CULTURE}"
+echo "GROCY_CULTURE=${CULTURE}" >> /etc/environment
+echo "GROCY_AUTH_CLASS=Grocy\\Middleware\\ReverseProxyAuthMiddleware" >> /etc/environment
 
-# Enable reverse proxy auth so no separate Grocy login is needed
-export GROCY_AUTH_CLASS="Grocy\\Middleware\\ReverseProxyAuthMiddleware"
-
-bashio::log.info "Grocy starting with culture=${CULTURE}, auth=ReverseProxy"
+bashio::log.info "Grocy: culture=${CULTURE}, auth=ReverseProxy"
