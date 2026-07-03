@@ -1,52 +1,77 @@
-#!/usr/bin/with-contenv bashio
+#!/bin/sh
+# bashio ist nicht verfügbar im LinuxServer-Image
+# HA legt Addon-Config unter /data/options.json ab
+
+OPTIONS="/data/options.json"
+
+if [ -f "$OPTIONS" ]; then
+    CULTURE=$(jq -r '.culture // "de"' "$OPTIONS")
+    CURRENCY=$(jq -r '.currency // "EUR"' "$OPTIONS")
+    ENTRY_PAGE=$(jq -r '.entry_page // "stock"' "$OPTIONS")
+    GROCYCODE_TYPE=$(jq -r '.grocycode_type // "2D"' "$OPTIONS")
+
+    FEAT_BATTERIES=$(jq -r '.features.batteries // false' "$OPTIONS")
+    FEAT_CALENDAR=$(jq -r '.features.calendar // true' "$OPTIONS")
+    FEAT_CHORES=$(jq -r '.features.chores // true' "$OPTIONS")
+    FEAT_EQUIPMENT=$(jq -r '.features.equipment // false' "$OPTIONS")
+    FEAT_RECIPES=$(jq -r '.features.recipes // true' "$OPTIONS")
+    FEAT_SHOPPINGLIST=$(jq -r '.features.shoppinglist // true' "$OPTIONS")
+    FEAT_STOCK=$(jq -r '.features.stock // true' "$OPTIONS")
+    FEAT_TASKS=$(jq -r '.features.tasks // false' "$OPTIONS")
+
+    TWEAK_CHORES_ASSIGN=$(jq -r '.tweaks.chores_assignment // true' "$OPTIONS")
+    TWEAK_MULTI_SHOP=$(jq -r '.tweaks.multiple_shopping_lists // true' "$OPTIONS")
+    TWEAK_BBD=$(jq -r '.tweaks.stock_best_before_date_tracking // true' "$OPTIONS")
+    TWEAK_LOCATION=$(jq -r '.tweaks.stock_location_tracking // true' "$OPTIONS")
+    TWEAK_PRICE=$(jq -r '.tweaks.stock_price_tracking // true' "$OPTIONS")
+    TWEAK_FREEZE=$(jq -r '.tweaks.stock_product_freezing // true' "$OPTIONS")
+    TWEAK_OPENED=$(jq -r '.tweaks.stock_product_opened_tracking // true' "$OPTIONS")
+    TWEAK_COUNT_OPENED=$(jq -r '.tweaks.stock_count_opened_products_against_minimum_stock_amount // true' "$OPTIONS")
+else
+    echo "[grocy-ha] /data/options.json not found, using defaults"
+    CULTURE="de"
+    CURRENCY="EUR"
+    ENTRY_PAGE="stock"
+    GROCYCODE_TYPE="2D"
+    FEAT_BATTERIES="false"
+    FEAT_CALENDAR="true"
+    FEAT_CHORES="true"
+    FEAT_EQUIPMENT="false"
+    FEAT_RECIPES="true"
+    FEAT_SHOPPINGLIST="true"
+    FEAT_STOCK="true"
+    FEAT_TASKS="false"
+    TWEAK_CHORES_ASSIGN="true"
+    TWEAK_MULTI_SHOP="true"
+    TWEAK_BBD="true"
+    TWEAK_LOCATION="true"
+    TWEAK_PRICE="true"
+    TWEAK_FREEZE="true"
+    TWEAK_OPENED="true"
+    TWEAK_COUNT_OPENED="true"
+fi
 
 # nginx ingress config bereitstellen
 mkdir -p /config/nginx/site-confs
 cp /ingress.conf.tpl /config/nginx/site-confs/ingress.conf
 
-# Werte aus HA Addon Config lesen
-CULTURE=$(bashio::config 'culture')
-CURRENCY=$(bashio::config 'currency')
-ENTRY_PAGE=$(bashio::config 'entry_page')
-GROCYCODE_TYPE=$(bashio::config 'grocycode_type')
-
-# Features
-FEAT_BATTERIES=$(bashio::config 'features.batteries')
-FEAT_CALENDAR=$(bashio::config 'features.calendar')
-FEAT_CHORES=$(bashio::config 'features.chores')
-FEAT_EQUIPMENT=$(bashio::config 'features.equipment')
-FEAT_RECIPES=$(bashio::config 'features.recipes')
-FEAT_SHOPPINGLIST=$(bashio::config 'features.shoppinglist')
-FEAT_STOCK=$(bashio::config 'features.stock')
-FEAT_TASKS=$(bashio::config 'features.tasks')
-
-# Tweaks
-TWEAK_CHORES_ASSIGN=$(bashio::config 'tweaks.chores_assignment')
-TWEAK_MULTI_SHOP=$(bashio::config 'tweaks.multiple_shopping_lists')
-TWEAK_BBD=$(bashio::config 'tweaks.stock_best_before_date_tracking')
-TWEAK_LOCATION=$(bashio::config 'tweaks.stock_location_tracking')
-TWEAK_PRICE=$(bashio::config 'tweaks.stock_price_tracking')
-TWEAK_FREEZE=$(bashio::config 'tweaks.stock_product_freezing')
-TWEAK_OPENED=$(bashio::config 'tweaks.stock_product_opened_tracking')
-TWEAK_COUNT_OPENED=$(bashio::config 'tweaks.stock_count_opened_products_against_minimum_stock_amount')
-
-# Grocy Environment Variablen setzen
+# Grocy Environment Variablen in /etc/environment schreiben
 {
-  echo "GROCY_CULTURE=${CULTURE}"
-  echo "GROCY_CURRENCY=${CURRENCY}"
-  echo "GROCY_ENTRY_PAGE=${ENTRY_PAGE}"
-  echo "GROCY_GROCYCODE_TYPE=${GROCYCODE_TYPE}"
-  echo "GROCY_AUTH_CLASS=Grocy\\Middleware\\ReverseProxyAuthMiddleware"
-  echo "GROCY_FEATURE_FLAG_BATTERIES=${FEAT_BATTERIES}"
-  echo "GROCY_FEATURE_FLAG_CALENDAR=${FEAT_CALENDAR}"
-  echo "GROCY_FEATURE_FLAG_CHORES=${FEAT_CHORES}"
-  echo "GROCY_FEATURE_FLAG_EQUIPMENT=${FEAT_EQUIPMENT}"
-  echo "GROCY_FEATURE_FLAG_RECIPES=${FEAT_RECIPES}"
-  echo "GROCY_FEATURE_FLAG_SHOPPINGLIST=${FEAT_SHOPPINGLIST}"
-  echo "GROCY_FEATURE_FLAG_STOCK=${FEAT_STOCK}"
-  echo "GROCY_FEATURE_FLAG_TASKS=${FEAT_TASKS}"
-  echo "GROCY_FEATURE_SETTING_CHORES_ASSIGNMENTS=${TWEAK_CHORES_ASSIGN}"
-  echo "GROCY_FEATURE_SETTING_STOCK_COUNT_OPENED_PRODUCTS_AGAINST_MINIMUM_STOCK_AMOUNT=${TWEAK_COUNT_OPENED}"
+    echo "GROCY_CULTURE=${CULTURE}"
+    echo "GROCY_CURRENCY=${CURRENCY}"
+    echo "GROCY_ENTRY_PAGE=${ENTRY_PAGE}"
+    echo "GROCY_GROCYCODE_TYPE=${GROCYCODE_TYPE}"
+    echo "GROCY_AUTH_CLASS=Grocy\\Middleware\\ReverseProxyAuthMiddleware"
+    echo "GROCY_FEATURE_FLAG_BATTERIES=${FEAT_BATTERIES}"
+    echo "GROCY_FEATURE_FLAG_CALENDAR=${FEAT_CALENDAR}"
+    echo "GROCY_FEATURE_FLAG_CHORES=${FEAT_CHORES}"
+    echo "GROCY_FEATURE_FLAG_EQUIPMENT=${FEAT_EQUIPMENT}"
+    echo "GROCY_FEATURE_FLAG_RECIPES=${FEAT_RECIPES}"
+    echo "GROCY_FEATURE_FLAG_SHOPPINGLIST=${FEAT_SHOPPINGLIST}"
+    echo "GROCY_FEATURE_FLAG_STOCK=${FEAT_STOCK}"
+    echo "GROCY_FEATURE_FLAG_TASKS=${FEAT_TASKS}"
+    echo "GROCY_FEATURE_SETTING_CHORES_ASSIGNMENTS=${TWEAK_CHORES_ASSIGN}"
+    echo "GROCY_FEATURE_SETTING_STOCK_COUNT_OPENED_PRODUCTS_AGAINST_MINIMUM_STOCK_AMOUNT=${TWEAK_COUNT_OPENED}"
 } >> /etc/environment
 
-bashio::log.info "Grocy: culture=${CULTURE} currency=${CURRENCY} entry=${ENTRY_PAGE}"
+echo "[grocy-ha] culture=${CULTURE} currency=${CURRENCY} entry=${ENTRY_PAGE}"
