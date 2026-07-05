@@ -18,7 +18,8 @@
   .err { background:#622; }
   label { display:block; margin-top:12px; }
   video { width:100%; border-radius:8px; background:#000; }
-  #barcodeLabel { font-size:1.3em; margin:8px 0; }
+  #barcodeLabel, #productName { font-size:1.3em; margin:8px 0; }
+  #productPic { max-width:100%; border-radius:8px; margin:8px 0; display:none; }
 </style>
 </head>
 <body>
@@ -32,6 +33,8 @@
 
 <div id="step-action" class="step">
   <p id="barcodeLabel"></p>
+  <p id="productName"></p>
+  <img id="productPic">
   <label>Menge</label>
   <input type="number" id="amount" value="1" step="1" min="0.01">
   <button id="btnAdd">Einlagern</button>
@@ -40,7 +43,8 @@
 </div>
 
 <div id="step-photo2" class="step">
-  <p>Barcode unbekannt. Bitte Kamera auf die Produkt-Vorderseite richten.</p>
+  <p id="unknownLabel"></p>
+  <p>Bitte Kamera auf die Produkt-Vorderseite richten und auf "Foto aufnehmen" tippen.</p>
   <video id="livestream2" muted playsinline></video>
   <button id="btnCapture">Foto aufnehmen &amp; Produkt anlegen</button>
 </div>
@@ -59,7 +63,6 @@ hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
 const reader = new ZXing.BrowserMultiFormatReader(hints);
 
 let pendingBarcode = null;
-let currentVideoEl = null;
 
 function showStep(id) {
   document.querySelectorAll('.step').forEach(e => e.classList.remove('active'));
@@ -75,83 +78,107 @@ function showStatus(msg, ok) {
 function startScanning() {
   showStep('step-video');
   showStatus('Suche Barcode...', true);
-  reader.decodeFromVideoDevice(undefined, 'livestream', (result, error) => {
+  reader.decodeFromVideoDevice(undefined, 'livestream', async (result, error) => {
     if (result) {
       reader.reset();
       pendingBarcode = result.getText();
-      // Wichtig: dies bedeutet nur "Barcode von der Kamera gelesen",
-      // NICHT "Produkt in Grocy bekannt". Der Grocy-Abgleich passiert erst
-      // beim Klick auf Einlagern/Auslagern (bookAction).
       document.getElementById('barcodeLabel').textContent = 'Barcode: ' + pendingBarcode;
-      showStatus('Barcode gelesen - noch nicht mit Grocy abgeglichen', true);
-      showStep('step-action');
+      await checkBarcode();
     }
   }).catch(err => showStatus('Kamera-Fehler: ' + err, false));
 }
 
-async function bookAction(action) {
-  const amount = document.getElementById('amount').value || 1;
+async function checkBarcode() {
   showStatus('Gleiche mit Grocy ab...', true);
-  const res = await fetch('/api/scan-text', {
+  const res = await fetch('/api/check-barcode', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ barcode: pendingBarcode })
+  });
+  const data = await res.json();
+
+  if (data.error) {
+    showStatus('Fehler: ' + data.error, false);
+    return;
+  }
+
+  if (data.found) {
+    document.getElementById('productName').textContent = data.name;
+    const pic = document.getElementById('productPic');
+    if (data.picture_file_name) {
+      pic.src = '/api/product-picture/' + encodeURIComponent(data.picture_file_name);
+      pic.style.display = 'block';
+    } else {
+      pic.style.display = 'none';
+    }
+    showStatus('Bekannt - aktueller Bestand: ' + (data.stock_amount ?? '0'), true);
+    showStep('step-action');
+  } else {
+    document.getElementById('unknownLabel').textContent = 'Unbekannter Barcode: ' + pendingBarcode;
+    showStatus('Unbekannt - bitte Produktfoto aufnehmen', false);
+    startPhoto2();
+  }
+}
+
+async function book(action) {
+  const amount = document.getElementById('amount').value || 1;
+  showStatus('Buche...', true);
+  const res = await fetch('/api/book', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ barcode: pendingBarcode, amount: amount, action: action })
   });
   const data = await res.json();
-
   if (data.status === 'ok') {
     showStatus('Gebucht: ' + data.barcode, true);
     setTimeout(startScanning, 800);
-  } else if (data.status === 'unknown') {
-    showStatus('Unbekannter Barcode: ' + data.barcode, false);
-    startPhoto2Scan();
   } else {
     showStatus('Fehler: ' + data.message, false);
   }
 }
 
-function startPhoto2Scan() {
+let photo2Stream = null;
+
+function startPhoto2() {
   showStep('step-photo2');
   const video = document.getElementById('livestream2');
-  currentVideoEl = video;
   navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } }).then(stream => {
+    photo2Stream = stream;
     video.srcObject = stream;
     video.play();
   }).catch(err => showStatus('Kamera-Fehler: ' + err, false));
 }
 
 document.getElementById('btnCapture').onclick = async () => {
-  const video = currentVideoEl;
+  const video = document.getElementById('livestream2');
   const canvas = document.getElementById('captureCanvas');
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
   canvas.getContext('2d').drawImage(video, 0, 0);
-
-  video.srcObject.getTracks().forEach(t => t.stop());
+  if (photo2Stream) photo2Stream.getTracks().forEach(t => t.stop());
 
   canvas.toBlob(async (blob) => {
     const fd = new FormData();
     fd.append('photo', blob, 'product.jpg');
     fd.append('barcode', pendingBarcode);
-    fd.append('amount', document.getElementById('amount').value || 1);
-    fd.append('action', pendingActionForCreate);
 
     showStatus('Lege Produkt an...', true);
     const res = await fetch('/api/create-unknown', { method: 'POST', body: fd });
     const data = await res.json();
 
     if (data.status === 'ok') {
-      showStatus('Produkt angelegt und gebucht (id ' + data.product_id + ')', true);
-      setTimeout(startScanning, 800);
+      showStatus('Produkt angelegt (id ' + data.product_id + ') - jetzt Menge eingeben', true);
+      document.getElementById('productName').textContent = '(neu angelegt, Name folgt spaeter)';
+      document.getElementById('productPic').style.display = 'none';
+      showStep('step-action');
     } else {
       showStatus('Fehler: ' + data.message, false);
     }
   }, 'image/jpeg', 0.9);
 };
 
-let pendingActionForCreate = 'add';
-document.getElementById('btnAdd').onclick = () => { pendingActionForCreate = 'add'; bookAction('add'); };
-document.getElementById('btnConsume').onclick = () => { pendingActionForCreate = 'consume'; bookAction('consume'); };
+document.getElementById('btnAdd').onclick = () => book('add');
+document.getElementById('btnConsume').onclick = () => book('consume');
 document.getElementById('btnCancel').onclick = () => startScanning();
 
 startScanning();
