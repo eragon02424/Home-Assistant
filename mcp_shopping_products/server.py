@@ -1,5 +1,5 @@
 """
-MCP Shopping Products for Home Assistant v1.5.0
+MCP Shopping Products for Home Assistant v1.6.0
 
 Two halves:
 1. Ingress web UI (live camera via getUserMedia + zxing-js) - handles the live
@@ -7,8 +7,9 @@ Two halves:
 2. MCP tools - used by Claude to (a) fill in names for products created with
    a placeholder name during scanning, (b) find products missing a barcode
    or picture, (c) build a shopping list from a recipe/message screenshot by
-   searching for products by name, and (d) create recipes and push a scaled
-   recipe's missing ingredients onto Grocy's shopping list.
+   searching for products by name, and (d) create/edit recipes (including
+   free-text instructions) and push a scaled recipe's ingredients onto
+   Grocy's shopping list.
 
 Grocy API facts this code relies on (verified against a live Grocy instance
 during development, see conversation history):
@@ -19,9 +20,8 @@ during development, see conversation history):
   string collides after the first use - the barcode string itself is used as
   a unique placeholder name during scanning instead (see api_create_unknown).
 - query[]=name~<text> (the "~" operator) does a SQL LIKE substring search and
-  returns ALL matches - confirmed live with name~Sprite returning two
-  differently-named Sprite products. query[]=name=<text> requires an exact,
-  non-empty value ("Invalid query" if the value is empty).
+  returns ALL matches. query[]=name=<text> requires an exact, non-empty value
+  ("Invalid query" if the value is empty) - used for exact-name lookups.
 - Product pictures must be fetched via GET /files/productpictures/{b64name}
   (this addon has its own isolated /config, no shared filesystem with the
   Grocy addon) - proxied to the browser via /api/product-picture/{filename}.
@@ -30,24 +30,21 @@ during development, see conversation history):
 - POST /stock/shoppinglist/add-product requires a product_id (not free text);
   confirmed live (204, entry verified via GET /objects/shopping_list) that it
   adds/increments an item on the given (or default, list_id=1) shopping list.
-- Recipes: entity names are "recipes" and "recipes_pos" (confirmed via the
-  ExposedEntity enum in the OpenAPI spec, since neither has a documented
-  request-body schema of its own). POST /objects/recipes only strictly needs
-  "name" (base_servings/desired_servings default to 1). POST /objects/recipes_pos
-  only strictly needs recipe_id/product_id/amount (confirmed live with minimal
-  bodies, checked via GET afterwards).
-- Recipe scaling: setting a recipe's desired_servings != base_servings scales
-  every ingredient proportionally in GET /objects/recipes_pos_resolved's
-  "recipe_amount"/"missing_amount" fields (confirmed live: base amount 3 with
-  desired_servings=2.5*base_servings produced recipe_amount=7.5 exactly).
-  POST /recipes/{id}/add-not-fulfilled-products-to-shoppinglist then pushes
-  that already-scaled missing amount onto the shopping list (confirmed live:
-  produced a shopping list entry with amount=7.5, matching the scaled value) -
-  it takes no explicit multiplier parameter itself, the scaling must already
-  be set on the recipe's desired_servings field beforehand. This endpoint also
-  requires a Content-Type: application/json header even though the request
-  body is documented as optional - omitting it gives "Bad Content-Type" (400),
-  confirmed live.
+- Recipes: entity names are "recipes" and "recipes_pos". POST /objects/recipes
+  only strictly needs "name" (base_servings/desired_servings default to 1;
+  the "description" field is free text and is used to hold step-by-step
+  instructions - Grocy's schema has no separate structured-steps table,
+  confirmed by inspecting the recipes table's migration history). POST
+  /objects/recipes_pos only strictly needs recipe_id/product_id/amount.
+- Deleting a recipe does NOT cascade-delete its recipes_pos rows (confirmed
+  live: an orphaned recipes_pos row with a dangling recipe_id remained after
+  DELETE /objects/recipes/{id} and had to be removed separately).
+- add_recipe_to_shopping_list (v1.6.0) intentionally does NOT use Grocy's
+  stock-fulfillment-based add-not-fulfilled-products-to-shoppinglist endpoint
+  (used in an earlier version) - the user explicitly said the "only order
+  the deficit versus current stock" behavior is not wanted for now. Instead
+  it reads recipes_pos directly and adds amount*multiplier for every
+  ingredient unconditionally.
 
 Why the ingress page uses getUserMedia+zxing-js instead of <input capture>:
 a file-input's capture attribute did not open the camera when this page was
@@ -128,12 +125,18 @@ mcp = FastMCP(
         "result is automatically correct. create_product_simple makes a new "
         "product with just a name (no barcode, no picture) when "
         "search_products found no suitable match. add_to_shopping_list adds a "
-        "product_id to Grocy's shopping list by amount. create_recipe makes a "
-        "new recipe; add_recipe_ingredient adds one ingredient (product_id + "
-        "amount at base_servings) to it; search_recipes finds an existing "
-        "recipe by name; add_recipe_to_shopping_list scales a recipe by a "
-        "servings multiplier and pushes its still-missing ingredients onto "
-        "the shopping list in one call."
+        "product_id to Grocy's shopping list by amount.\n\n"
+        "Recipes: create_or_update_recipe upserts a recipe by its exact name "
+        "(name, description - description holds free-text instructions, e.g. "
+        "numbered steps - and base_servings, the serving count all ingredient "
+        "amounts are defined for). search_recipes finds a recipe by name. "
+        "get_recipe_ingredients lists a recipe's ingredients. "
+        "add_recipe_ingredient/update_recipe_ingredient/remove_recipe_ingredient "
+        "manage individual ingredients. add_recipe_to_shopping_list takes "
+        "every ingredient's amount times a multiplier and adds it to the "
+        "shopping list directly - it does NOT check current stock or "
+        "existing shopping list amounts, it always adds the full scaled "
+        "quantity."
     ),
 )
 mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
@@ -339,20 +342,80 @@ async def add_to_shopping_list(product_id: int, amount: float = 1, note: str = "
 
 
 @mcp.tool()
-async def create_recipe(name: str, description: str = "", base_servings: float = 1) -> dict:
-    """Create a new Grocy recipe (without ingredients yet - add those
-    afterwards with add_recipe_ingredient). Args: name (required),
-    description (optional), base_servings (default 1 - the serving count that
-    all ingredient amounts are defined for)."""
+async def create_or_update_recipe(name: str, description: str = "", base_servings: float = 1) -> dict:
+    """Create a new recipe, or update an existing one if a recipe with this
+    EXACT name already exists (matched via an exact, case-sensitive name
+    lookup). Args: name (required - used as the lookup key), description
+    (free text - use this to hold step-by-step instructions, e.g. '1. Kartoffeln
+    waschen\\n2. schneiden\\n3. kochen'), base_servings (default 1 - the
+    serving count all ingredient amounts are defined for). Returns
+    {"success", "recipe_id", "created": true|false}."""
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await grocy_post(client, "/objects/recipes", {
+        existing = await grocy_get(client, "/objects/recipes", params={"query[]": f"name={name}"})
+        if existing.status_code == 200 and existing.json():
+            recipe_id = existing.json()[0]["id"]
+            ur = await grocy_put(client, f"/objects/recipes/{recipe_id}", json_body={
+                "description": description,
+                "base_servings": base_servings,
+            })
+            if ur.status_code not in (200, 204):
+                return {"success": False, "error": f"Grocy returned {ur.status_code}: {ur.text}"}
+            return {"success": True, "recipe_id": recipe_id, "name": name, "created": False}
+
+        cr = await grocy_post(client, "/objects/recipes", {
             "name": name,
             "description": description,
             "base_servings": base_servings,
         })
+        if cr.status_code != 200:
+            return {"success": False, "error": f"Grocy returned {cr.status_code}: {cr.text}"}
+        return {"success": True, "recipe_id": int(cr.json()["created_object_id"]), "name": name, "created": True}
+
+
+@mcp.tool()
+async def search_recipes(query: str) -> dict:
+    """Broad substring search for Grocy recipes by name. Returns
+    {"results": [{"recipe_id", "name", "base_servings", "description"}, ...]}."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await grocy_get(client, "/objects/recipes", params={"query[]": f"name~{query}"})
         if r.status_code != 200:
-            return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
-        return {"success": True, "recipe_id": int(r.json()["created_object_id"]), "name": name}
+            return {"results": [], "error": f"Grocy returned {r.status_code}: {r.text}"}
+        recipes = r.json()
+        return {"results": [
+            {
+                "recipe_id": rec["id"],
+                "name": rec.get("name"),
+                "base_servings": rec.get("base_servings"),
+                "description": rec.get("description"),
+            }
+            for rec in recipes
+        ]}
+
+
+@mcp.tool()
+async def get_recipe_ingredients(recipe_id: int) -> dict:
+    """List all ingredients of a recipe. Returns {"results": [{"recipe_pos_id",
+    "product_id", "product_name", "amount"}, ...]} where amount is defined for
+    the recipe's base_servings."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        pr = await grocy_get(client, "/objects/recipes_pos", params={"query[]": f"recipe_id={recipe_id}"})
+        if pr.status_code != 200:
+            return {"results": [], "error": f"Grocy returned {pr.status_code}: {pr.text}"}
+        positions = pr.json()
+
+        results = []
+        for pos in positions:
+            name = None
+            prod = await grocy_get(client, f"/objects/products/{pos['product_id']}")
+            if prod.status_code == 200:
+                name = prod.json().get("name")
+            results.append({
+                "recipe_pos_id": pos["id"],
+                "product_id": pos["product_id"],
+                "product_name": name,
+                "amount": pos["amount"],
+            })
+        return {"results": results}
 
 
 @mcp.tool()
@@ -373,50 +436,65 @@ async def add_recipe_ingredient(recipe_id: int, product_id: int, amount: float) 
 
 
 @mcp.tool()
-async def search_recipes(query: str) -> dict:
-    """Broad substring search for Grocy recipes by name. Returns
-    {"results": [{"recipe_id", "name", "base_servings"}, ...]}."""
+async def update_recipe_ingredient(recipe_pos_id: int, amount: float) -> dict:
+    """Change the amount of an existing recipe ingredient. Args:
+    recipe_pos_id (from get_recipe_ingredients), amount (new quantity, at the
+    recipe's base_servings)."""
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await grocy_get(client, "/objects/recipes", params={"query[]": f"name~{query}"})
-        if r.status_code != 200:
-            return {"results": [], "error": f"Grocy returned {r.status_code}: {r.text}"}
-        recipes = r.json()
-        return {"results": [
-            {"recipe_id": rec["id"], "name": rec.get("name"), "base_servings": rec.get("base_servings")}
-            for rec in recipes
-        ]}
+        r = await grocy_put(client, f"/objects/recipes_pos/{recipe_pos_id}", json_body={"amount": amount})
+        if r.status_code not in (200, 204):
+            return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
+        return {"success": True, "recipe_pos_id": recipe_pos_id, "amount": amount}
 
 
 @mcp.tool()
-async def add_recipe_to_shopping_list(recipe_id: int, servings_multiplier: float = 1) -> dict:
-    """Scale a recipe by servings_multiplier (relative to its own
-    base_servings - e.g. multiplier=2.5 with base_servings=4 sets the
-    effective servings to 10) and add all of its currently-missing
-    ingredients (i.e. not already sufficiently in stock or on the shopping
-    list) to Grocy's shopping list in the correctly scaled amounts. This
-    calls Grocy's own recipe fulfillment logic - it does not duplicate
-    already-covered amounts."""
+async def remove_recipe_ingredient(recipe_pos_id: int) -> dict:
+    """Remove an ingredient from a recipe. Args: recipe_pos_id (from
+    get_recipe_ingredients)."""
     async with httpx.AsyncClient(timeout=15) as client:
-        rr = await grocy_get(client, f"/objects/recipes/{recipe_id}")
-        if rr.status_code != 200:
-            return {"success": False, "error": f"Grocy returned {rr.status_code}: {rr.text}"}
-        base_servings = rr.json().get("base_servings", 1)
-        desired_servings = base_servings * servings_multiplier
+        r = await client.delete(f"{GROCY_BASE}/objects/recipes_pos/{recipe_pos_id}")
+        if r.status_code not in (200, 204):
+            return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
+        return {"success": True, "recipe_pos_id": recipe_pos_id}
 
-        ur = await grocy_put(client, f"/objects/recipes/{recipe_id}", json_body={"desired_servings": desired_servings})
-        if ur.status_code not in (200, 204):
-            return {"success": False, "error": f"Grocy returned {ur.status_code}: {ur.text}"}
 
-        ar = await grocy_post(client, f"/recipes/{recipe_id}/add-not-fulfilled-products-to-shoppinglist", {})
-        if ar.status_code != 204:
-            error_message = ""
-            try:
-                error_message = ar.json().get("error_message", "")
-            except Exception:
-                pass
-            return {"success": False, "error": error_message or ar.text}
+@mcp.tool()
+async def add_recipe_to_shopping_list(recipe_id: int, multiplier: float = 1) -> dict:
+    """Add every ingredient of a recipe to Grocy's shopping list, each scaled
+    by multiplier (e.g. multiplier=1.5 doubles-and-a-half every ingredient
+    amount). This adds the full scaled amount unconditionally - it does NOT
+    check current stock or existing shopping list amounts and subtract them
+    first (that stock-fulfillment behavior was intentionally removed per the
+    user's request). Returns {"success", "added": [{"product_id",
+    "product_name", "amount"}, ...]}."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        pr = await grocy_get(client, "/objects/recipes_pos", params={"query[]": f"recipe_id={recipe_id}"})
+        if pr.status_code != 200:
+            return {"success": False, "error": f"Grocy returned {pr.status_code}: {pr.text}"}
+        positions = pr.json()
+        if not positions:
+            return {"success": False, "error": "Recipe has no ingredients (or does not exist)"}
 
-        return {"success": True, "recipe_id": recipe_id, "desired_servings": desired_servings}
+        added = []
+        for pos in positions:
+            scaled_amount = pos["amount"] * multiplier
+            body = {"product_id": pos["product_id"], "product_amount": scaled_amount}
+            ar = await grocy_post(client, "/stock/shoppinglist/add-product", body)
+            if ar.status_code != 204:
+                error_message = ""
+                try:
+                    error_message = ar.json().get("error_message", "")
+                except Exception:
+                    pass
+                return {"success": False, "error": f"Failed on product_id {pos['product_id']}: {error_message or ar.text}", "added_so_far": added}
+
+            name = None
+            prod = await grocy_get(client, f"/objects/products/{pos['product_id']}")
+            if prod.status_code == 200:
+                name = prod.json().get("name")
+            added.append({"product_id": pos["product_id"], "product_name": name, "amount": scaled_amount})
+
+        return {"success": True, "added": added}
 
 
 # ── Ingress web UI (scan workflow, no Claude involved) ───────────────────────
