@@ -52,6 +52,13 @@
 <canvas id="captureCanvas" style="display:none;"></canvas>
 
 <script>
+// WICHTIG: alle eigenen API-Pfade unten sind dokumentrelativ (kein fuehrender
+// "/"), z.B. "api/check-barcode" statt "/api/check-barcode". Root-relative
+// Pfade werden innerhalb des HA-Ingress-iframes gegen die Nabu-Casa-Domain
+// aufgeloest statt gegen den tatsaechlichen Ingress-Pfad dieses Add-ons -
+// exakt derselbe Fehler, den wir vorher bei Grocys eigenen Asset-Links
+// gefunden und behoben haben.
+
 const hints = new Map();
 hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
   ZXing.BarcodeFormat.EAN_8,
@@ -78,62 +85,74 @@ function showStatus(msg, ok) {
 function startScanning() {
   showStep('step-video');
   showStatus('Suche Barcode...', true);
-  reader.decodeFromVideoDevice(undefined, 'livestream', async (result, error) => {
+  reader.decodeFromVideoDevice(undefined, 'livestream', (result, error) => {
     if (result) {
       reader.reset();
       pendingBarcode = result.getText();
       document.getElementById('barcodeLabel').textContent = 'Barcode: ' + pendingBarcode;
-      await checkBarcode();
+      checkBarcode();
     }
   }).catch(err => showStatus('Kamera-Fehler: ' + err, false));
 }
 
 async function checkBarcode() {
   showStatus('Gleiche mit Grocy ab...', true);
-  const res = await fetch('/api/check-barcode', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ barcode: pendingBarcode })
-  });
-  const data = await res.json();
-
-  if (data.error) {
-    showStatus('Fehler: ' + data.error, false);
-    return;
-  }
-
-  if (data.found) {
-    document.getElementById('productName').textContent = data.name;
-    const pic = document.getElementById('productPic');
-    if (data.picture_file_name) {
-      pic.src = '/api/product-picture/' + encodeURIComponent(data.picture_file_name);
-      pic.style.display = 'block';
-    } else {
-      pic.style.display = 'none';
+  try {
+    const res = await fetch('api/check-barcode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ barcode: pendingBarcode })
+    });
+    if (!res.ok) {
+      showStatus('Server-Fehler (' + res.status + ')', false);
+      return;
     }
-    showStatus('Bekannt - aktueller Bestand: ' + (data.stock_amount ?? '0'), true);
-    showStep('step-action');
-  } else {
-    document.getElementById('unknownLabel').textContent = 'Unbekannter Barcode: ' + pendingBarcode;
-    showStatus('Unbekannt - bitte Produktfoto aufnehmen', false);
-    startPhoto2();
+    const data = await res.json();
+
+    if (data.error) {
+      showStatus('Fehler: ' + data.error, false);
+      return;
+    }
+
+    if (data.found) {
+      document.getElementById('productName').textContent = data.name;
+      const pic = document.getElementById('productPic');
+      if (data.picture_file_name) {
+        pic.src = 'api/product-picture/' + encodeURIComponent(data.picture_file_name);
+        pic.style.display = 'block';
+      } else {
+        pic.style.display = 'none';
+      }
+      showStatus('Bekannt - aktueller Bestand: ' + (data.stock_amount ?? '0'), true);
+      showStep('step-action');
+    } else {
+      document.getElementById('unknownLabel').textContent = 'Unbekannter Barcode: ' + pendingBarcode;
+      showStatus('Unbekannt - bitte Produktfoto aufnehmen', false);
+      startPhoto2();
+    }
+  } catch (err) {
+    showStatus('Netzwerk-Fehler beim Abgleich: ' + err, false);
   }
 }
 
 async function book(action) {
   const amount = document.getElementById('amount').value || 1;
   showStatus('Buche...', true);
-  const res = await fetch('/api/book', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ barcode: pendingBarcode, amount: amount, action: action })
-  });
-  const data = await res.json();
-  if (data.status === 'ok') {
-    showStatus('Gebucht: ' + data.barcode, true);
-    setTimeout(startScanning, 800);
-  } else {
-    showStatus('Fehler: ' + data.message, false);
+  try {
+    const res = await fetch('api/book', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ barcode: pendingBarcode, amount: amount, action: action })
+    });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      showStatus('Gebucht: ' + data.barcode, true);
+      setTimeout(startScanning, 800);
+    } else {
+      showStatus('Fehler: ' + data.message, false);
+    }
+  } catch (err) {
+    showStatus('Netzwerk-Fehler beim Buchen: ' + err, false);
   }
 }
 
@@ -163,16 +182,20 @@ document.getElementById('btnCapture').onclick = async () => {
     fd.append('barcode', pendingBarcode);
 
     showStatus('Lege Produkt an...', true);
-    const res = await fetch('/api/create-unknown', { method: 'POST', body: fd });
-    const data = await res.json();
+    try {
+      const res = await fetch('api/create-unknown', { method: 'POST', body: fd });
+      const data = await res.json();
 
-    if (data.status === 'ok') {
-      showStatus('Produkt angelegt (id ' + data.product_id + ') - jetzt Menge eingeben', true);
-      document.getElementById('productName').textContent = '(neu angelegt, Name folgt spaeter)';
-      document.getElementById('productPic').style.display = 'none';
-      showStep('step-action');
-    } else {
-      showStatus('Fehler: ' + data.message, false);
+      if (data.status === 'ok') {
+        showStatus('Produkt angelegt (id ' + data.product_id + ') - jetzt Menge eingeben', true);
+        document.getElementById('productName').textContent = '(neu angelegt, Name folgt spaeter)';
+        document.getElementById('productPic').style.display = 'none';
+        showStep('step-action');
+      } else {
+        showStatus('Fehler: ' + data.message, false);
+      }
+    } catch (err) {
+      showStatus('Netzwerk-Fehler beim Anlegen: ' + err, false);
     }
   }, 'image/jpeg', 0.9);
 };
