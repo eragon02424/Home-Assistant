@@ -1,5 +1,5 @@
 """
-MCP Shopping Products for Home Assistant v1.3.1
+MCP Shopping Products for Home Assistant v1.3.2
 
 Two halves:
 1. Ingress web UI (live camera via getUserMedia + zxing-js, same library and
@@ -48,19 +48,25 @@ opened inside the Home Assistant Companion App's ingress webview (confirmed
 by the user testing on-device), while Grocy's own getUserMedia-based scanner,
 running in the very same webview/ingress context, did open the camera.
 
-IMPORTANT routing fix (v1.3.1): mcp.streamable_http_app() already serves its
-own single route internally at exactly "/mcp" (confirmed by inspecting
-app.routes on the actual installed mcp package). Earlier versions of this
-file additionally mounted that whole app under ANOTHER "/mcp" prefix via
-Starlette's app.mount("/mcp", mcp_app) - this created a double-nested path
-requirement and, combined with Starlette's automatic redirect-to-trailing-
-slash behavior for Mounts, made the MCP endpoint completely unreachable
-(reproduced live: POST to /mcp returned 307 to /mcp/, and POST to /mcp/ then
-returned 404). Fix: merge mcp_app's own routes directly into this file's
-Starlette app instead of nesting it under an extra prefix, and pass through
-mcp_app's lifespan (needed to start FastMCP's internal session manager -
-dropping this would leave the streamable-HTTP session handling
-uninitialized even though the route itself matches).
+Routing fix (v1.3.1): mcp.streamable_http_app() already serves its own single
+route internally at exactly "/mcp". Mounting that whole app under ANOTHER
+"/mcp" prefix via Starlette's app.mount() created a double-nested path
+requirement, making the endpoint unreachable (307 to /mcp/, then 404). Fixed
+by merging mcp_app's routes directly into this file's own Starlette app and
+passing through its lifespan (needed for FastMCP's session manager to start).
+
+Image return fix (v1.3.2): returning a dict with an Image instance as one of
+its values (e.g. {"found": True, "image": Image(...)}) does NOT produce a
+viewable image for the MCP client - confirmed live: the client received the
+literal Python repr string of the Image object instead of an actual picture.
+Root cause (confirmed in mcp/server/fastmcp/utilities/func_metadata.py,
+_convert_to_content): FastMCP only special-cases a tool's return value when
+it IS an Image instance directly, or a list/tuple, whose items are then each
+converted recursively (dict -> JSON text, Image -> real ImageContent block).
+A dict is serialized whole via pydantic_core with fallback=str, which is why
+a nested Image silently became a text repr rather than raising an error. Fix:
+whenever an image is available, return a list [info_dict, Image(...)]
+instead of embedding the Image inside the dict.
 """
 
 import base64
@@ -122,17 +128,17 @@ mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding
 
 
 @mcp.tool()
-async def get_next_unnamed_product() -> dict:
+async def get_next_unnamed_product() -> list:
     """Return the next Grocy product that still has its barcode as a placeholder
     name (real name not filled in yet), along with its barcode and product
-    photo. Returns {"found": false} when none are left.
+    photo. Returns just {"found": false} when none are left.
     A product still needs naming if its name exactly matches one of its own
     linked barcodes - this is checked in Python since Grocy's query[] filter
     does not support this kind of comparison."""
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_get(client, "/objects/products")
         if pr.status_code != 200:
-            return {"found": False, "error": f"Grocy returned {pr.status_code}: {pr.text}"}
+            return [{"found": False, "error": f"Grocy returned {pr.status_code}: {pr.text}"}]
         products = pr.json()
 
         br = await grocy_get(client, "/objects/product_barcodes")
@@ -146,38 +152,37 @@ async def get_next_unnamed_product() -> dict:
             if p.get("name") and p["name"] in barcodes_by_product.get(p["id"], [])
         ]
         if not candidates:
-            return {"found": False}
+            return [{"found": False}]
 
         product = candidates[0]
         product_id = product["id"]
         barcode = product["name"]
 
-        result = {"found": True, "product_id": product_id, "barcode": barcode}
+        info = {"found": True, "product_id": product_id, "barcode": barcode}
 
         picture_file_name = product.get("picture_file_name")
         if picture_file_name:
             image = await fetch_product_image(client, picture_file_name)
             if image:
-                result["image"] = image
-            else:
-                result["picture_error"] = "Could not fetch picture"
+                return [info, image]
+            info["picture_error"] = "Could not fetch picture"
         else:
-            result["picture_error"] = "No picture_file_name set on this product"
+            info["picture_error"] = "No picture_file_name set on this product"
 
-        return result
+        return [info]
 
 
 @mcp.tool()
-async def get_next_product_without_barcode() -> dict:
+async def get_next_product_without_barcode() -> list:
     """Return the next Grocy product that has no barcode linked to it at all
     (checked by cross-referencing every product id against the full
     product_barcodes list - not the same case as get_next_unnamed_product,
     which is about products that DO have a barcode but it's being used as a
-    placeholder name). Returns {"found": false} when none are left."""
+    placeholder name). Returns just {"found": false} when none are left."""
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_get(client, "/objects/products")
         if pr.status_code != 200:
-            return {"found": False, "error": f"Grocy returned {pr.status_code}: {pr.text}"}
+            return [{"found": False, "error": f"Grocy returned {pr.status_code}: {pr.text}"}]
         products = pr.json()
 
         br = await grocy_get(client, "/objects/product_barcodes")
@@ -187,18 +192,18 @@ async def get_next_product_without_barcode() -> dict:
 
         candidates = [p for p in products if p["id"] not in product_ids_with_barcode]
         if not candidates:
-            return {"found": False}
+            return [{"found": False}]
 
         product = candidates[0]
-        result = {"found": True, "product_id": product["id"], "name": product.get("name")}
+        info = {"found": True, "product_id": product["id"], "name": product.get("name")}
 
         picture_file_name = product.get("picture_file_name")
         if picture_file_name:
             image = await fetch_product_image(client, picture_file_name)
             if image:
-                result["image"] = image
+                return [info, image]
 
-        return result
+        return [info]
 
 
 @mcp.tool()
@@ -384,8 +389,8 @@ async def api_create_unknown(request: Request):
 
 # ── App assembly ──────────────────────────────────────────────────────────────
 # mcp_app's own route ("/mcp") is merged directly into this app's route list
-# (not nested via Mount - see the v1.3.1 note in the module docstring for why).
-# Its lifespan is passed through so FastMCP's session manager actually starts.
+# (not nested via Mount). Its lifespan is passed through so FastMCP's session
+# manager actually starts.
 
 mcp_app = mcp.streamable_http_app()
 
