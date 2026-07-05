@@ -1,52 +1,55 @@
 """
-MCP Shopping Products for Home Assistant v1.1.0
+MCP Shopping Products for Home Assistant v1.2.0
 
 Two halves:
 1. Ingress web UI (live camera via getUserMedia + zxing-js, same library and
    version Grocy itself uses) - handles the live scan workflow directly
-   against Grocy's API, without involving Claude at all. Barcode decoding now
-   happens client-side in the browser (continuous video scan), not server-side.
+   against Grocy's API, without involving Claude at all.
 2. MCP tools - used later by Claude in a separate session to fill in names
    for products that were created with a placeholder name during scanning.
 
+Flow (v1.2.0, check-first instead of try-then-fallback):
+1. Barcode decoded client-side (zxing-js) from the live video.
+2. Frontend calls /api/check-barcode (read-only GET against Grocy).
+   - Known: shows name/picture + amount + Einlagern/Auslagern -> /api/book
+   - Unknown: goes straight to a camera capture step (live preview with an
+     explicit "Foto aufnehmen" button - not automatic, not continuous
+     analysis) -> /api/create-unknown creates the product (barcode as
+     placeholder name, links barcode, uploads picture) WITHOUT booking any
+     stock -> frontend then shows amount + Einlagern/Auslagern -> /api/book
+
 Grocy API facts this code relies on (verified against a live Grocy instance
 during development, see conversation history):
+- GET /stock/products/by-barcode/{barcode} returns 200 with product/
+  picture_file_name/stock_amount for a known barcode, or 400 with
+  error_message "No product with barcode ... found" for an unknown one.
 - Product.name has a NOT NULL constraint AND a UNIQUE constraint. An empty
-  string "" is accepted by the NOT NULL check but is itself subject to the
-  UNIQUE constraint too (confirmed live: a second product with name=""
-  fails with "UNIQUE constraint failed: products.name", and Grocy stores/
-  returns "" as null). Fix: use the barcode string itself as the placeholder
-  name (barcodes are unique per product, confirmed live).
-- Filtering objects with query[]=name= (empty value) returns "Invalid query".
-- POST /stock/products/by-barcode/{barcode}/add|consume returns HTTP 400 with
-  error_message "No product with barcode ... found" for an unknown barcode -
-  this exact substring is used to detect the unknown-product case.
+  string collides after the first use (Grocy stores/returns "" as null and
+  enforces uniqueness on it) - the barcode string itself is used as a unique
+  placeholder name instead.
 - Product pictures must be fetched via GET /files/productpictures/{b64name}
   (this addon has its own isolated /config, no shared filesystem with the
-  Grocy addon, so direct disk access is not possible here).
+  Grocy addon, so direct disk access is not possible here) - proxied to the
+  browser via /api/product-picture/{filename} since the browser cannot reach
+  Grocy's internal hostname directly.
 - ProductBarcode is a separate object from Product (POST /objects/product_barcodes).
 
-Why the ingress page moved from <input capture> to getUserMedia+zxing-js:
+Why the ingress page uses getUserMedia+zxing-js instead of <input capture>:
 a file-input's capture attribute did not open the camera when this page was
 opened inside the Home Assistant Companion App's ingress webview (confirmed
 by the user testing on-device), while Grocy's own getUserMedia-based scanner,
-running in the very same webview/ingress context, did open the camera. The
-server-side zbar-based decode_barcode() function and the old /api/scan photo
-endpoint are kept for now as a fallback but are no longer used by the page.
+running in the very same webview/ingress context, did open the camera.
 """
 
 import base64
-import io
 import os
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.server.fastmcp.utilities.types import Image as MCPImage
-from PIL import Image
-from pyzbar.pyzbar import decode as zbar_decode
 from starlette.applications import Starlette
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 from starlette.requests import Request
 import uvicorn
@@ -61,50 +64,15 @@ QU_STOCK = int(os.environ.get("GROCY_QU_STOCK", "2"))
 # ── Grocy HTTP helpers ────────────────────────────────────────────────────────
 
 async def grocy_get(client: httpx.AsyncClient, path: str, params: dict | None = None):
-    r = await client.get(f"{GROCY_BASE}{path}", params=params)
-    return r
+    return await client.get(f"{GROCY_BASE}{path}", params=params)
 
 
 async def grocy_post(client: httpx.AsyncClient, path: str, json_body: dict):
-    r = await client.post(f"{GROCY_BASE}{path}", json=json_body)
-    return r
+    return await client.post(f"{GROCY_BASE}{path}", json=json_body)
 
 
 async def grocy_put(client: httpx.AsyncClient, path: str, json_body: dict | None = None, content: bytes | None = None, headers: dict | None = None):
-    r = await client.put(f"{GROCY_BASE}{path}", json=json_body, content=content, headers=headers)
-    return r
-
-
-# ── Barcode decoding (server-side fallback, no longer used by the page) ──────
-
-def decode_barcode(image_bytes: bytes) -> str | None:
-    """Decode a barcode from image bytes using zbar. Kept as a fallback; the
-    ingress page now decodes barcodes client-side via zxing-js instead."""
-    img = Image.open(io.BytesIO(image_bytes))
-    results = zbar_decode(img)
-    if not results:
-        return None
-    return results[0].data.decode("utf-8")
-
-
-# ── Shared booking logic ─────────────────────────────────────────────────────
-
-async def try_book(client: httpx.AsyncClient, barcode: str, amount: str, action: str):
-    """Attempt POST /stock/products/by-barcode/{barcode}/{action}. Returns a
-    dict with status ok|unknown|error, used by both the text-based and
-    photo-based scan endpoints."""
-    body = {"amount": float(amount), "transaction_type": "purchase" if action == "add" else "consume"}
-    r = await grocy_post(client, f"/stock/products/by-barcode/{barcode}/{action}", body)
-    if r.status_code == 200:
-        return {"status": "ok", "barcode": barcode}
-    error_message = ""
-    try:
-        error_message = r.json().get("error_message", "")
-    except Exception:
-        pass
-    if "No product with barcode" in error_message:
-        return {"status": "unknown", "barcode": barcode}
-    return {"status": "error", "message": error_message or r.text}
+    return await client.put(f"{GROCY_BASE}{path}", json=json_body, content=content, headers=headers)
 
 
 # ── MCP tools ─────────────────────────────────────────────────────────────────
@@ -154,11 +122,7 @@ async def get_next_unnamed_product() -> dict:
         product_id = product["id"]
         barcode = product["name"]
 
-        result = {
-            "found": True,
-            "product_id": product_id,
-            "barcode": barcode,
-        }
+        result = {"found": True, "product_id": product_id, "barcode": barcode}
 
         picture_file_name = product.get("picture_file_name")
         if picture_file_name:
@@ -197,50 +161,78 @@ async def index(request: Request):
         return HTMLResponse(f.read())
 
 
-async def api_scan_text(request: Request):
-    """Body: JSON {barcode, amount, action}. Barcode already decoded client-side
-    by zxing-js. Attempts the stock booking directly against Grocy.
-    Returns status: ok | unknown | error."""
+async def api_check_barcode(request: Request):
+    """Body: JSON {barcode}. Read-only check against Grocy, books nothing.
+    Returns {found: true, name, picture_file_name, stock_amount} or
+    {found: false}."""
+    data = await request.json()
+    barcode = data.get("barcode")
+    if not barcode:
+        return JSONResponse({"found": False, "error": "Kein Barcode uebergeben"})
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await grocy_get(client, f"/stock/products/by-barcode/{barcode}")
+        if r.status_code == 200:
+            d = r.json()
+            return JSONResponse({
+                "found": True,
+                "name": d["product"]["name"],
+                "picture_file_name": d["product"].get("picture_file_name"),
+                "stock_amount": d.get("stock_amount"),
+            })
+        error_message = ""
+        try:
+            error_message = r.json().get("error_message", "")
+        except Exception:
+            pass
+        if "No product with barcode" in error_message:
+            return JSONResponse({"found": False})
+        return JSONResponse({"found": False, "error": error_message or r.text})
+
+
+async def api_product_picture(request: Request):
+    """Proxies a product picture from Grocy to the browser (the browser
+    cannot reach Grocy's internal hostname directly)."""
+    filename = request.path_params["filename"]
+    fname_b64 = base64.b64encode(filename.encode()).decode()
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await grocy_get(client, f"/files/productpictures/{fname_b64}")
+        if r.status_code != 200:
+            return Response(status_code=404)
+        return Response(content=r.content, media_type="image/jpeg")
+
+
+async def api_book(request: Request):
+    """Body: JSON {barcode, amount, action}. Books directly - the frontend
+    only calls this once a barcode is already confirmed known (either it was
+    found by api_check_barcode, or it was just created by api_create_unknown).
+    Returns status: ok | error."""
     data = await request.json()
     barcode = data.get("barcode")
     amount = data.get("amount", "1")
     action = data.get("action", "add")
-    if not barcode:
-        return JSONResponse({"status": "error", "message": "Kein Barcode uebergeben"})
     async with httpx.AsyncClient(timeout=15) as client:
-        result = await try_book(client, barcode, amount, action)
-        return JSONResponse(result)
-
-
-async def api_scan(request: Request):
-    """Body: multipart form with 'photo' (barcode photo), 'amount', 'action' (add|consume).
-    Server-side fallback path, kept for compatibility; the page itself no
-    longer calls this (see api_scan_text)."""
-    form = await request.form()
-    photo = await form["photo"].read()
-    amount = form.get("amount", "1")
-    action = form.get("action", "add")
-
-    barcode = decode_barcode(photo)
-    if barcode is None:
-        return JSONResponse({"status": "error", "message": "Kein Barcode im Bild erkannt"})
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        result = await try_book(client, barcode, amount, action)
-        return JSONResponse(result)
+        body = {"amount": float(amount), "transaction_type": "purchase" if action == "add" else "consume"}
+        r = await grocy_post(client, f"/stock/products/by-barcode/{barcode}/{action}", body)
+        if r.status_code == 200:
+            return JSONResponse({"status": "ok", "barcode": barcode})
+        error_message = ""
+        try:
+            error_message = r.json().get("error_message", "")
+        except Exception:
+            pass
+        return JSONResponse({"status": "error", "message": error_message or r.text})
 
 
 async def api_create_unknown(request: Request):
-    """Body: multipart form with 'photo' (product front photo, captured from
-    the live video via canvas), 'barcode', 'amount', 'action'.
+    """Body: multipart form with 'photo' (product front photo, a single
+    explicit capture, not a continuous stream) and 'barcode'.
     Creates the product using the barcode itself as a (unique, valid)
-    placeholder name, links the barcode, uploads the picture, then retries the
-    originally requested stock booking."""
+    placeholder name, links the barcode, uploads the picture. Does NOT book
+    any stock - the frontend calls /api/book separately afterwards once the
+    user enters a quantity."""
     form = await request.form()
     photo = await form["photo"].read()
     barcode = form["barcode"]
-    amount = form.get("amount", "1")
-    action = form.get("action", "add")
 
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_post(client, "/objects/products", {
@@ -265,25 +257,19 @@ async def api_create_unknown(request: Request):
 
         await grocy_put(client, f"/objects/products/{product_id}", json_body={"picture_file_name": filename})
 
-        body = {"amount": float(amount), "transaction_type": "purchase" if action == "add" else "consume"}
-        sr = await grocy_post(client, f"/stock/products/by-barcode/{barcode}/{action}", body)
-        if sr.status_code != 200:
-            return JSONResponse({"status": "error", "message": f"Produkt angelegt, aber Buchung fehlgeschlagen: {sr.text}"})
-
         return JSONResponse({"status": "ok", "product_id": product_id})
 
 
 # ── App assembly ──────────────────────────────────────────────────────────────
-# FastMCP's ASGI app is mounted at /mcp; the ingress web UI and its own small
-# JSON API live at the root paths. Both share one Python process and one port.
 
 mcp_app = mcp.streamable_http_app()
 
 app = Starlette(routes=[
     Route("/", index),
-    Route("/api/scan-text", api_scan_text, methods=["POST"]),
-    Route("/api/scan", api_scan, methods=["POST"]),
+    Route("/api/check-barcode", api_check_barcode, methods=["POST"]),
+    Route("/api/book", api_book, methods=["POST"]),
     Route("/api/create-unknown", api_create_unknown, methods=["POST"]),
+    Route("/api/product-picture/{filename}", api_product_picture, methods=["GET"]),
 ])
 app.mount("/mcp", mcp_app)
 
