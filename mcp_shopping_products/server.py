@@ -1,24 +1,13 @@
 """
-MCP Shopping Products for Home Assistant v1.3.2
+MCP Shopping Products for Home Assistant v1.4.0
 
 Two halves:
-1. Ingress web UI (live camera via getUserMedia + zxing-js, same library and
-   version Grocy itself uses) - handles the live scan workflow directly
-   against Grocy's API, without involving Claude at all.
-2. MCP tools - used later by Claude in a separate session to fill in names
-   for products that were created with a placeholder name during scanning,
-   plus two additional maintenance checks: products with no barcode linked
-   at all, and products missing a photo.
-
-Flow (check-first instead of try-then-fallback):
-1. Barcode decoded client-side (zxing-js) from the live video.
-2. Frontend calls /api/check-barcode (read-only GET against Grocy).
-   - Known: shows name/picture + amount + Einlagern/Auslagern -> /api/book
-   - Unknown: goes straight to a camera capture step (live preview with an
-     explicit "Foto aufnehmen" button - not automatic, not continuous
-     analysis) -> /api/create-unknown creates the product (barcode as
-     placeholder name, links barcode, uploads picture) WITHOUT booking any
-     stock -> frontend then shows amount + Einlagern/Auslagern -> /api/book
+1. Ingress web UI (live camera via getUserMedia + zxing-js) - handles the live
+   scan workflow directly against Grocy's API, without involving Claude.
+2. MCP tools - used by Claude to (a) fill in names for products created with
+   a placeholder name during scanning, (b) find products missing a barcode
+   or picture, and (c) build a shopping list from a recipe/message screenshot
+   by searching for products by name and adding them to Grocy's shopping list.
 
 Grocy API facts this code relies on (verified against a live Grocy instance
 during development, see conversation history):
@@ -26,21 +15,20 @@ during development, see conversation history):
   picture_file_name/stock_amount for a known barcode, or 400 with
   error_message "No product with barcode ... found" for an unknown one.
 - Product.name has a NOT NULL constraint AND a UNIQUE constraint. An empty
-  string collides after the first use (Grocy stores/returns "" as null and
-  enforces uniqueness on it) - the barcode string itself is used as a unique
-  placeholder name instead.
-- If a product with name==<barcode> already exists but has no linked
-  ProductBarcode entry, a later scan of the same barcode used to crash with
-  "UNIQUE constraint failed: products.name" (reproduced live). Fix:
-  api_create_unknown first checks for an existing product with that exact
-  name and reuses it instead of always creating a new one.
+  string collides after the first use - the barcode string itself is used as
+  a unique placeholder name during scanning instead (see api_create_unknown).
+- query[]=name~<text> (the "~" operator) does a SQL LIKE substring search and
+  returns ALL matches - confirmed live with name~Sprite returning two
+  differently-named Sprite products. query[]=name=<text> requires an exact,
+  non-empty value ("Invalid query" if the value is empty).
 - Product pictures must be fetched via GET /files/productpictures/{b64name}
   (this addon has its own isolated /config, no shared filesystem with the
   Grocy addon) - proxied to the browser via /api/product-picture/{filename}.
-- ProductBarcode is a separate object from Product (POST /objects/product_barcodes).
-- "No barcode linked" / "no picture" are checked client-side in Python by
-  cross-referencing product lists, since Grocy's query[] filter has no
-  suitable operator for either case.
+- ProductBarcode is a separate object from Product (POST /objects/product_barcodes) -
+  a product can exist validly with zero linked barcodes and/or no picture.
+- POST /stock/shoppinglist/add-product requires a product_id (not free text);
+  confirmed live (204, entry verified via GET /objects/shopping_list) that it
+  adds/increments an item on the given (or default, list_id=1) shopping list.
 
 Why the ingress page uses getUserMedia+zxing-js instead of <input capture>:
 a file-input's capture attribute did not open the camera when this page was
@@ -50,23 +38,18 @@ running in the very same webview/ingress context, did open the camera.
 
 Routing fix (v1.3.1): mcp.streamable_http_app() already serves its own single
 route internally at exactly "/mcp". Mounting that whole app under ANOTHER
-"/mcp" prefix via Starlette's app.mount() created a double-nested path
-requirement, making the endpoint unreachable (307 to /mcp/, then 404). Fixed
-by merging mcp_app's routes directly into this file's own Starlette app and
-passing through its lifespan (needed for FastMCP's session manager to start).
+"/mcp" prefix via Starlette's app.mount() made the endpoint unreachable (307
+to /mcp/, then 404). Fixed by merging mcp_app's routes directly into this
+file's own Starlette app and passing through its lifespan.
 
-Image return fix (v1.3.2): returning a dict with an Image instance as one of
-its values (e.g. {"found": True, "image": Image(...)}) does NOT produce a
-viewable image for the MCP client - confirmed live: the client received the
-literal Python repr string of the Image object instead of an actual picture.
-Root cause (confirmed in mcp/server/fastmcp/utilities/func_metadata.py,
-_convert_to_content): FastMCP only special-cases a tool's return value when
-it IS an Image instance directly, or a list/tuple, whose items are then each
-converted recursively (dict -> JSON text, Image -> real ImageContent block).
-A dict is serialized whole via pydantic_core with fallback=str, which is why
-a nested Image silently became a text repr rather than raising an error. Fix:
-whenever an image is available, return a list [info_dict, Image(...)]
-instead of embedding the Image inside the dict.
+Image return fix (v1.3.2): a dict with an Image instance as one of its values
+does NOT produce a viewable image for the MCP client - confirmed live, the
+client received the literal Python repr string instead of a picture. Root
+cause (mcp/server/fastmcp/utilities/func_metadata.py, _convert_to_content):
+FastMCP only special-cases a tool's return value when it IS an Image
+instance directly, or a list/tuple whose items are converted recursively.
+Fix: return [info_dict, Image(...)] as a list instead of nesting the Image
+inside the dict.
 """
 
 import base64
@@ -116,12 +99,18 @@ async def fetch_product_image(client: httpx.AsyncClient, picture_file_name: str)
 mcp = FastMCP(
     name="MCP Shopping Products",
     instructions=(
-        "Tools to maintain Grocy products created during shopping scans. "
+        "Tools to maintain Grocy products and build shopping lists. "
         "get_next_unnamed_product finds products still carrying their barcode "
         "as a placeholder name. get_next_product_without_barcode finds products "
         "with no barcode linked at all. get_next_product_without_picture finds "
-        "products missing a photo. Call each repeatedly (with update_product or "
-        "add_product_barcode in between) until it returns found=false."
+        "products missing a photo. search_products does a broad substring "
+        "search by name (e.g. 'Mehl' returns all flour products) - review the "
+        "returned list yourself and pick the right product_id based on the "
+        "user's wording; do not assume a single result is automatically "
+        "correct. create_product_simple makes a new product with just a name "
+        "(no barcode, no picture) when search_products found no suitable "
+        "match. add_to_shopping_list adds a product_id to Grocy's shopping "
+        "list by amount."
     ),
 )
 mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
@@ -266,6 +255,64 @@ async def add_product_barcode(product_id: int, barcode: str) -> dict:
         if r.status_code != 200:
             return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
         return {"success": True, "product_id": product_id, "barcode": barcode}
+
+
+@mcp.tool()
+async def search_products(query: str) -> dict:
+    """Broad substring search for Grocy products by name (SQL LIKE, e.g.
+    'Mehl' returns every product whose name contains 'Mehl' - Vollkornmehl,
+    Weizenmehl Type 405, etc. all at once). Returns {"results": [{"product_id",
+    "name"}, ...]}. Caller must pick the correct product_id from the list
+    based on context (e.g. the user asking specifically for '405') - this
+    tool does not attempt to disambiguate itself, and if the distinguishing
+    detail isn't actually part of the stored name, it cannot be told apart
+    from the returned data alone."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await grocy_get(client, "/objects/products", params={"query[]": f"name~{query}"})
+        if r.status_code != 200:
+            return {"results": [], "error": f"Grocy returned {r.status_code}: {r.text}"}
+        products = r.json()
+        return {"results": [{"product_id": p["id"], "name": p.get("name")} for p in products]}
+
+
+@mcp.tool()
+async def create_product_simple(name: str) -> dict:
+    """Create a new Grocy product with just a name - no barcode, no picture.
+    Use this when search_products found no suitable existing match for an
+    item from a shopping list/recipe. Uses this addon's configured default
+    location_id/qu_id_purchase/qu_id_stock."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await grocy_post(client, "/objects/products", {
+            "name": name,
+            "location_id": LOCATION_ID,
+            "qu_id_purchase": QU_PURCHASE,
+            "qu_id_stock": QU_STOCK,
+        })
+        if r.status_code != 200:
+            return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
+        return {"success": True, "product_id": int(r.json()["created_object_id"]), "name": name}
+
+
+@mcp.tool()
+async def add_to_shopping_list(product_id: int, amount: float = 1, note: str = "") -> dict:
+    """Add a product to Grocy's default shopping list (list_id=1). If the
+    product is already on the list, Grocy increases the existing amount
+    rather than duplicating the entry (this is Grocy's own behavior, not
+    something this tool checks for). Args: product_id, amount (default 1),
+    note (optional)."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        body = {"product_id": product_id, "product_amount": amount}
+        if note:
+            body["note"] = note
+        r = await grocy_post(client, "/stock/shoppinglist/add-product", body)
+        if r.status_code != 204:
+            error_message = ""
+            try:
+                error_message = r.json().get("error_message", "")
+            except Exception:
+                pass
+            return {"success": False, "error": error_message or r.text}
+        return {"success": True, "product_id": product_id, "amount": amount}
 
 
 # ── Ingress web UI (scan workflow, no Claude involved) ───────────────────────
