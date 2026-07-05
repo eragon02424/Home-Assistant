@@ -44,9 +44,13 @@ def setup_routes(app: web.Application):
         n = int(request.query.get("last_n_cycles", 10))
         return web.json_response(device_manager.get_uptime_pattern(name, n))
 
-    async def get_device_logs(request):
+    async def get_online_offline_history(request):
         name = request.match_info["device_name"]
-        return web.json_response(device_manager.get_device_logs(name))
+        n = int(request.query.get("last_n", 10))
+        result = device_manager.get_online_offline_history(name, n)
+        if result is None:
+            return web.json_response({"error": "device not found"}, status=404)
+        return web.json_response(result)
 
     async def start_compile(request):
         name = request.match_info["device_name"]
@@ -101,7 +105,6 @@ def setup_routes(app: web.Application):
                 result["psk_found"] = m is not None
                 if m:
                     result["psk_prefix"] = m.group(1)[:8]
-                # Show raw bytes around encryption:
                 idx = content.find("encryption:")
                 if idx >= 0:
                     result["raw_bytes"] = repr(content[idx:idx+60])
@@ -113,7 +116,7 @@ def setup_routes(app: web.Application):
     app.router.add_get("/devices", list_devices)
     app.router.add_get("/devices/{device_name}/last_seen", get_last_seen)
     app.router.add_get("/devices/{device_name}/uptime_pattern", get_uptime_pattern)
-    app.router.add_get("/devices/{device_name}/logs", get_device_logs)
+    app.router.add_get("/devices/{device_name}/history", get_online_offline_history)
     app.router.add_get("/devices/{device_name}/debug_psk", debug_psk)
     app.router.add_post("/devices/{device_name}/compile", start_compile)
     app.router.add_post("/devices/{device_name}/install", start_install)
