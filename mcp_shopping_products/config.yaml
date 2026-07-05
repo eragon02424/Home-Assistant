@@ -1,0 +1,31 @@
+name: "MCP Shopping Products"
+description: "Scan groceries into Grocy (Ingress camera page) and let Claude fill in missing product names via MCP tools"
+version: "1.0.0"
+slug: "mcp_shopping_products"
+init: false
+arch:
+  - amd64
+  - aarch64
+startup: services
+boot: auto
+ports:
+  8769/tcp: 8769
+ports_description:
+  8769/tcp: "MCP + Ingress web UI"
+ingress: true
+ingress_port: 8769
+ingress_stream: false
+options:
+  grocy_host: "57f327aa-grocy-linuxserver"
+  location_id: 2
+  qu_id_purchase: 2
+  qu_id_stock: 2
+schema:
+  grocy_host: str
+  location_id: int
+  qu_id_purchase: int
+  qu_id_stock: int
+map:
+  - type: addon_config
+    path: /config
+    read_only: false
