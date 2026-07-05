@@ -4,18 +4,21 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Shopping Scan</title>
+<script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
 <style>
   body { font-family: sans-serif; background:#111; color:#eee; margin:0; padding:16px; }
   h2 { margin-top:0; }
   .step { display:none; }
   .step.active { display:block; }
-  button, input[type=submit] { font-size:1.2em; padding:12px 20px; margin:8px 0; width:100%; border-radius:8px; border:none; background:#2a6; color:#fff; }
+  button { font-size:1.2em; padding:12px 20px; margin:8px 0; width:100%; border-radius:8px; border:none; background:#2a6; color:#fff; }
   button.secondary { background:#446; }
   input[type=number] { font-size:1.2em; padding:10px; width:100%; box-sizing:border-box; margin:8px 0; }
-  #status { margin:12px 0; padding:10px; border-radius:8px; }
+  #status { margin:12px 0; padding:10px; border-radius:8px; min-height:1.2em; }
   .ok { background:#264; }
   .err { background:#622; }
   label { display:block; margin-top:12px; }
+  video { width:100%; border-radius:8px; background:#000; }
+  #barcodeLabel { font-size:1.3em; margin:8px 0; }
 </style>
 </head>
 <body>
@@ -23,26 +26,40 @@
 <h2>Grocy Schnellscan</h2>
 <div id="status"></div>
 
-<div id="step-photo1" class="step active">
-  <label>Foto vom Barcode</label>
-  <input type="file" accept="image/*" capture="environment" id="photo1">
+<div id="step-video" class="step active">
+  <video id="livestream" muted playsinline></video>
+</div>
+
+<div id="step-action" class="step">
+  <p id="barcodeLabel"></p>
   <label>Menge</label>
   <input type="number" id="amount" value="1" step="1" min="0.01">
   <button id="btnAdd">Einlagern</button>
   <button id="btnConsume" class="secondary">Auslagern</button>
+  <button id="btnCancel" class="secondary">Abbrechen (neu scannen)</button>
 </div>
 
 <div id="step-photo2" class="step">
-  <p>Barcode unbekannt. Bitte Foto von der Produkt-Vorderseite machen.</p>
-  <label>Foto vom Produkt</label>
-  <input type="file" accept="image/*" capture="environment" id="photo2">
-  <button id="btnCreate">Produkt anlegen &amp; buchen</button>
+  <p>Barcode unbekannt. Bitte Kamera auf die Produkt-Vorderseite richten.</p>
+  <video id="livestream2" muted playsinline></video>
+  <button id="btnCapture">Foto aufnehmen &amp; Produkt anlegen</button>
 </div>
 
+<canvas id="captureCanvas" style="display:none;"></canvas>
+
 <script>
+const hints = new Map();
+hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+  ZXing.BarcodeFormat.EAN_8,
+  ZXing.BarcodeFormat.EAN_13,
+  ZXing.BarcodeFormat.CODE_39,
+  ZXing.BarcodeFormat.CODE_128,
+  ZXing.BarcodeFormat.QR_CODE,
+]);
+const reader = new ZXing.BrowserMultiFormatReader(hints);
+
 let pendingBarcode = null;
-let pendingAmount = 1;
-let pendingAction = "add";
+let currentVideoEl = null;
 
 function showStep(id) {
   document.querySelectorAll('.step').forEach(e => e.classList.remove('active'));
@@ -55,59 +72,86 @@ function showStatus(msg, ok) {
   el.className = ok ? 'ok' : 'err';
 }
 
-async function scan(action) {
-  const fileInput = document.getElementById('photo1');
-  if (!fileInput.files.length) { showStatus('Bitte erst ein Foto aufnehmen', false); return; }
-  pendingAmount = document.getElementById('amount').value || 1;
-  pendingAction = action;
+function startScanning() {
+  showStep('step-video');
+  showStatus('Suche Barcode...', true);
+  reader.decodeFromVideoDevice(undefined, 'livestream', (result, error) => {
+    if (result) {
+      reader.reset();
+      pendingBarcode = result.getText();
+      document.getElementById('barcodeLabel').textContent = 'Barcode: ' + pendingBarcode;
+      showStatus('Gefunden', true);
+      showStep('step-action');
+    }
+  }).catch(err => showStatus('Kamera-Fehler: ' + err, false));
+}
 
-  const fd = new FormData();
-  fd.append('photo', fileInput.files[0]);
-  fd.append('amount', pendingAmount);
-  fd.append('action', action);
-
-  showStatus('Scanne...', true);
-  const res = await fetch('/api/scan', { method: 'POST', body: fd });
+async function bookAction(action) {
+  const amount = document.getElementById('amount').value || 1;
+  showStatus('Buche...', true);
+  const res = await fetch('/api/scan-text', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ barcode: pendingBarcode, amount: amount, action: action })
+  });
   const data = await res.json();
 
   if (data.status === 'ok') {
     showStatus('Gebucht: ' + data.barcode, true);
-    fileInput.value = '';
+    setTimeout(startScanning, 800);
   } else if (data.status === 'unknown') {
-    pendingBarcode = data.barcode;
     showStatus('Unbekannter Barcode: ' + data.barcode, false);
-    showStep('step-photo2');
+    startPhoto2Scan();
   } else {
     showStatus('Fehler: ' + data.message, false);
   }
 }
 
-document.getElementById('btnAdd').onclick = () => scan('add');
-document.getElementById('btnConsume').onclick = () => scan('consume');
+function startPhoto2Scan() {
+  showStep('step-photo2');
+  const video = document.getElementById('livestream2');
+  currentVideoEl = video;
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } }).then(stream => {
+    video.srcObject = stream;
+    video.play();
+  }).catch(err => showStatus('Kamera-Fehler: ' + err, false));
+}
 
-document.getElementById('btnCreate').onclick = async () => {
-  const fileInput = document.getElementById('photo2');
-  if (!fileInput.files.length) { showStatus('Bitte erst ein Foto aufnehmen', false); return; }
+document.getElementById('btnCapture').onclick = async () => {
+  const video = currentVideoEl;
+  const canvas = document.getElementById('captureCanvas');
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  canvas.getContext('2d').drawImage(video, 0, 0);
 
-  const fd = new FormData();
-  fd.append('photo', fileInput.files[0]);
-  fd.append('barcode', pendingBarcode);
-  fd.append('amount', pendingAmount);
-  fd.append('action', pendingAction);
+  video.srcObject.getTracks().forEach(t => t.stop());
 
-  showStatus('Lege Produkt an...', true);
-  const res = await fetch('/api/create-unknown', { method: 'POST', body: fd });
-  const data = await res.json();
+  canvas.toBlob(async (blob) => {
+    const fd = new FormData();
+    fd.append('photo', blob, 'product.jpg');
+    fd.append('barcode', pendingBarcode);
+    fd.append('amount', document.getElementById('amount').value || 1);
+    fd.append('action', pendingActionForCreate);
 
-  if (data.status === 'ok') {
-    showStatus('Produkt angelegt und gebucht (id ' + data.product_id + ')', true);
-    document.getElementById('photo1').value = '';
-    fileInput.value = '';
-    showStep('step-photo1');
-  } else {
-    showStatus('Fehler: ' + data.message, false);
-  }
+    showStatus('Lege Produkt an...', true);
+    const res = await fetch('/api/create-unknown', { method: 'POST', body: fd });
+    const data = await res.json();
+
+    if (data.status === 'ok') {
+      showStatus('Produkt angelegt und gebucht (id ' + data.product_id + ')', true);
+      setTimeout(startScanning, 800);
+    } else {
+      showStatus('Fehler: ' + data.message, false);
+    }
+  }, 'image/jpeg', 0.9);
 };
+
+let pendingActionForCreate = 'add';
+document.getElementById('btnAdd').onclick = () => { pendingActionForCreate = 'add'; bookAction('add'); };
+document.getElementById('btnConsume').onclick = () => { pendingActionForCreate = 'consume'; bookAction('consume'); };
+document.getElementById('btnCancel').onclick = () => startScanning();
+
+startScanning();
 </script>
 </body>
 </html>
