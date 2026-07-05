@@ -1,5 +1,5 @@
 """
-MCP Shopping Products for Home Assistant v1.7.0
+MCP Shopping Products for Home Assistant v1.8.0
 
 Two halves:
 1. Ingress web UI (live camera via getUserMedia + zxing-js) - handles the live
@@ -8,8 +8,8 @@ Two halves:
    a placeholder name during scanning, (b) find products missing a barcode
    or picture, (c) build a shopping list from a recipe/message screenshot by
    searching for products by name, and (d) create/edit recipes (including
-   free-text instructions and a dish photo) and push a scaled recipe's
-   ingredients onto Grocy's shopping list.
+   free-text instructions, per-ingredient quantity units, and a dish photo)
+   and push a scaled recipe's ingredients onto Grocy's shopping list.
 
 Grocy API facts this code relies on (verified against a live Grocy instance
 during development, see conversation history):
@@ -33,9 +33,20 @@ during development, see conversation history):
 - Recipes: entity names are "recipes" and "recipes_pos". POST /objects/recipes
   only strictly needs "name" (base_servings/desired_servings default to 1;
   the "description" field is free text and is used to hold step-by-step
-  instructions - Grocy's schema has no separate structured-steps table,
-  confirmed by inspecting the recipes table's migration history). POST
-  /objects/recipes_pos only strictly needs recipe_id/product_id/amount.
+  instructions - Grocy's schema has no separate structured-steps table).
+  POST /objects/recipes_pos only strictly needs recipe_id/product_id/amount,
+  but ALSO accepts an optional qu_id (confirmed against recipes_pos' own
+  migration history - column added in migration 0034) to record which
+  quantity unit (g, ml, tsp, piece, pinch, ...) the amount is measured in.
+  Without qu_id, Grocy silently falls back to the product's own default
+  stock unit, which is wrong whenever a recipe's ingredient unit differs
+  from that product's usual stock unit (e.g. "Butter" tracked in "Stück" in
+  stock but needed in "Gramm" for a recipe) - this was found live while
+  building a real multi-ingredient recipe and fixed by adding qu_id support
+  to add_recipe_ingredient/update_recipe_ingredient plus a
+  search_quantity_units/create_quantity_unit tool pair so units can be
+  looked up or created (only "Stück", "Liter", "ml", "1l Packung" existed
+  initially - "Gramm", "Teelöffel", "Prise", "Päckchen" were added live).
 - Deleting a recipe does NOT cascade-delete its recipes_pos rows (confirmed
   live: an orphaned recipes_pos row with a dangling recipe_id remained after
   DELETE /objects/recipes/{id} and had to be removed separately).
@@ -144,15 +155,23 @@ mcp = FastMCP(
         "(name, description - description holds free-text instructions, e.g. "
         "numbered steps - and base_servings, the serving count all ingredient "
         "amounts are defined for). search_recipes finds a recipe by name. "
-        "get_recipe_ingredients lists a recipe's ingredients. "
+        "get_recipe_ingredients lists a recipe's ingredients including their "
+        "quantity unit. search_quantity_units/create_quantity_unit look up or "
+        "create units like Gramm/Teelöffel/Prise - always pass the correct "
+        "qu_id to add_recipe_ingredient/update_recipe_ingredient, since "
+        "omitting it silently defaults to the product's own stock unit which "
+        "is usually wrong for a recipe (e.g. Butter tracked in Stück in stock "
+        "but needed in Gramm for a recipe). "
         "add_recipe_ingredient/update_recipe_ingredient/remove_recipe_ingredient "
         "manage individual ingredients. add_recipe_to_shopping_list takes "
         "every ingredient's amount times a multiplier and adds it to the "
         "shopping list directly - it does NOT check current stock or "
         "existing shopping list amounts, it always adds the full scaled "
-        "quantity. set_recipe_picture attaches a dish photo to a recipe (pass "
-        "the image as a base64 string, read from Claude's own sandbox); "
-        "get_recipe_picture retrieves it again."
+        "quantity (and does not currently convert units - the shopping list "
+        "amount will be in the ingredient's recipe unit). set_recipe_picture "
+        "attaches a dish photo to a recipe (pass the image as a base64 "
+        "string, read from Claude's own sandbox); get_recipe_picture "
+        "retrieves it again."
     ),
 )
 mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
@@ -358,6 +377,35 @@ async def add_to_shopping_list(product_id: int, amount: float = 1, note: str = "
 
 
 @mcp.tool()
+async def search_quantity_units(query: str = "") -> dict:
+    """Look up Grocy quantity units by name (substring search; pass an empty
+    query to list all of them). Returns {"results": [{"qu_id", "name"}, ...]}.
+    Use this before add_recipe_ingredient to find the correct qu_id for a
+    unit like Gramm/ml/Teelöffel/Stück/Prise/Päckchen."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        params = {"query[]": f"name~{query}"} if query else None
+        r = await grocy_get(client, "/objects/quantity_units", params=params)
+        if r.status_code != 200:
+            return {"results": [], "error": f"Grocy returned {r.status_code}: {r.text}"}
+        units = r.json()
+        return {"results": [{"qu_id": u["id"], "name": u.get("name")} for u in units]}
+
+
+@mcp.tool()
+async def create_quantity_unit(name: str, name_plural: str = "") -> dict:
+    """Create a new Grocy quantity unit (e.g. 'Gramm', 'Teelöffel', 'Prise').
+    Args: name, name_plural (defaults to name if not given)."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await grocy_post(client, "/objects/quantity_units", {
+            "name": name,
+            "name_plural": name_plural or name,
+        })
+        if r.status_code != 200:
+            return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
+        return {"success": True, "qu_id": int(r.json()["created_object_id"]), "name": name}
+
+
+@mcp.tool()
 async def create_or_update_recipe(name: str, description: str = "", base_servings: float = 1) -> dict:
     """Create a new recipe, or update an existing one if a recipe with this
     EXACT name already exists (matched via an exact, case-sensitive name
@@ -411,8 +459,10 @@ async def search_recipes(query: str) -> dict:
 @mcp.tool()
 async def get_recipe_ingredients(recipe_id: int) -> dict:
     """List all ingredients of a recipe. Returns {"results": [{"recipe_pos_id",
-    "product_id", "product_name", "amount"}, ...]} where amount is defined for
-    the recipe's base_servings."""
+    "product_id", "product_name", "amount", "qu_id", "unit_name"}, ...]} where
+    amount is defined for the recipe's base_servings, and unit_name is null
+    if no qu_id was set on that ingredient (meaning Grocy falls back to the
+    product's own default stock unit)."""
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_get(client, "/objects/recipes_pos", params={"query[]": f"recipe_id={recipe_id}"})
         if pr.status_code != 200:
@@ -425,39 +475,61 @@ async def get_recipe_ingredients(recipe_id: int) -> dict:
             prod = await grocy_get(client, f"/objects/products/{pos['product_id']}")
             if prod.status_code == 200:
                 name = prod.json().get("name")
+
+            unit_name = None
+            qu_id = pos.get("qu_id")
+            if qu_id:
+                qu = await grocy_get(client, f"/objects/quantity_units/{qu_id}")
+                if qu.status_code == 200:
+                    unit_name = qu.json().get("name")
+
             results.append({
                 "recipe_pos_id": pos["id"],
                 "product_id": pos["product_id"],
                 "product_name": name,
                 "amount": pos["amount"],
+                "qu_id": qu_id,
+                "unit_name": unit_name,
             })
         return {"results": results}
 
 
 @mcp.tool()
-async def add_recipe_ingredient(recipe_id: int, product_id: int, amount: float) -> dict:
+async def add_recipe_ingredient(recipe_id: int, product_id: int, amount: float, qu_id: int | None = None) -> dict:
     """Add one ingredient to a recipe. Args: recipe_id, product_id, amount
     (the quantity of this product needed for the recipe's base_servings -
     e.g. if base_servings=4 and the recipe needs 200g flour for 4 servings,
-    amount=200, not a per-serving amount)."""
+    amount=200, not a per-serving amount), qu_id (the quantity unit id from
+    search_quantity_units/create_quantity_unit - e.g. Gramm for flour,
+    Teelöffel for cocoa powder. STRONGLY RECOMMENDED to always set this: if
+    omitted, Grocy silently uses the product's own default stock unit, which
+    is very often wrong for a recipe amount - e.g. a product tracked in
+    'Stück' in stock but needed in 'Gramm' for this recipe)."""
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await grocy_post(client, "/objects/recipes_pos", {
+        body = {
             "recipe_id": recipe_id,
             "product_id": product_id,
             "amount": amount,
-        })
+        }
+        if qu_id is not None:
+            body["qu_id"] = qu_id
+        r = await grocy_post(client, "/objects/recipes_pos", body)
         if r.status_code != 200:
             return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
         return {"success": True, "recipe_pos_id": int(r.json()["created_object_id"])}
 
 
 @mcp.tool()
-async def update_recipe_ingredient(recipe_pos_id: int, amount: float) -> dict:
-    """Change the amount of an existing recipe ingredient. Args:
-    recipe_pos_id (from get_recipe_ingredients), amount (new quantity, at the
-    recipe's base_servings)."""
+async def update_recipe_ingredient(recipe_pos_id: int, amount: float, qu_id: int | None = None) -> dict:
+    """Change the amount (and optionally the quantity unit) of an existing
+    recipe ingredient. Args: recipe_pos_id (from get_recipe_ingredients),
+    amount (new quantity, at the recipe's base_servings), qu_id (optional -
+    only changes the unit if given)."""
+    body = {"amount": amount}
+    if qu_id is not None:
+        body["qu_id"] = qu_id
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await grocy_put(client, f"/objects/recipes_pos/{recipe_pos_id}", json_body={"amount": amount})
+        r = await grocy_put(client, f"/objects/recipes_pos/{recipe_pos_id}", json_body=body)
         if r.status_code not in (200, 204):
             return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
         return {"success": True, "recipe_pos_id": recipe_pos_id, "amount": amount}
@@ -481,8 +553,11 @@ async def add_recipe_to_shopping_list(recipe_id: int, multiplier: float = 1) -> 
     amount). This adds the full scaled amount unconditionally - it does NOT
     check current stock or existing shopping list amounts and subtract them
     first (that stock-fulfillment behavior was intentionally removed per the
-    user's request). Returns {"success", "added": [{"product_id",
-    "product_name", "amount"}, ...]}."""
+    user's request). Note: this does not convert units - the shopping list
+    entry gets the recipe ingredient's amount as-is, in whatever unit that
+    ingredient's qu_id is (or the product's default stock unit if none was
+    set). Returns {"success", "added": [{"product_id", "product_name",
+    "amount"}, ...]}."""
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_get(client, "/objects/recipes_pos", params={"query[]": f"recipe_id={recipe_id}"})
         if pr.status_code != 200:
