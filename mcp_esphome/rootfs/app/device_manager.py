@@ -1,6 +1,6 @@
 """Device Manager - handles ESPHome device discovery and heartbeat history.
 
-Architecture (v0.8.0):
+Architecture (v0.9.0):
 ──────────────────────
 DISCOVERY (at startup, then every DISCOVERY_INTERVAL_SECONDS)
   Fetch /devices. For every device not yet known: register it (address,
@@ -38,8 +38,18 @@ PERSISTENCE / HISTORY
   /data/mcp_esphome/heartbeat_<name>.json. This file is the durable
   source of truth and is reloaded on addon/HA restart via
   _load_heartbeat_history(), so online/offline history survives restarts.
+
   get_online_offline_history() derives the last N online periods and the
-  last N offline periods from this persisted event list.
+  last N offline periods from this persisted event list (used by the
+  /history API endpoint).
+
+  list_devices() additionally exposes, per device, the duration of the
+  last COMPLETED online period and the last COMPLETED offline period
+  (last_online_duration_seconds / last_offline_duration_seconds), derived
+  from the same persisted events. These feed the "Zuletzt Online" /
+  "Zuletzt Offline" sensors in the ESPHome LiveState integration and are
+  correct across restarts since they come from the persisted file, not
+  from in-memory-only state.
 
 Every TCP ping attempt logs its duration in ms.
 
@@ -471,9 +481,40 @@ class DeviceManager:
     def get_bearer_token(self) -> str:
         return self.bearer_token
 
+    def _last_completed_periods(self, device: DeviceState) -> tuple[Optional[dict], Optional[dict]]:
+        """Scans heartbeat_events once and returns
+        (last_completed_online_period, last_completed_offline_period),
+        each as {"duration_seconds": ..., "ended_at": ...} or None if no
+        such completed period exists yet. Derived purely from the
+        persisted event list, so this is correct immediately after a
+        restart, before any new ping has run.
+        """
+        last_online: Optional[dict] = None
+        last_offline: Optional[dict] = None
+        pending_start: Optional[float] = None
+        pending_kind: Optional[str] = None
+
+        for ts, kind in device.heartbeat_events:
+            if kind == "connected":
+                if pending_kind == "disconnected" and pending_start is not None:
+                    last_offline = {"duration_seconds": ts - pending_start, "ended_at": ts}
+                pending_start = ts
+                pending_kind = "connected"
+            elif kind == "disconnected":
+                if pending_kind == "connected" and pending_start is not None:
+                    last_online = {"duration_seconds": ts - pending_start, "ended_at": ts}
+                pending_start = ts
+                pending_kind = "disconnected"
+
+        return last_online, last_offline
+
     def list_devices(self) -> list[dict]:
-        return [
-            {
+        result = []
+        for name, device in self.devices.items():
+            if not device.initialized:
+                continue
+            last_online, last_offline = self._last_completed_periods(device)
+            result.append({
                 "name": name,
                 "address": device.address,
                 "online": device.online,
@@ -482,10 +523,12 @@ class DeviceManager:
                 "mac_address": device.mac_address,
                 "backoff_multiplier": device.backoff_multiplier,
                 "esphome_reports_online": device.esphome_reports_online,
-            }
-            for name, device in self.devices.items()
-            if device.initialized
-        ]
+                "last_online_duration_seconds": last_online["duration_seconds"] if last_online else None,
+                "last_online_ended_at": last_online["ended_at"] if last_online else None,
+                "last_offline_duration_seconds": last_offline["duration_seconds"] if last_offline else None,
+                "last_offline_ended_at": last_offline["ended_at"] if last_offline else None,
+            })
+        return result
 
     def get_last_seen(self, device_name: str) -> Optional[dict]:
         device = self.devices.get(device_name)
@@ -518,11 +561,6 @@ class DeviceManager:
         completed offline periods from the persisted heartbeat_events.
         Survives HA/addon restarts because heartbeat_events is loaded from
         /data/mcp_esphome/heartbeat_<name>.json on startup.
-
-        A period is "completed" once the opposite transition has occurred
-        (e.g. an online period is only counted once a disconnect follows
-        the connect). The currently ongoing period is reported separately
-        via current_state / current_state_since.
         """
         device = self.devices.get(device_name)
         if not device:
