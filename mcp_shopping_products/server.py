@@ -1,5 +1,5 @@
 """
-MCP Shopping Products for Home Assistant v1.0.0
+MCP Shopping Products for Home Assistant v1.0.1
 
 Two halves:
 1. Ingress web UI (camera photo capture) - handles the live scan workflow
@@ -243,4 +243,4 @@ app = Starlette(routes=[
 app.mount("/mcp", mcp_app)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8769)
+    uvicorn.run(app, host="0.0.0.0", port=8770)
