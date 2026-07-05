@@ -1,12 +1,14 @@
 """
-MCP Shopping Products for Home Assistant v1.2.1
+MCP Shopping Products for Home Assistant v1.3.0
 
 Two halves:
 1. Ingress web UI (live camera via getUserMedia + zxing-js, same library and
    version Grocy itself uses) - handles the live scan workflow directly
    against Grocy's API, without involving Claude at all.
 2. MCP tools - used later by Claude in a separate session to fill in names
-   for products that were created with a placeholder name during scanning.
+   for products that were created with a placeholder name during scanning,
+   plus two additional maintenance checks: products with no barcode linked
+   at all, and products missing a photo.
 
 Flow (check-first instead of try-then-fallback):
 1. Barcode decoded client-side (zxing-js) from the live video.
@@ -41,6 +43,12 @@ during development, see conversation history):
   browser via /api/product-picture/{filename} since the browser cannot reach
   Grocy's internal hostname directly.
 - ProductBarcode is a separate object from Product (POST /objects/product_barcodes).
+- "No barcode linked" is checked by cross-referencing every product's id
+  against the full /objects/product_barcodes list - Grocy's query[] filter
+  has no "not in" or "is null on a joined table" operator for this.
+- "No picture" is a direct field check: product["picture_file_name"] is
+  falsy (Grocy returns null when unset - confirmed on live products created
+  without ever setting this field).
 
 Why the ingress page uses getUserMedia+zxing-js instead of <input capture>:
 a file-input's capture attribute did not open the camera when this page was
@@ -83,17 +91,25 @@ async def grocy_put(client: httpx.AsyncClient, path: str, json_body: dict | None
     return await client.put(f"{GROCY_BASE}{path}", json=json_body, content=content, headers=headers)
 
 
+async def fetch_product_image(client: httpx.AsyncClient, picture_file_name: str) -> MCPImage | None:
+    fname_b64 = base64.b64encode(picture_file_name.encode()).decode()
+    r = await grocy_get(client, f"/files/productpictures/{fname_b64}")
+    if r.status_code == 200:
+        return MCPImage(data=r.content, format="jpeg")
+    return None
+
+
 # ── MCP tools ─────────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
     name="MCP Shopping Products",
     instructions=(
-        "Tools to find Grocy products that were created during shopping with the "
-        "barcode used as a placeholder name (real name unknown at scan time, a "
-        "front-of-package photo was saved instead), and to fill in the real name "
-        "once the photo has been reviewed. Call get_next_unnamed_product "
-        "repeatedly, updating each one with update_product, until it returns "
-        "found=false."
+        "Tools to maintain Grocy products created during shopping scans. "
+        "get_next_unnamed_product finds products still carrying their barcode "
+        "as a placeholder name. get_next_product_without_barcode finds products "
+        "with no barcode linked at all. get_next_product_without_picture finds "
+        "products missing a photo. Call each repeatedly (with update_product or "
+        "add_product_picture in between) until it returns found=false."
     ),
 )
 mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
@@ -134,16 +150,84 @@ async def get_next_unnamed_product() -> dict:
 
         picture_file_name = product.get("picture_file_name")
         if picture_file_name:
-            fname_b64 = base64.b64encode(picture_file_name.encode()).decode()
-            pic_r = await grocy_get(client, f"/files/productpictures/{fname_b64}")
-            if pic_r.status_code == 200:
-                result["image"] = MCPImage(data=pic_r.content, format="jpeg")
+            image = await fetch_product_image(client, picture_file_name)
+            if image:
+                result["image"] = image
             else:
-                result["picture_error"] = f"Could not fetch picture: {pic_r.status_code}"
+                result["picture_error"] = "Could not fetch picture"
         else:
             result["picture_error"] = "No picture_file_name set on this product"
 
         return result
+
+
+@mcp.tool()
+async def get_next_product_without_barcode() -> dict:
+    """Return the next Grocy product that has no barcode linked to it at all
+    (checked by cross-referencing every product id against the full
+    product_barcodes list - not the same case as get_next_unnamed_product,
+    which is about products that DO have a barcode but it's being used as a
+    placeholder name). Returns {"found": false} when none are left."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        pr = await grocy_get(client, "/objects/products")
+        if pr.status_code != 200:
+            return {"found": False, "error": f"Grocy returned {pr.status_code}: {pr.text}"}
+        products = pr.json()
+
+        br = await grocy_get(client, "/objects/product_barcodes")
+        product_ids_with_barcode = set()
+        if br.status_code == 200:
+            product_ids_with_barcode = {entry["product_id"] for entry in br.json()}
+
+        candidates = [p for p in products if p["id"] not in product_ids_with_barcode]
+        if not candidates:
+            return {"found": False}
+
+        product = candidates[0]
+        result = {"found": True, "product_id": product["id"], "name": product.get("name")}
+
+        picture_file_name = product.get("picture_file_name")
+        if picture_file_name:
+            image = await fetch_product_image(client, picture_file_name)
+            if image:
+                result["image"] = image
+
+        return result
+
+
+@mcp.tool()
+async def get_next_product_without_picture() -> dict:
+    """Return the next Grocy product that has no picture_file_name set at all
+    (regardless of whether it has a real name or a barcode-as-placeholder
+    name). Returns {"found": false, "product_id", "name", "barcode"} - there is
+    no image to return here by definition, since this tool exists to find
+    products that are missing one."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        pr = await grocy_get(client, "/objects/products")
+        if pr.status_code != 200:
+            return {"found": False, "error": f"Grocy returned {pr.status_code}: {pr.text}"}
+        products = pr.json()
+
+        candidates = [p for p in products if not p.get("picture_file_name")]
+        if not candidates:
+            return {"found": False}
+
+        product = candidates[0]
+        product_id = product["id"]
+
+        barcode = None
+        br = await grocy_get(client, "/objects/product_barcodes", params={"query[]": f"product_id={product_id}"})
+        if br.status_code == 200:
+            entries = br.json()
+            if entries:
+                barcode = entries[0]["barcode"]
+
+        return {
+            "found": True,
+            "product_id": product_id,
+            "name": product.get("name"),
+            "barcode": barcode,
+        }
 
 
 @mcp.tool()
@@ -160,6 +244,17 @@ async def update_product(product_id: int, name: str, description: str = "", prod
         if r.status_code not in (200, 204):
             return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
         return {"success": True, "product_id": product_id, "name": name}
+
+
+@mcp.tool()
+async def add_product_barcode(product_id: int, barcode: str) -> dict:
+    """Link a barcode to an existing Grocy product that currently has none.
+    Args: product_id, barcode (the EAN/UPC string to link)."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await grocy_post(client, "/objects/product_barcodes", {"product_id": product_id, "barcode": barcode})
+        if r.status_code != 200:
+            return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
+        return {"success": True, "product_id": product_id, "barcode": barcode}
 
 
 # ── Ingress web UI (scan workflow, no Claude involved) ───────────────────────
