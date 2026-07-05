@@ -2,5 +2,3 @@ mcp[cli]>=1.0.0
 starlette
 uvicorn
 httpx
-pyzbar
-Pillow
