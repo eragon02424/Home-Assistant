@@ -79,8 +79,11 @@ function startScanning() {
     if (result) {
       reader.reset();
       pendingBarcode = result.getText();
+      // Wichtig: dies bedeutet nur "Barcode von der Kamera gelesen",
+      // NICHT "Produkt in Grocy bekannt". Der Grocy-Abgleich passiert erst
+      // beim Klick auf Einlagern/Auslagern (bookAction).
       document.getElementById('barcodeLabel').textContent = 'Barcode: ' + pendingBarcode;
-      showStatus('Gefunden', true);
+      showStatus('Barcode gelesen - noch nicht mit Grocy abgeglichen', true);
       showStep('step-action');
     }
   }).catch(err => showStatus('Kamera-Fehler: ' + err, false));
@@ -88,7 +91,7 @@ function startScanning() {
 
 async function bookAction(action) {
   const amount = document.getElementById('amount').value || 1;
-  showStatus('Buche...', true);
+  showStatus('Gleiche mit Grocy ab...', true);
   const res = await fetch('/api/scan-text', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
