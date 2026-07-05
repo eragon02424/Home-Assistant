@@ -1,5 +1,5 @@
 """
-MCP Shopping Products for Home Assistant v1.6.0
+MCP Shopping Products for Home Assistant v1.7.0
 
 Two halves:
 1. Ingress web UI (live camera via getUserMedia + zxing-js) - handles the live
@@ -8,8 +8,8 @@ Two halves:
    a placeholder name during scanning, (b) find products missing a barcode
    or picture, (c) build a shopping list from a recipe/message screenshot by
    searching for products by name, and (d) create/edit recipes (including
-   free-text instructions) and push a scaled recipe's ingredients onto
-   Grocy's shopping list.
+   free-text instructions and a dish photo) and push a scaled recipe's
+   ingredients onto Grocy's shopping list.
 
 Grocy API facts this code relies on (verified against a live Grocy instance
 during development, see conversation history):
@@ -39,12 +39,22 @@ during development, see conversation history):
 - Deleting a recipe does NOT cascade-delete its recipes_pos rows (confirmed
   live: an orphaned recipes_pos row with a dangling recipe_id remained after
   DELETE /objects/recipes/{id} and had to be removed separately).
-- add_recipe_to_shopping_list (v1.6.0) intentionally does NOT use Grocy's
-  stock-fulfillment-based add-not-fulfilled-products-to-shoppinglist endpoint
-  (used in an earlier version) - the user explicitly said the "only order
-  the deficit versus current stock" behavior is not wanted for now. Instead
-  it reads recipes_pos directly and adds amount*multiplier for every
-  ingredient unconditionally.
+- add_recipe_to_shopping_list intentionally does NOT use Grocy's stock-
+  fulfillment-based add-not-fulfilled-products-to-shoppinglist endpoint (used
+  in an earlier version) - the user explicitly said the "only order the
+  deficit versus current stock" behavior is not wanted for now. Instead it
+  reads recipes_pos directly and adds amount*multiplier for every ingredient
+  unconditionally.
+- Recipe pictures: the /files/{group}/{fileName} endpoint's "group" path
+  parameter accepts "recipepictures" as a valid FileGroups enum value
+  (confirmed against the OpenAPI schema and live: PUT
+  /files/recipepictures/{b64name} followed by PUT /objects/recipes/{id} with
+  {"picture_file_name": name} works exactly like the existing product-picture
+  mechanism). Since Claude has no direct byte-level access to images the user
+  pastes into chat, set_recipe_picture takes a base64-encoded string
+  parameter instead of a file upload - Claude reads the user-uploaded image
+  from its own sandbox, base64-encodes it there, and passes that string as
+  a tool argument.
 
 Why the ingress page uses getUserMedia+zxing-js instead of <input capture>:
 a file-input's capture attribute did not open the camera when this page was
@@ -102,12 +112,16 @@ async def grocy_put(client: httpx.AsyncClient, path: str, json_body: dict | None
     return await client.put(f"{GROCY_BASE}{path}", json=json_body, content=content, headers=headers)
 
 
-async def fetch_product_image(client: httpx.AsyncClient, picture_file_name: str) -> MCPImage | None:
+async def fetch_image(client: httpx.AsyncClient, group: str, picture_file_name: str) -> MCPImage | None:
     fname_b64 = base64.b64encode(picture_file_name.encode()).decode()
-    r = await grocy_get(client, f"/files/productpictures/{fname_b64}")
+    r = await grocy_get(client, f"/files/{group}/{fname_b64}")
     if r.status_code == 200:
         return MCPImage(data=r.content, format="jpeg")
     return None
+
+
+async def fetch_product_image(client: httpx.AsyncClient, picture_file_name: str) -> MCPImage | None:
+    return await fetch_image(client, "productpictures", picture_file_name)
 
 
 # ── MCP tools ─────────────────────────────────────────────────────────────────
@@ -136,7 +150,9 @@ mcp = FastMCP(
         "every ingredient's amount times a multiplier and adds it to the "
         "shopping list directly - it does NOT check current stock or "
         "existing shopping list amounts, it always adds the full scaled "
-        "quantity."
+        "quantity. set_recipe_picture attaches a dish photo to a recipe (pass "
+        "the image as a base64 string, read from Claude's own sandbox); "
+        "get_recipe_picture retrieves it again."
     ),
 )
 mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
@@ -495,6 +511,50 @@ async def add_recipe_to_shopping_list(recipe_id: int, multiplier: float = 1) -> 
             added.append({"product_id": pos["product_id"], "product_name": name, "amount": scaled_amount})
 
         return {"success": True, "added": added}
+
+
+@mcp.tool()
+async def set_recipe_picture(recipe_id: int, image_base64: str, extension: str = "jpg") -> dict:
+    """Attach a dish photo to a recipe. Args: recipe_id, image_base64 (the
+    image's bytes, base64-encoded as a string - Claude reads the image from
+    its own sandbox and encodes it before calling this), extension (file
+    extension without dot, default 'jpg'). Overwrites any existing picture on
+    this recipe."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            image_bytes = base64.b64decode(image_base64)
+        except Exception as e:
+            return {"success": False, "error": f"Invalid base64: {e}"}
+
+        filename = f"recipe_{recipe_id}.{extension}"
+        fname_b64 = base64.b64encode(filename.encode()).decode()
+        upr = await grocy_put(client, f"/files/recipepictures/{fname_b64}", content=image_bytes, headers={"Content-Type": "application/octet-stream"})
+        if upr.status_code not in (200, 204):
+            return {"success": False, "error": f"Upload fehlgeschlagen: Grocy returned {upr.status_code}: {upr.text}"}
+
+        ur = await grocy_put(client, f"/objects/recipes/{recipe_id}", json_body={"picture_file_name": filename})
+        if ur.status_code not in (200, 204):
+            return {"success": False, "error": f"Grocy returned {ur.status_code}: {ur.text}"}
+
+        return {"success": True, "recipe_id": recipe_id, "picture_file_name": filename}
+
+
+@mcp.tool()
+async def get_recipe_picture(recipe_id: int) -> list:
+    """Retrieve a recipe's dish photo, if one is set. Returns just
+    {"found": false} if the recipe has no picture_file_name set."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        rr = await grocy_get(client, f"/objects/recipes/{recipe_id}")
+        if rr.status_code != 200:
+            return [{"found": False, "error": f"Grocy returned {rr.status_code}: {rr.text}"}]
+        picture_file_name = rr.json().get("picture_file_name")
+        if not picture_file_name:
+            return [{"found": False}]
+
+        image = await fetch_image(client, "recipepictures", picture_file_name)
+        if not image:
+            return [{"found": False, "error": "Could not fetch picture"}]
+        return [{"found": True, "recipe_id": recipe_id}, image]
 
 
 # ── Ingress web UI (scan workflow, no Claude involved) ───────────────────────
