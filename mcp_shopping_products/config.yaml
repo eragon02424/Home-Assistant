@@ -1,6 +1,6 @@
 name: "MCP Shopping Products"
 description: "Scan groceries into Grocy (Ingress camera page) and let Claude fill in missing product names via MCP tools"
-version: "1.0.0"
+version: "1.0.1"
 slug: "mcp_shopping_products"
 init: false
 arch:
@@ -9,11 +9,11 @@ arch:
 startup: services
 boot: auto
 ports:
-  8769/tcp: 8769
+  8770/tcp: 8770
 ports_description:
-  8769/tcp: "MCP + Ingress web UI"
+  8770/tcp: "MCP + Ingress web UI"
 ingress: true
-ingress_port: 8769
+ingress_port: 8770
 ingress_stream: false
 options:
   grocy_host: "57f327aa-grocy-linuxserver"
