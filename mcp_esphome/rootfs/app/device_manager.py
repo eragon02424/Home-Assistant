@@ -1,6 +1,6 @@
 """Device Manager - handles ESPHome device discovery and heartbeat history.
 
-Architecture (v0.7.1):
+Architecture (v0.8.0):
 ──────────────────────
 DISCOVERY (at startup, then every DISCOVERY_INTERVAL_SECONDS)
   Fetch /devices. For every device not yet known: register it (address,
@@ -27,16 +27,21 @@ PER-DEVICE KEEPALIVE TASK (never dies once started)
 BACKOFF CAP
   cap_multiplier is the smallest power of two such that
   keepalive_interval * cap_multiplier >= keepalive_max_backoff_seconds.
-  Example: interval=10, max_backoff=21600 -> 10*2048=20480 (<21600, reject)
-  -> 10*4096=40960 (>=21600, accept) -> cap_multiplier=4096.
 
 mDNS LISTENER (global)
   add_service/update_service fires for every announce. If the device is
-  known, its wake_event is set via loop.call_soon_threadsafe. This does
-  NOT start a new task -- it only wakes an already-sleeping task early.
+  known, its wake_event is set via loop.call_soon_threadsafe.
 
-Every TCP ping attempt logs its duration in ms, to help tune
-keepalive_ping_timeout_ms.
+PERSISTENCE / HISTORY
+  Every state transition (connected/disconnected) is appended to
+  device.heartbeat_events and immediately written to
+  /data/mcp_esphome/heartbeat_<name>.json. This file is the durable
+  source of truth and is reloaded on addon/HA restart via
+  _load_heartbeat_history(), so online/offline history survives restarts.
+  get_online_offline_history() derives the last N online periods and the
+  last N offline periods from this persisted event list.
+
+Every TCP ping attempt logs its duration in ms.
 
 ZERO aioesphomeapi.
 """
@@ -172,6 +177,8 @@ class DeviceManager:
                         name=device_name, address="", initialized=False
                     )
                 self.devices[device_name].heartbeat_events = events
+                _LOGGER.info("Loaded %d heartbeat event(s) for %s from disk",
+                             len(events), device_name)
             except Exception as err:
                 _LOGGER.warning("Failed to load heartbeat history from %s: %s", f, err)
 
@@ -505,3 +512,51 @@ class DeviceManager:
                 cycles.append(current)
                 current = {}
         return cycles[-last_n_cycles:]
+
+    def get_online_offline_history(self, device_name: str, last_n: int = 10) -> Optional[dict]:
+        """Derives the last N completed online periods and the last N
+        completed offline periods from the persisted heartbeat_events.
+        Survives HA/addon restarts because heartbeat_events is loaded from
+        /data/mcp_esphome/heartbeat_<name>.json on startup.
+
+        A period is "completed" once the opposite transition has occurred
+        (e.g. an online period is only counted once a disconnect follows
+        the connect). The currently ongoing period is reported separately
+        via current_state / current_state_since.
+        """
+        device = self.devices.get(device_name)
+        if not device:
+            return None
+
+        events = device.heartbeat_events
+        online_periods: list[dict] = []
+        offline_periods: list[dict] = []
+        pending_start: Optional[float] = None
+        pending_kind: Optional[str] = None
+
+        for ts, kind in events:
+            if kind == "connected":
+                if pending_kind == "disconnected" and pending_start is not None:
+                    offline_periods.append({
+                        "start": pending_start,
+                        "end": ts,
+                        "duration_seconds": ts - pending_start,
+                    })
+                pending_start = ts
+                pending_kind = "connected"
+            elif kind == "disconnected":
+                if pending_kind == "connected" and pending_start is not None:
+                    online_periods.append({
+                        "start": pending_start,
+                        "end": ts,
+                        "duration_seconds": ts - pending_start,
+                    })
+                pending_start = ts
+                pending_kind = "disconnected"
+
+        return {
+            "online_periods": online_periods[-last_n:],
+            "offline_periods": offline_periods[-last_n:],
+            "current_state": "online" if device.online else "offline",
+            "current_state_since": pending_start,
+        }
