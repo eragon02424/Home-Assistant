@@ -1,18 +1,25 @@
 """
-MCP Shopping Products for Home Assistant v1.0.1
+MCP Shopping Products for Home Assistant v1.0.2
 
 Two halves:
 1. Ingress web UI (camera photo capture) - handles the live scan workflow
    directly against Grocy's API, without involving Claude at all.
 2. MCP tools - used later by Claude in a separate session to fill in names
-   for products that were created with an empty name during scanning.
+   for products that were created with a placeholder name during scanning.
 
 Grocy API facts this code relies on (verified against a live Grocy instance
 during development, see conversation history):
-- Product.name has a NOT NULL constraint but accepts an empty string "".
+- Product.name has a NOT NULL constraint AND a UNIQUE constraint. An empty
+  string "" is accepted by the NOT NULL check but is itself subject to the
+  UNIQUE constraint too (confirmed live: a second product with name=""
+  fails with "UNIQUE constraint failed: products.name", and Grocy stores/
+  returns "" as null). This means only ONE unnamed product could ever exist
+  at a time with the empty-string approach - broken for a shopping session
+  with several unknown products. Fix: use the barcode string itself as the
+  placeholder name (barcodes are unique per product, confirmed live with
+  product creation using name=<barcode> succeeding for a second product).
 - Filtering objects with query[]=name= (empty value) returns "Invalid query" -
-  so unnamed products are found by fetching all products and filtering in
-  Python, not via the query[] mechanism.
+  in any case not usable now that the placeholder is the barcode, not "".
 - POST /stock/products/by-barcode/{barcode}/add|consume returns HTTP 400 with
   error_message "No product with barcode ... found" for an unknown barcode -
   this exact substring is used to detect the unknown-product case.
@@ -82,11 +89,12 @@ def decode_barcode(image_bytes: bytes) -> str | None:
 mcp = FastMCP(
     name="MCP Shopping Products",
     instructions=(
-        "Tools to find Grocy products that were created during shopping with an "
-        "empty name (barcode unknown at scan time, front-of-package photo was "
-        "saved instead), and to fill in the name/details once a photo has been "
-        "reviewed. Call get_next_unnamed_product repeatedly, updating each one "
-        "with update_product, until it returns found=false."
+        "Tools to find Grocy products that were created during shopping with the "
+        "barcode used as a placeholder name (real name unknown at scan time, a "
+        "front-of-package photo was saved instead), and to fill in the real name "
+        "once the photo has been reviewed. Call get_next_unnamed_product "
+        "repeatedly, updating each one with update_product, until it returns "
+        "found=false."
     ),
 )
 mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
@@ -94,29 +102,34 @@ mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding
 
 @mcp.tool()
 async def get_next_unnamed_product() -> dict:
-    """Return the next Grocy product that still has an empty name (created
-    during scanning because its barcode was unknown), along with its barcode
-    and product photo. Returns {"found": false} when none are left.
-    Server-side filtering on an empty name is not possible (Grocy's query[]
-    rejects an empty comparison value), so this fetches all products and
-    filters in Python."""
+    """Return the next Grocy product that still has its barcode as a placeholder
+    name (real name not filled in yet), along with its barcode and product
+    photo. Returns {"found": false} when none are left.
+    A product still needs naming if its name exactly matches one of its own
+    linked barcodes - this is checked in Python since Grocy's query[] filter
+    does not support this kind of comparison."""
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await grocy_get(client, "/objects/products")
-        if r.status_code != 200:
-            return {"found": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
-        products = r.json()
-        candidates = [p for p in products if p.get("name", "") == ""]
+        pr = await grocy_get(client, "/objects/products")
+        if pr.status_code != 200:
+            return {"found": False, "error": f"Grocy returned {pr.status_code}: {pr.text}"}
+        products = pr.json()
+
+        br = await grocy_get(client, "/objects/product_barcodes")
+        barcodes_by_product: dict[int, list[str]] = {}
+        if br.status_code == 200:
+            for entry in br.json():
+                barcodes_by_product.setdefault(entry["product_id"], []).append(entry["barcode"])
+
+        candidates = [
+            p for p in products
+            if p.get("name") and p["name"] in barcodes_by_product.get(p["id"], [])
+        ]
         if not candidates:
             return {"found": False}
+
         product = candidates[0]
         product_id = product["id"]
-
-        barcode = None
-        br = await grocy_get(client, "/objects/product_barcodes", params={"query[]": f"product_id={product_id}"})
-        if br.status_code == 200:
-            barcodes = br.json()
-            if barcodes:
-                barcode = barcodes[0].get("barcode")
+        barcode = product["name"]
 
         result = {
             "found": True,
@@ -141,7 +154,8 @@ async def get_next_unnamed_product() -> dict:
 @mcp.tool()
 async def update_product(product_id: int, name: str, description: str = "", product_group_id: int | None = None) -> dict:
     """Update a Grocy product's name and optionally description/product group,
-    after reviewing its photo. Args: product_id, name (required, non-empty),
+    after reviewing its photo. Args: product_id, name (required, non-empty,
+    must not equal the product's barcode - Grocy names must be unique),
     description (optional free text), product_group_id (optional category id)."""
     body = {"name": name, "description": description}
     if product_group_id is not None:
@@ -190,8 +204,9 @@ async def api_scan(request: Request):
 
 async def api_create_unknown(request: Request):
     """Body: multipart form with 'photo' (product front photo), 'barcode', 'amount', 'action'.
-    Creates the product with an empty name, links the barcode, uploads the
-    picture, then retries the originally requested stock booking."""
+    Creates the product using the barcode itself as a (unique, valid)
+    placeholder name, links the barcode, uploads the picture, then retries the
+    originally requested stock booking."""
     form = await request.form()
     photo = await form["photo"].read()
     barcode = form["barcode"]
@@ -200,7 +215,7 @@ async def api_create_unknown(request: Request):
 
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_post(client, "/objects/products", {
-            "name": "",
+            "name": barcode,
             "location_id": LOCATION_ID,
             "qu_id_purchase": QU_PURCHASE,
             "qu_id_stock": QU_STOCK,
