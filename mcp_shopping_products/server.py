@@ -1,5 +1,5 @@
 """
-MCP Shopping Products for Home Assistant v1.2.0
+MCP Shopping Products for Home Assistant v1.2.1
 
 Two halves:
 1. Ingress web UI (live camera via getUserMedia + zxing-js, same library and
@@ -8,7 +8,7 @@ Two halves:
 2. MCP tools - used later by Claude in a separate session to fill in names
    for products that were created with a placeholder name during scanning.
 
-Flow (v1.2.0, check-first instead of try-then-fallback):
+Flow (check-first instead of try-then-fallback):
 1. Barcode decoded client-side (zxing-js) from the live video.
 2. Frontend calls /api/check-barcode (read-only GET against Grocy).
    - Known: shows name/picture + amount + Einlagern/Auslagern -> /api/book
@@ -27,6 +27,14 @@ during development, see conversation history):
   string collides after the first use (Grocy stores/returns "" as null and
   enforces uniqueness on it) - the barcode string itself is used as a unique
   placeholder name instead.
+- If a product with name==<barcode> already exists but has no linked
+  ProductBarcode entry (e.g. a previous create-unknown run was interrupted
+  after the product-create step but before the barcode-link step), a later
+  scan of the same barcode used to crash with "UNIQUE constraint failed:
+  products.name" when trying to create a second product with that name
+  (reproduced live during development). Fix: api_create_unknown first checks
+  for an existing product with that exact name and reuses it instead of
+  always creating a new one.
 - Product pictures must be fetched via GET /files/productpictures/{b64name}
   (this addon has its own isolated /config, no shared filesystem with the
   Grocy addon, so direct disk access is not possible here) - proxied to the
@@ -226,28 +234,41 @@ async def api_book(request: Request):
 async def api_create_unknown(request: Request):
     """Body: multipart form with 'photo' (product front photo, a single
     explicit capture, not a continuous stream) and 'barcode'.
-    Creates the product using the barcode itself as a (unique, valid)
-    placeholder name, links the barcode, uploads the picture. Does NOT book
-    any stock - the frontend calls /api/book separately afterwards once the
-    user enters a quantity."""
+    Reuses an existing product with name==barcode if one already exists
+    (e.g. left over from a previously interrupted run), otherwise creates a
+    new one using the barcode itself as a (unique, valid) placeholder name.
+    Ensures the barcode is linked and uploads the picture. Does NOT book any
+    stock - the frontend calls /api/book separately afterwards."""
     form = await request.form()
     photo = await form["photo"].read()
     barcode = form["barcode"]
 
     async with httpx.AsyncClient(timeout=15) as client:
-        pr = await grocy_post(client, "/objects/products", {
-            "name": barcode,
-            "location_id": LOCATION_ID,
-            "qu_id_purchase": QU_PURCHASE,
-            "qu_id_stock": QU_STOCK,
-        })
-        if pr.status_code != 200:
-            return JSONResponse({"status": "error", "message": f"Produkt anlegen fehlgeschlagen: {pr.text}"})
-        product_id = pr.json()["created_object_id"]
+        # Reuse an existing product with this exact placeholder name if present.
+        existing = await grocy_get(client, "/objects/products", params={"query[]": f"name={barcode}"})
+        product_id = None
+        if existing.status_code == 200 and existing.json():
+            product_id = existing.json()[0]["id"]
+        else:
+            pr = await grocy_post(client, "/objects/products", {
+                "name": barcode,
+                "location_id": LOCATION_ID,
+                "qu_id_purchase": QU_PURCHASE,
+                "qu_id_stock": QU_STOCK,
+            })
+            if pr.status_code != 200:
+                return JSONResponse({"status": "error", "message": f"Produkt anlegen fehlgeschlagen: {pr.text}"})
+            product_id = pr.json()["created_object_id"]
 
-        bcr = await grocy_post(client, "/objects/product_barcodes", {"product_id": int(product_id), "barcode": barcode})
-        if bcr.status_code != 200:
-            return JSONResponse({"status": "error", "message": f"Barcode verknuepfen fehlgeschlagen: {bcr.text}"})
+        # Link the barcode only if not already linked to this product.
+        existing_barcodes = await grocy_get(client, "/objects/product_barcodes", params={"query[]": f"product_id={product_id}"})
+        already_linked = existing_barcodes.status_code == 200 and any(
+            b["barcode"] == barcode for b in existing_barcodes.json()
+        )
+        if not already_linked:
+            bcr = await grocy_post(client, "/objects/product_barcodes", {"product_id": int(product_id), "barcode": barcode})
+            if bcr.status_code != 200:
+                return JSONResponse({"status": "error", "message": f"Barcode verknuepfen fehlgeschlagen: {bcr.text}"})
 
         filename = f"scan_{barcode}.jpg"
         fname_b64 = base64.b64encode(filename.encode()).decode()
