@@ -1,5 +1,5 @@
 """
-MCP Shopping Products for Home Assistant v1.3.0
+MCP Shopping Products for Home Assistant v1.3.1
 
 Two halves:
 1. Ingress web UI (live camera via getUserMedia + zxing-js, same library and
@@ -30,31 +30,37 @@ during development, see conversation history):
   enforces uniqueness on it) - the barcode string itself is used as a unique
   placeholder name instead.
 - If a product with name==<barcode> already exists but has no linked
-  ProductBarcode entry (e.g. a previous create-unknown run was interrupted
-  after the product-create step but before the barcode-link step), a later
-  scan of the same barcode used to crash with "UNIQUE constraint failed:
-  products.name" when trying to create a second product with that name
-  (reproduced live during development). Fix: api_create_unknown first checks
-  for an existing product with that exact name and reuses it instead of
-  always creating a new one.
+  ProductBarcode entry, a later scan of the same barcode used to crash with
+  "UNIQUE constraint failed: products.name" (reproduced live). Fix:
+  api_create_unknown first checks for an existing product with that exact
+  name and reuses it instead of always creating a new one.
 - Product pictures must be fetched via GET /files/productpictures/{b64name}
   (this addon has its own isolated /config, no shared filesystem with the
-  Grocy addon, so direct disk access is not possible here) - proxied to the
-  browser via /api/product-picture/{filename} since the browser cannot reach
-  Grocy's internal hostname directly.
+  Grocy addon) - proxied to the browser via /api/product-picture/{filename}.
 - ProductBarcode is a separate object from Product (POST /objects/product_barcodes).
-- "No barcode linked" is checked by cross-referencing every product's id
-  against the full /objects/product_barcodes list - Grocy's query[] filter
-  has no "not in" or "is null on a joined table" operator for this.
-- "No picture" is a direct field check: product["picture_file_name"] is
-  falsy (Grocy returns null when unset - confirmed on live products created
-  without ever setting this field).
+- "No barcode linked" / "no picture" are checked client-side in Python by
+  cross-referencing product lists, since Grocy's query[] filter has no
+  suitable operator for either case.
 
 Why the ingress page uses getUserMedia+zxing-js instead of <input capture>:
 a file-input's capture attribute did not open the camera when this page was
 opened inside the Home Assistant Companion App's ingress webview (confirmed
 by the user testing on-device), while Grocy's own getUserMedia-based scanner,
 running in the very same webview/ingress context, did open the camera.
+
+IMPORTANT routing fix (v1.3.1): mcp.streamable_http_app() already serves its
+own single route internally at exactly "/mcp" (confirmed by inspecting
+app.routes on the actual installed mcp package). Earlier versions of this
+file additionally mounted that whole app under ANOTHER "/mcp" prefix via
+Starlette's app.mount("/mcp", mcp_app) - this created a double-nested path
+requirement and, combined with Starlette's automatic redirect-to-trailing-
+slash behavior for Mounts, made the MCP endpoint completely unreachable
+(reproduced live: POST to /mcp returned 307 to /mcp/, and POST to /mcp/ then
+returned 404). Fix: merge mcp_app's own routes directly into this file's
+Starlette app instead of nesting it under an extra prefix, and pass through
+mcp_app's lifespan (needed to start FastMCP's internal session manager -
+dropping this would leave the streamable-HTTP session handling
+uninitialized even though the route itself matches).
 """
 
 import base64
@@ -109,7 +115,7 @@ mcp = FastMCP(
         "as a placeholder name. get_next_product_without_barcode finds products "
         "with no barcode linked at all. get_next_product_without_picture finds "
         "products missing a photo. Call each repeatedly (with update_product or "
-        "add_product_picture in between) until it returns found=false."
+        "add_product_barcode in between) until it returns found=false."
     ),
 )
 mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
@@ -377,17 +383,22 @@ async def api_create_unknown(request: Request):
 
 
 # ── App assembly ──────────────────────────────────────────────────────────────
+# mcp_app's own route ("/mcp") is merged directly into this app's route list
+# (not nested via Mount - see the v1.3.1 note in the module docstring for why).
+# Its lifespan is passed through so FastMCP's session manager actually starts.
 
 mcp_app = mcp.streamable_http_app()
 
-app = Starlette(routes=[
-    Route("/", index),
-    Route("/api/check-barcode", api_check_barcode, methods=["POST"]),
-    Route("/api/book", api_book, methods=["POST"]),
-    Route("/api/create-unknown", api_create_unknown, methods=["POST"]),
-    Route("/api/product-picture/{filename}", api_product_picture, methods=["GET"]),
-])
-app.mount("/mcp", mcp_app)
+app = Starlette(
+    routes=[
+        Route("/", index),
+        Route("/api/check-barcode", api_check_barcode, methods=["POST"]),
+        Route("/api/book", api_book, methods=["POST"]),
+        Route("/api/create-unknown", api_create_unknown, methods=["POST"]),
+        Route("/api/product-picture/{filename}", api_product_picture, methods=["GET"]),
+    ] + mcp_app.routes,
+    lifespan=mcp_app.router.lifespan_context,
+)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8770)
