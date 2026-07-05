@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shopping Scan</title>
+<style>
+  body { font-family: sans-serif; background:#111; color:#eee; margin:0; padding:16px; }
+  h2 { margin-top:0; }
+  .step { display:none; }
+  .step.active { display:block; }
+  button, input[type=submit] { font-size:1.2em; padding:12px 20px; margin:8px 0; width:100%; border-radius:8px; border:none; background:#2a6; color:#fff; }
+  button.secondary { background:#446; }
+  input[type=number] { font-size:1.2em; padding:10px; width:100%; box-sizing:border-box; margin:8px 0; }
+  #status { margin:12px 0; padding:10px; border-radius:8px; }
+  .ok { background:#264; }
+  .err { background:#622; }
+  label { display:block; margin-top:12px; }
+</style>
+</head>
+<body>
+
+<h2>Grocy Schnellscan</h2>
+<div id="status"></div>
+
+<div id="step-photo1" class="step active">
+  <label>Foto vom Barcode</label>
+  <input type="file" accept="image/*" capture="environment" id="photo1">
+  <label>Menge</label>
+  <input type="number" id="amount" value="1" step="1" min="0.01">
+  <button id="btnAdd">Einlagern</button>
+  <button id="btnConsume" class="secondary">Auslagern</button>
+</div>
+
+<div id="step-photo2" class="step">
+  <p>Barcode unbekannt. Bitte Foto von der Produkt-Vorderseite machen.</p>
+  <label>Foto vom Produkt</label>
+  <input type="file" accept="image/*" capture="environment" id="photo2">
+  <button id="btnCreate">Produkt anlegen &amp; buchen</button>
+</div>
+
+<script>
+let pendingBarcode = null;
+let pendingAmount = 1;
+let pendingAction = "add";
+
+function showStep(id) {
+  document.querySelectorAll('.step').forEach(e => e.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+function showStatus(msg, ok) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = ok ? 'ok' : 'err';
+}
+
+async function scan(action) {
+  const fileInput = document.getElementById('photo1');
+  if (!fileInput.files.length) { showStatus('Bitte erst ein Foto aufnehmen', false); return; }
+  pendingAmount = document.getElementById('amount').value || 1;
+  pendingAction = action;
+
+  const fd = new FormData();
+  fd.append('photo', fileInput.files[0]);
+  fd.append('amount', pendingAmount);
+  fd.append('action', action);
+
+  showStatus('Scanne...', true);
+  const res = await fetch('/api/scan', { method: 'POST', body: fd });
+  const data = await res.json();
+
+  if (data.status === 'ok') {
+    showStatus('Gebucht: ' + data.barcode, true);
+    fileInput.value = '';
+  } else if (data.status === 'unknown') {
+    pendingBarcode = data.barcode;
+    showStatus('Unbekannter Barcode: ' + data.barcode, false);
+    showStep('step-photo2');
+  } else {
+    showStatus('Fehler: ' + data.message, false);
+  }
+}
+
+document.getElementById('btnAdd').onclick = () => scan('add');
+document.getElementById('btnConsume').onclick = () => scan('consume');
+
+document.getElementById('btnCreate').onclick = async () => {
+  const fileInput = document.getElementById('photo2');
+  if (!fileInput.files.length) { showStatus('Bitte erst ein Foto aufnehmen', false); return; }
+
+  const fd = new FormData();
+  fd.append('photo', fileInput.files[0]);
+  fd.append('barcode', pendingBarcode);
+  fd.append('amount', pendingAmount);
+  fd.append('action', pendingAction);
+
+  showStatus('Lege Produkt an...', true);
+  const res = await fetch('/api/create-unknown', { method: 'POST', body: fd });
+  const data = await res.json();
+
+  if (data.status === 'ok') {
+    showStatus('Produkt angelegt und gebucht (id ' + data.product_id + ')', true);
+    document.getElementById('photo1').value = '';
+    fileInput.value = '';
+    showStep('step-photo1');
+  } else {
+    showStatus('Fehler: ' + data.message, false);
+  }
+};
+</script>
+</body>
+</html>
