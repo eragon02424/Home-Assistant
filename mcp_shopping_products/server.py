@@ -1,5 +1,5 @@
 """
-MCP Shopping Products for Home Assistant v1.8.0
+MCP Shopping Products for Home Assistant v1.8.2
 
 Two halves:
 1. Ingress web UI (live camera via getUserMedia + zxing-js) - handles the live
@@ -35,18 +35,15 @@ during development, see conversation history):
   the "description" field is free text and is used to hold step-by-step
   instructions - Grocy's schema has no separate structured-steps table).
   POST /objects/recipes_pos only strictly needs recipe_id/product_id/amount,
-  but ALSO accepts an optional qu_id (confirmed against recipes_pos' own
-  migration history - column added in migration 0034) to record which
-  quantity unit (g, ml, tsp, piece, pinch, ...) the amount is measured in.
-  Without qu_id, Grocy silently falls back to the product's own default
-  stock unit, which is wrong whenever a recipe's ingredient unit differs
-  from that product's usual stock unit (e.g. "Butter" tracked in "Stück" in
-  stock but needed in "Gramm" for a recipe) - this was found live while
-  building a real multi-ingredient recipe and fixed by adding qu_id support
-  to add_recipe_ingredient/update_recipe_ingredient plus a
-  search_quantity_units/create_quantity_unit tool pair so units can be
-  looked up or created (only "Stück", "Liter", "ml", "1l Packung" existed
-  initially - "Gramm", "Teelöffel", "Prise", "Päckchen" were added live).
+  but ALSO accepts an optional qu_id (column added in migration 0034) to
+  record which quantity unit (g, ml, tsp, piece, pinch, ...) the amount is
+  measured in. Without qu_id, Grocy silently falls back to the product's own
+  default stock unit, which is wrong whenever a recipe's ingredient unit
+  differs from that product's usual stock unit (e.g. "Butter" tracked in
+  "Stück" in stock but needed in "Gramm" for a recipe) - this was found live
+  while building a real multi-ingredient recipe and fixed by adding qu_id
+  support to add_recipe_ingredient/update_recipe_ingredient plus a
+  search_quantity_units/create_quantity_unit tool pair.
 - Deleting a recipe does NOT cascade-delete its recipes_pos rows (confirmed
   live: an orphaned recipes_pos row with a dangling recipe_id remained after
   DELETE /objects/recipes/{id} and had to be removed separately).
@@ -58,14 +55,18 @@ during development, see conversation history):
   unconditionally.
 - Recipe pictures: the /files/{group}/{fileName} endpoint's "group" path
   parameter accepts "recipepictures" as a valid FileGroups enum value
-  (confirmed against the OpenAPI schema and live: PUT
-  /files/recipepictures/{b64name} followed by PUT /objects/recipes/{id} with
-  {"picture_file_name": name} works exactly like the existing product-picture
-  mechanism). Since Claude has no direct byte-level access to images the user
-  pastes into chat, set_recipe_picture takes a base64-encoded string
-  parameter instead of a file upload - Claude reads the user-uploaded image
-  from its own sandbox, base64-encodes it there, and passes that string as
-  a tool argument.
+  (confirmed against the OpenAPI schema and live). Since Claude has no direct
+  byte-level access to images the user pastes into chat, set_recipe_picture
+  takes a base64-encoded string parameter instead of a file upload - Claude
+  reads the user-uploaded image from its own sandbox, base64-encodes it
+  there, and passes that string as a tool argument.
+- Grocy's file PUT does NOT overwrite an existing file at the same path - it
+  returns 400 "Error while creating file ..." if one already exists there.
+  This was found live: uploading a picture to a recipe worked the first
+  time, but re-uploading to the SAME recipe_id (same resulting filename)
+  failed with this error on the second attempt. Fixed in set_recipe_picture
+  by issuing a DELETE for that path first (best-effort, response ignored)
+  before the PUT, so overwriting a recipe's picture always works.
 
 Why the ingress page uses getUserMedia+zxing-js instead of <input capture>:
 a file-input's capture attribute did not open the camera when this page was
@@ -170,8 +171,8 @@ mcp = FastMCP(
         "quantity (and does not currently convert units - the shopping list "
         "amount will be in the ingredient's recipe unit). set_recipe_picture "
         "attaches a dish photo to a recipe (pass the image as a base64 "
-        "string, read from Claude's own sandbox); get_recipe_picture "
-        "retrieves it again."
+        "string, read from Claude's own sandbox) and overwrites any existing "
+        "one; get_recipe_picture retrieves it again."
     ),
 )
 mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
@@ -603,6 +604,11 @@ async def set_recipe_picture(recipe_id: int, image_base64: str, extension: str =
 
         filename = f"recipe_{recipe_id}.{extension}"
         fname_b64 = base64.b64encode(filename.encode()).decode()
+        # Delete any existing file at this path first - Grocy's file PUT does
+        # not overwrite, it errors "Error while creating file ..." if a file
+        # already exists there (confirmed live: re-uploading a picture to the
+        # same recipe_id failed with this error until this delete was added).
+        await client.delete(f"{GROCY_BASE}/files/recipepictures/{fname_b64}")
         upr = await grocy_put(client, f"/files/recipepictures/{fname_b64}", content=image_bytes, headers={"Content-Type": "application/octet-stream"})
         if upr.status_code not in (200, 204):
             return {"success": False, "error": f"Upload fehlgeschlagen: Grocy returned {upr.status_code}: {upr.text}"}
