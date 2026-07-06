@@ -1,6 +1,6 @@
 """Device Manager - handles ESPHome device discovery and heartbeat history.
 
-Architecture (v0.10.0):
+Architecture (v0.11.0):
 ───────────────────────
 DISCOVERY (at startup, then every DISCOVERY_INTERVAL_SECONDS)
   Fetch /devices. For every device not yet known: register it (address,
@@ -43,15 +43,9 @@ PERSISTENCE / HISTORY
     - last_online_duration_seconds / last_offline_duration_seconds:
       duration of the last COMPLETED period of that kind (frozen once
       that period ended).
-    - current_online_elapsed_seconds: if the device is online right now,
-      how long the CURRENT online period has lasted so far (live,
-      recomputed as now() - last transition timestamp on every call).
-      None while offline.
-    - current_offline_elapsed_seconds: same idea while offline. None
-      while online.
-  This lets the "Zuletzt Online" / "Zuletzt Offline" sensors tick up
-  live while their direction is the current state, and freeze at the
-  completed duration once the state flips away.
+    - current_online_elapsed_seconds / current_offline_elapsed_seconds:
+      live elapsed time of the CURRENT period, only one of the two is
+      non-None depending on device.online.
 
 Every TCP ping attempt logs its duration in ms.
 
@@ -124,7 +118,6 @@ def compute_backoff_cap_multiplier(interval: int, max_backoff_seconds: int) -> i
 class DeviceState:
     name: str
     address: str
-    ping_index: int = 0
     configuration_file: str = ""
     noise_psk: Optional[str] = None
     mac_address: Optional[str] = None
@@ -143,7 +136,6 @@ class DeviceManager:
     def __init__(
         self,
         esphome_dashboard_url: str,
-        log_retention_hours: int,
         heartbeat_retention_days: int,
         keepalive_interval: int = 10,
         keepalive_retries: int = 5,
@@ -167,7 +159,6 @@ class DeviceManager:
         )
         self.bearer_token = load_or_generate_bearer_token(bearer_token)
         self.devices: dict[str, DeviceState] = {}
-        self._ping_counter = 0
         self._azeroconf: Optional[object] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -314,12 +305,11 @@ class DeviceManager:
 
             psk = self._read_noise_psk(configuration_file)
             device = DeviceState(
-                name=name, address=address, ping_index=self._ping_counter,
+                name=name, address=address,
                 configuration_file=configuration_file, noise_psk=psk,
                 mac_address=mac or None, initialized=True,
                 esphome_reports_online=esphome_online,
             )
-            self._ping_counter += 1
 
             if psk:
                 _LOGGER.info("Noise PSK loaded for %s", name)
@@ -489,10 +479,7 @@ class DeviceManager:
           COMPLETED online period (None if none exists yet)
         - last_offline: same for the last completed offline period
         - current_state_since: timestamp of the most recent transition
-          (start of the period that is still ongoing, i.e. NOT yet
-          followed by the opposite event)
-        All derived purely from the persisted event list, so correct
-        immediately after a restart.
+          (start of the period that is still ongoing)
         """
         last_online: Optional[dict] = None
         last_offline: Optional[dict] = None
@@ -563,22 +550,6 @@ class DeviceManager:
             "last_seen": device.last_seen,
             "last_disconnect": device.last_disconnect,
         }
-
-    def get_uptime_pattern(self, device_name: str, last_n_cycles: int = 10) -> list[dict]:
-        device = self.devices.get(device_name)
-        if not device:
-            return []
-        events = device.heartbeat_events[-(last_n_cycles * 2):]
-        cycles, current = [], {}
-        for ts, kind in events:
-            if kind == "connected":
-                current = {"connected_at": ts}
-            elif kind == "disconnected" and "connected_at" in current:
-                current["disconnected_at"] = ts
-                current["duration_seconds"] = ts - current["connected_at"]
-                cycles.append(current)
-                current = {}
-        return cycles[-last_n_cycles:]
 
     def get_online_offline_history(self, device_name: str, last_n: int = 10) -> Optional[dict]:
         """Derives the last N completed online periods and the last N
