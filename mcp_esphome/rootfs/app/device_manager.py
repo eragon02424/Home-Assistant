@@ -1,7 +1,7 @@
 """Device Manager - handles ESPHome device discovery and heartbeat history.
 
-Architecture (v0.9.0):
-──────────────────────
+Architecture (v0.10.0):
+───────────────────────
 DISCOVERY (at startup, then every DISCOVERY_INTERVAL_SECONDS)
   Fetch /devices. For every device not yet known: register it (address,
   mac, psk) and start ONE keepalive task that runs forever for the
@@ -39,17 +39,19 @@ PERSISTENCE / HISTORY
   source of truth and is reloaded on addon/HA restart via
   _load_heartbeat_history(), so online/offline history survives restarts.
 
-  get_online_offline_history() derives the last N online periods and the
-  last N offline periods from this persisted event list (used by the
-  /history API endpoint).
-
-  list_devices() additionally exposes, per device, the duration of the
-  last COMPLETED online period and the last COMPLETED offline period
-  (last_online_duration_seconds / last_offline_duration_seconds), derived
-  from the same persisted events. These feed the "Zuletzt Online" /
-  "Zuletzt Offline" sensors in the ESPHome LiveState integration and are
-  correct across restarts since they come from the persisted file, not
-  from in-memory-only state.
+  list_devices() exposes, per device:
+    - last_online_duration_seconds / last_offline_duration_seconds:
+      duration of the last COMPLETED period of that kind (frozen once
+      that period ended).
+    - current_online_elapsed_seconds: if the device is online right now,
+      how long the CURRENT online period has lasted so far (live,
+      recomputed as now() - last transition timestamp on every call).
+      None while offline.
+    - current_offline_elapsed_seconds: same idea while offline. None
+      while online.
+  This lets the "Zuletzt Online" / "Zuletzt Offline" sensors tick up
+  live while their direction is the current state, and freeze at the
+  completed duration once the state flips away.
 
 Every TCP ping attempt logs its duration in ms.
 
@@ -481,13 +483,16 @@ class DeviceManager:
     def get_bearer_token(self) -> str:
         return self.bearer_token
 
-    def _last_completed_periods(self, device: DeviceState) -> tuple[Optional[dict], Optional[dict]]:
-        """Scans heartbeat_events once and returns
-        (last_completed_online_period, last_completed_offline_period),
-        each as {"duration_seconds": ..., "ended_at": ...} or None if no
-        such completed period exists yet. Derived purely from the
-        persisted event list, so this is correct immediately after a
-        restart, before any new ping has run.
+    def _period_summary(self, device: DeviceState) -> dict:
+        """Single pass over heartbeat_events computing:
+        - last_online: {"duration_seconds", "ended_at"} of the last
+          COMPLETED online period (None if none exists yet)
+        - last_offline: same for the last completed offline period
+        - current_state_since: timestamp of the most recent transition
+          (start of the period that is still ongoing, i.e. NOT yet
+          followed by the opposite event)
+        All derived purely from the persisted event list, so correct
+        immediately after a restart.
         """
         last_online: Optional[dict] = None
         last_offline: Optional[dict] = None
@@ -506,14 +511,31 @@ class DeviceManager:
                 pending_start = ts
                 pending_kind = "disconnected"
 
-        return last_online, last_offline
+        return {
+            "last_online": last_online,
+            "last_offline": last_offline,
+            "current_state_since": pending_start,
+        }
 
     def list_devices(self) -> list[dict]:
+        now = time.time()
         result = []
         for name, device in self.devices.items():
             if not device.initialized:
                 continue
-            last_online, last_offline = self._last_completed_periods(device)
+            summary = self._period_summary(device)
+            last_online = summary["last_online"]
+            last_offline = summary["last_offline"]
+            since = summary["current_state_since"]
+
+            current_online_elapsed = None
+            current_offline_elapsed = None
+            if since is not None:
+                if device.online:
+                    current_online_elapsed = now - since
+                else:
+                    current_offline_elapsed = now - since
+
             result.append({
                 "name": name,
                 "address": device.address,
@@ -527,6 +549,8 @@ class DeviceManager:
                 "last_online_ended_at": last_online["ended_at"] if last_online else None,
                 "last_offline_duration_seconds": last_offline["duration_seconds"] if last_offline else None,
                 "last_offline_ended_at": last_offline["ended_at"] if last_offline else None,
+                "current_online_elapsed_seconds": current_online_elapsed,
+                "current_offline_elapsed_seconds": current_offline_elapsed,
             })
         return result
 
