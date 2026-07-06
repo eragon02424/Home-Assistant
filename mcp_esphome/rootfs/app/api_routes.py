@@ -1,16 +1,11 @@
 """HTTP API routes exposed by MCP ESPHome."""
 import logging
-import re
-from pathlib import Path
 
 from aiohttp import web
 
 from job_manager import JobManager
 
 _LOGGER = logging.getLogger("mcp_esphome.api")
-
-ESPHOME_CONFIG_DIR = Path("/config/esphome")
-_NOISE_KEY_RE = re.compile(r'encryption:\s*\n\s*key:\s*["\']?([A-Za-z0-9+/=]+)["\']?')
 
 
 def setup_routes(app: web.Application):
@@ -38,11 +33,6 @@ def setup_routes(app: web.Application):
         if result is None:
             return web.json_response({"error": "device not found"}, status=404)
         return web.json_response(result)
-
-    async def get_uptime_pattern(request):
-        name = request.match_info["device_name"]
-        n = int(request.query.get("last_n_cycles", 10))
-        return web.json_response(device_manager.get_uptime_pattern(name, n))
 
     async def get_online_offline_history(request):
         name = request.match_info["device_name"]
@@ -86,38 +76,10 @@ def setup_routes(app: web.Application):
     async def health(request):
         return web.json_response({"status": "ok", "devices": len(device_manager.devices)})
 
-    async def debug_psk(request):
-        """Temporary debug endpoint: test PSK reading inside the container."""
-        name = request.match_info["device_name"]
-        filename = f"{name}.yaml"
-        path = ESPHOME_CONFIG_DIR / filename
-        result = {
-            "device": name,
-            "path": str(path),
-            "exists": path.exists(),
-        }
-        if path.exists():
-            try:
-                content = path.read_text(encoding="utf-8")
-                result["size"] = len(content)
-                result["has_encryption_keyword"] = "encryption:" in content
-                m = _NOISE_KEY_RE.search(content)
-                result["psk_found"] = m is not None
-                if m:
-                    result["psk_prefix"] = m.group(1)[:8]
-                idx = content.find("encryption:")
-                if idx >= 0:
-                    result["raw_bytes"] = repr(content[idx:idx+60])
-            except Exception as e:
-                result["error"] = str(e)
-        return web.json_response(result)
-
     app.router.add_get("/health", health)
     app.router.add_get("/devices", list_devices)
     app.router.add_get("/devices/{device_name}/last_seen", get_last_seen)
-    app.router.add_get("/devices/{device_name}/uptime_pattern", get_uptime_pattern)
     app.router.add_get("/devices/{device_name}/history", get_online_offline_history)
-    app.router.add_get("/devices/{device_name}/debug_psk", debug_psk)
     app.router.add_post("/devices/{device_name}/compile", start_compile)
     app.router.add_post("/devices/{device_name}/install", start_install)
     app.router.add_get("/jobs/{job_id}/status", get_job_status)
