@@ -33,7 +33,6 @@ async def main():
     esphome_dashboard_url = opts.get("esphome_dashboard_url", "http://localhost:6052")
     bearer_token = opts.get("bearer_token", "")
     port = opts.get("port", 8090)
-    log_retention_hours = opts.get("log_retention_hours", 24)
     heartbeat_retention_days = opts.get("heartbeat_retention_days", 30)
     keepalive_interval = opts.get("keepalive_interval", 10)
     keepalive_retries = opts.get("keepalive_retries", 5)
@@ -42,7 +41,6 @@ async def main():
 
     device_manager = DeviceManager(
         esphome_dashboard_url=esphome_dashboard_url,
-        log_retention_hours=log_retention_hours,
         heartbeat_retention_days=heartbeat_retention_days,
         keepalive_interval=keepalive_interval,
         keepalive_retries=keepalive_retries,
