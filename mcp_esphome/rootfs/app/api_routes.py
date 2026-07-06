@@ -42,33 +42,41 @@ def setup_routes(app: web.Application):
             return web.json_response({"error": "device not found"}, status=404)
         return web.json_response(result)
 
+    async def validate_config(request):
+        name = request.match_info["device_name"]
+        try:
+            result = await job_manager.validate_config(name)
+        except Exception as err:
+            _LOGGER.error("Validate failed for %s: %s", name, err)
+            return web.json_response({"error": str(err)}, status=502)
+        return web.json_response(result)
+
     async def start_compile(request):
         name = request.match_info["device_name"]
-        job_id = await job_manager.start_compile(name)
-        return web.json_response({"job_id": job_id})
-
-    async def start_install(request):
-        name = request.match_info["device_name"]
-        job_id = await job_manager.start_install(name)
+        try:
+            job_id = await job_manager.start_compile(name)
+        except Exception as err:
+            _LOGGER.error("Compile start failed for %s: %s", name, err)
+            return web.json_response({"error": str(err)}, status=502)
         return web.json_response({"job_id": job_id})
 
     async def get_job_status(request):
         job_id = request.match_info["job_id"]
-        status = job_manager.get_status(job_id)
+        status = await job_manager.get_status(job_id)
         if status is None:
             return web.json_response({"error": "job not found"}, status=404)
         return web.json_response(status)
 
     async def get_error_summary(request):
         job_id = request.match_info["job_id"]
-        summary = job_manager.get_error_summary(job_id)
+        summary = await job_manager.get_error_summary(job_id)
         if summary is None:
             return web.json_response({"error": "job not found"}, status=404)
         return web.json_response({"summary": summary})
 
     async def get_full_log(request):
         job_id = request.match_info["job_id"]
-        log = job_manager.get_full_log(job_id)
+        log = await job_manager.get_full_log(job_id)
         if log is None:
             return web.json_response({"error": "job not found"}, status=404)
         return web.json_response({"log": log})
@@ -80,8 +88,8 @@ def setup_routes(app: web.Application):
     app.router.add_get("/devices", list_devices)
     app.router.add_get("/devices/{device_name}/last_seen", get_last_seen)
     app.router.add_get("/devices/{device_name}/history", get_online_offline_history)
+    app.router.add_post("/devices/{device_name}/validate", validate_config)
     app.router.add_post("/devices/{device_name}/compile", start_compile)
-    app.router.add_post("/devices/{device_name}/install", start_install)
     app.router.add_get("/jobs/{job_id}/status", get_job_status)
     app.router.add_get("/jobs/{job_id}/error_summary", get_error_summary)
     app.router.add_get("/jobs/{job_id}/full_log", get_full_log)
