@@ -1,5 +1,5 @@
 """
-MCP Shopping Products for Home Assistant v1.8.2
+MCP Shopping Products for Home Assistant v1.9.0
 
 Two halves:
 1. Ingress web UI (live camera via getUserMedia + zxing-js) - handles the live
@@ -31,18 +31,26 @@ during development, see conversation history):
   confirmed live (204, entry verified via GET /objects/shopping_list) that it
   adds/increments an item on the given (or default, list_id=1) shopping list.
 - Recipes: entity names are "recipes" and "recipes_pos". POST /objects/recipes
-  only strictly needs "name" (base_servings/desired_servings default to 1;
-  the "description" field is free text and is used to hold step-by-step
-  instructions - Grocy's schema has no separate structured-steps table).
+  only strictly needs "name" (base_servings/desired_servings default to 1).
+  The "description" field is a RICH-TEXT/HTML field (Grocy's recipe editor is
+  a WYSIWYG editor with bold/underline/list buttons, confirmed from a
+  screenshot of the actual edit page) - it is NOT plain text. Sending plain
+  text containing "\\n" characters gets stored verbatim, but HTML collapses
+  ordinary whitespace/newlines when rendering, so every line runs together
+  into one unbroken paragraph in Grocy's UI (confirmed live: this exact
+  problem was reported and reproduced by fetching the stored description and
+  seeing literal "\\n" characters in it). Fix: create_or_update_recipe now
+  runs description through text_to_html(), which converts blank-line-
+  separated blocks into separate <p> paragraphs and single newlines within a
+  block into <br> tags, before sending it to Grocy.
   POST /objects/recipes_pos only strictly needs recipe_id/product_id/amount,
   but ALSO accepts an optional qu_id (column added in migration 0034) to
   record which quantity unit (g, ml, tsp, piece, pinch, ...) the amount is
   measured in. Without qu_id, Grocy silently falls back to the product's own
   default stock unit, which is wrong whenever a recipe's ingredient unit
   differs from that product's usual stock unit (e.g. "Butter" tracked in
-  "Stück" in stock but needed in "Gramm" for a recipe) - this was found live
-  while building a real multi-ingredient recipe and fixed by adding qu_id
-  support to add_recipe_ingredient/update_recipe_ingredient plus a
+  "Stück" in stock but needed in "Gramm" for a recipe) - fixed by adding
+  qu_id support to add_recipe_ingredient/update_recipe_ingredient plus a
   search_quantity_units/create_quantity_unit tool pair.
 - Deleting a recipe does NOT cascade-delete its recipes_pos rows (confirmed
   live: an orphaned recipes_pos row with a dangling recipe_id remained after
@@ -62,11 +70,8 @@ during development, see conversation history):
   there, and passes that string as a tool argument.
 - Grocy's file PUT does NOT overwrite an existing file at the same path - it
   returns 400 "Error while creating file ..." if one already exists there.
-  This was found live: uploading a picture to a recipe worked the first
-  time, but re-uploading to the SAME recipe_id (same resulting filename)
-  failed with this error on the second attempt. Fixed in set_recipe_picture
-  by issuing a DELETE for that path first (best-effort, response ignored)
-  before the PUT, so overwriting a recipe's picture always works.
+  Fixed in set_recipe_picture by issuing a DELETE for that path first
+  (best-effort, response ignored) before the PUT.
 
 Why the ingress page uses getUserMedia+zxing-js instead of <input capture>:
 a file-input's capture attribute did not open the camera when this page was
@@ -91,6 +96,7 @@ inside the dict.
 """
 
 import base64
+import html
 import os
 
 import httpx
@@ -136,6 +142,22 @@ async def fetch_product_image(client: httpx.AsyncClient, picture_file_name: str)
     return await fetch_image(client, "productpictures", picture_file_name)
 
 
+def text_to_html(text: str) -> str:
+    """Convert plain text with blank-line-separated paragraphs and single
+    newlines within a paragraph into HTML - needed because Grocy's recipe
+    description field is a rich-text/HTML field, not plain text, and
+    ordinary "\\n" characters get stored verbatim but collapsed away when
+    rendered as HTML (confirmed live - see module docstring)."""
+    if not text:
+        return text
+    paragraphs = text.split("\n\n")
+    html_paragraphs = []
+    for para in paragraphs:
+        escaped = html.escape(para).replace("\n", "<br>")
+        html_paragraphs.append(f"<p>{escaped}</p>")
+    return "".join(html_paragraphs)
+
+
 # ── MCP tools ─────────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
@@ -153,16 +175,19 @@ mcp = FastMCP(
         "search_products found no suitable match. add_to_shopping_list adds a "
         "product_id to Grocy's shopping list by amount.\n\n"
         "Recipes: create_or_update_recipe upserts a recipe by its exact name "
-        "(name, description - description holds free-text instructions, e.g. "
-        "numbered steps - and base_servings, the serving count all ingredient "
-        "amounts are defined for). search_recipes finds a recipe by name. "
-        "get_recipe_ingredients lists a recipe's ingredients including their "
-        "quantity unit. search_quantity_units/create_quantity_unit look up or "
-        "create units like Gramm/Teelöffel/Prise - always pass the correct "
-        "qu_id to add_recipe_ingredient/update_recipe_ingredient, since "
-        "omitting it silently defaults to the product's own stock unit which "
-        "is usually wrong for a recipe (e.g. Butter tracked in Stück in stock "
-        "but needed in Gramm for a recipe). "
+        "(name, description - plain text with blank lines between paragraphs "
+        "and single newlines for line breaks, e.g. numbered steps each on "
+        "their own line - this gets converted to HTML automatically since "
+        "Grocy's description field is rich-text, not plain text; and "
+        "base_servings, the serving count all ingredient amounts are defined "
+        "for). search_recipes finds a recipe by name. get_recipe_ingredients "
+        "lists a recipe's ingredients including their quantity unit. "
+        "search_quantity_units/create_quantity_unit look up or create units "
+        "like Gramm/Teelöffel/Prise - always pass the correct qu_id to "
+        "add_recipe_ingredient/update_recipe_ingredient, since omitting it "
+        "silently defaults to the product's own stock unit which is usually "
+        "wrong for a recipe (e.g. Butter tracked in Stück in stock but "
+        "needed in Gramm for a recipe). "
         "add_recipe_ingredient/update_recipe_ingredient/remove_recipe_ingredient "
         "manage individual ingredients. add_recipe_to_shopping_list takes "
         "every ingredient's amount times a multiplier and adds it to the "
@@ -411,16 +436,20 @@ async def create_or_update_recipe(name: str, description: str = "", base_serving
     """Create a new recipe, or update an existing one if a recipe with this
     EXACT name already exists (matched via an exact, case-sensitive name
     lookup). Args: name (required - used as the lookup key), description
-    (free text - use this to hold step-by-step instructions, e.g. '1. Kartoffeln
-    waschen\\n2. schneiden\\n3. kochen'), base_servings (default 1 - the
-    serving count all ingredient amounts are defined for). Returns
-    {"success", "recipe_id", "created": true|false}."""
+    (plain text - write it with blank lines between paragraphs and a single
+    newline per line break, e.g. numbered steps each on their own line; this
+    is automatically converted to HTML before saving, since Grocy's
+    description field is rich-text/HTML and does not respect plain
+    newlines), base_servings (default 1 - the serving count all ingredient
+    amounts are defined for). Returns {"success", "recipe_id",
+    "created": true|false}."""
+    html_description = text_to_html(description)
     async with httpx.AsyncClient(timeout=15) as client:
         existing = await grocy_get(client, "/objects/recipes", params={"query[]": f"name={name}"})
         if existing.status_code == 200 and existing.json():
             recipe_id = existing.json()[0]["id"]
             ur = await grocy_put(client, f"/objects/recipes/{recipe_id}", json_body={
-                "description": description,
+                "description": html_description,
                 "base_servings": base_servings,
             })
             if ur.status_code not in (200, 204):
@@ -429,7 +458,7 @@ async def create_or_update_recipe(name: str, description: str = "", base_serving
 
         cr = await grocy_post(client, "/objects/recipes", {
             "name": name,
-            "description": description,
+            "description": html_description,
             "base_servings": base_servings,
         })
         if cr.status_code != 200:
