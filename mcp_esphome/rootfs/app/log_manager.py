@@ -1,29 +1,28 @@
 """Log Manager - persists ESPHome native API debug logs per device.
 
-ROOT CAUSE FOUND AND FIXED (v0.14.4): see git history / earlier
-docstring revisions for the get_local_timezone() singleton poisoning
-bug. Fixed by passing an explicit timezone to APIClient.
+ROOT CAUSE FOUND AND FIXED (v0.14.4): see git history for the
+get_local_timezone() singleton poisoning bug. Fixed by passing an
+explicit timezone to APIClient.
 
 v0.15.0: log-subscription task lifecycle decoupled from the fast
 TCP-ping keepalive, tied only to device.esphome_reports_online instead
 (see device_manager.py).
 
-v0.15.1: this persistent connection's own connect/disconnect events are
-now ALSO used as a fast, immediate online/offline signal for
-DeviceManager, via an on_state_change callback. Rationale: ESPHome's
-own dashboard shows a device's online/offline status change instantly
-while a live log view is open, because that live connection's on_stop
-callback fires exactly when the connection drops (aioesphomeapi
-delivers this immediately, confirmed by direct testing earlier). We
-already hold exactly this kind of persistent connection whenever
-esphome_reports_online is True, but weren't previously using its own
-connect/disconnect transitions to update DeviceManager's fast online
-state at all -- only our separate TCP-ping keepalive did that, which
-has up to keepalive_interval seconds of latency. Wiring on_stop/connect
-into DeviceManager gives the same near-instant detection the native
-ESPHome dashboard shows, for any device that currently has a log
-subscription running. Devices ESPHome itself reports offline still rely
-purely on TCP-ping (no persistent connection is held for them at all).
+v0.15.1 (REVERTED in v0.15.2): tried using this connection's own
+connect/on_stop events as a fast online/offline signal for
+DeviceManager. Measured directly against a real power-loss test
+(device physically unplugged/replugged, exact timestamps compared in
+conversation): the log connection's on_stop did NOT detect the actual
+outage at all -- it only fired ~35s later, as a side effect of the
+device reconnecting and resetting the stale socket, not from
+proactively noticing the drop. The TCP-ping keepalive detected both the
+offline and online transitions faster in all four measured cases (1.5s,
+4.2s, 5.9s, 6.3s vs. no detection at all / 21-35s for the log
+connection). Reverted: this signal is unreliable for real disconnects,
+only fires promptly for clean/graceful disconnects (e.g. ESPHome's own
+dashboard log view appearing instant is likely from a controlled
+reboot with a goodbye message, not a power loss). Keeping it caused
+conflicting online/offline signals and confusing rapid flapping.
 
 Other things verified/fixed along the way:
   - subscribe_logs(on_log, log_level=...) only delivers lines if
@@ -45,6 +44,9 @@ Architecture:
     /data/mcp_esphome/esplog_<name>.jsonl: {"ts": <epoch float>, "message": <str>}.
   - A periodic prune task rewrites each log file keeping only entries
     newer than retention_days.
+  - This connection's own state is used ONLY for logging, not for
+    online/offline detection. Online/offline detection is purely the
+    TCP-ping keepalive in device_manager.py.
 """
 import asyncio
 import json
@@ -52,7 +54,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 try:
     from aioesphomeapi import APIClient, LogLevel
@@ -79,18 +81,10 @@ class LogManager:
         self.tasks: dict[str, asyncio.Task] = {}
         self.zeroconf_instance: Optional[object] = None
         self.timezone = timezone
-        # Called with (device_name, is_online) the instant this
-        # connection connects or disconnects. Lets DeviceManager treat
-        # this connection as a fast online/offline signal, same as the
-        # native ESPHome dashboard's live log view does.
-        self.on_state_change: Optional[Callable[[str, bool], None]] = None
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
     def set_zeroconf_instance(self, instance: object):
         self.zeroconf_instance = instance
-
-    def set_state_change_callback(self, callback: Callable[[str, bool], None]):
-        self.on_state_change = callback
 
     def _log_file(self, device_name: str) -> Path:
         return STORAGE_DIR / f"esplog_{device_name.replace('/', '_')}.jsonl"
@@ -125,16 +119,11 @@ class LogManager:
             )
             stop_event = asyncio.Event()
 
-            async def on_stop(expected, ev=stop_event, dn=device_name):
+            async def on_stop(expected, ev=stop_event):
                 ev.set()
-                if self.on_state_change is not None:
-                    self.on_state_change(dn, False)
 
             try:
                 await client.connect(login=False, on_stop=on_stop)
-
-                if self.on_state_change is not None:
-                    self.on_state_change(device_name, True)
 
                 def on_log(msg, dn=device_name):
                     line = msg.message
@@ -152,8 +141,6 @@ class LogManager:
             except Exception as err:
                 _LOGGER.info("Log subscription error for %s: %s — retry in %ds",
                              device_name, err, RETRY_SECONDS)
-                if self.on_state_change is not None:
-                    self.on_state_change(device_name, False)
             finally:
                 try:
                     await client.disconnect()
