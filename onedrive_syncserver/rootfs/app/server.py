@@ -2,7 +2,7 @@
 """OneDrive SyncServer - Web UI Backend
 Aufruf: python3 server.py [PORT]
   Port 8765 = Ingress (BASE aus X-Ingress-Path Header)
-  Port 8766 = Direktzugriff Auth-Seite (BASE immer leer)
+  Port 8769 = Direktzugriff Auth-Seite (BASE immer leer)
 """
 
 import json
@@ -19,7 +19,7 @@ from flask import Flask, request, jsonify, render_template_string
 app = Flask(__name__)
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
-IS_DIRECT = (PORT == 8766)  # Direktzugriff ohne Ingress
+IS_DIRECT = (PORT == 8769)
 
 CONFIG_DIR = "/data"
 SYNC_CONFIG = f"{CONFIG_DIR}/sync_config.json"
@@ -119,8 +119,6 @@ def get_local_folders():
     return sorted(folders)
 
 def get_base():
-    # Direktzugriff (Port 8766): BASE leer, fetch() nutzt relativen Pfad direkt
-    # Ingress (Port 8765): BASE aus X-Ingress-Path Header
     if IS_DIRECT:
         return ""
     return request.headers.get("X-Ingress-Path", "").rstrip("/")
@@ -225,7 +223,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <div class="header">
   <span style="font-size:1.5rem">&#9729;</span>
   <h1>OneDrive SyncServer</h1>
-  {% if is_direct %}<span class="direct-badge">Direktzugriff Port 8766</span>{% endif %}
+  {% if is_direct %}<span class="direct-badge">Direktzugriff Port 8769</span>{% endif %}
 </div>
 <div class="container">
 
