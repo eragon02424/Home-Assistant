@@ -21,13 +21,13 @@ else
   SYNC_INTERVAL=300
 fi
 
-# Ingress UI (Port 8765) - alle Funktionen ausser Auth
+# Ingress UI (Port 8765) - alle Funktionen
 echo "[OneDrive SyncServer] Starting main UI on port 8765 (Ingress)..."
 python3 /app/server.py 8765 &
 
-# Auth UI (Port 8766) - direkter Zugriff ohne Ingress fuer Microsoft OAuth
-echo "[OneDrive SyncServer] Starting auth UI on port 8766 (direct)..."
-python3 /app/server.py 8766 &
+# Auth UI (Port 8769) - direkter Zugriff ohne Ingress fuer Microsoft OAuth
+echo "[OneDrive SyncServer] Starting auth UI on port 8769 (direct access)..."
+python3 /app/server.py 8769 &
 
 echo "[OneDrive SyncServer] Waiting for OneDrive authentication..."
 while [ ! -f "${ONEDRIVE_CONFIG_DIR}/refresh_token" ]; do
@@ -42,7 +42,7 @@ onedrive \
   --download-only \
   --verbose 2>&1 | tee -a /data/sync.log
 
-echo "[OneDrive SyncServer] Initial download complete. Starting sync loop..."
+echo "[OneDrive SyncServer] Initial download complete."
 
 while true; do
   sleep "${SYNC_INTERVAL}"
