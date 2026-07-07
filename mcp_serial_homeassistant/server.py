@@ -1,14 +1,14 @@
 """
-MCP Serial HomeAssistant v1.0.5
+MCP Serial HomeAssistant v1.0.6
 Persistenter serieller Listener fuer ESP32-S2 USB-CDC.
 FastMCP HTTP Transport.
 Polling alle 0.5s (udev NETLINK in Docker geblockt).
 ttyACM* hat immer Vorrang vor ttyUSB*.
 Burst-Lines (CR-getrennt) werden in einzelne Eintraege aufgesplittet.
+Monitor kann per MCP-Tool pausiert/fortgesetzt werden (z.B. fuer Flash-Vorgang).
 """
 import logging
 import os
-import re
 import threading
 import time
 import glob
@@ -45,6 +45,9 @@ state = {
     "ring_buffer_lines":   opts.get("ring_buffer_lines", 300),
     "log_retention_hours": opts.get("log_retention_hours", 24),
     "log_max_size_mb":     opts.get("log_max_size_mb", 20),
+    # Monitor-Steuerung: True = aktiv (default), False = pausiert
+    "monitor_active":      True,
+    "monitor_paused_at":   None,   # ISO-Timestamp wann pausiert wurde
 }
 MCP_PORT = int(opts.get("port", 8769))
 
@@ -87,11 +90,6 @@ def write_log_line(entry: dict):
             log.warning("Log write error: %s", e)
 
 def split_and_clean(raw_line: str) -> list[str]:
-    """
-    Splittet Burst-Zeilen die per \\r zusammengequetscht wurden in einzelne Zeilen.
-    Beim S2-Aufwachen kommen die ersten Bytes oft als ein grosser Burst mit
-    \\r als Zeilentrenner statt \\n.
-    """
     segments = raw_line.split("\r")
     result = []
     for seg in segments:
@@ -154,8 +152,16 @@ def store_line(port_name: str, line: str):
 def serial_loop():
     last_seen_port = None
     while True:
+        # Monitor pausiert -> Port schliessen und warten
+        if not state["monitor_active"]:
+            close_port()
+            last_seen_port = None
+            time.sleep(0.5)
+            continue
+
         with ser_lock:
             s = ser
+
         if s and s.is_open:
             try:
                 raw_bytes = s.readline()
@@ -183,7 +189,47 @@ def serial_loop():
                 last_seen_port = None
             time.sleep(0.5)
 
+# ---------------------------------------------------------------------------
+# FastMCP Tools
+# ---------------------------------------------------------------------------
 mcp = FastMCP("MCP Serial HomeAssistant")
+
+@mcp.tool()
+def serial_monitor_stop() -> dict:
+    """
+    Pausiert den seriellen Monitor komplett. Kein Port wird geoeffnet oder gelesen.
+    Verwenden vor Flash-Vorgang oder wenn der Port exklusiv benoetigt wird.
+    Nach Add-on Neustart ist der Monitor automatisch wieder aktiv.
+    """
+    if not state["monitor_active"]:
+        return {"monitor_active": False, "note": "War bereits pausiert", "paused_at": state["monitor_paused_at"]}
+    close_port()
+    state["monitor_active"] = False
+    state["monitor_paused_at"] = datetime.now(timezone.utc).isoformat()
+    log.info("Monitor PAUSIERT - kein Port wird geoeffnet")
+    return {
+        "monitor_active": False,
+        "paused_at": state["monitor_paused_at"],
+        "note": "Monitor pausiert. serial_monitor_start() zum Fortsetzen."
+    }
+
+@mcp.tool()
+def serial_monitor_start() -> dict:
+    """
+    Startet den seriellen Monitor nach einer Pause wieder.
+    Der Monitor erkennt automatisch den naechsten verfuegbaren ttyACM* Port.
+    """
+    if state["monitor_active"]:
+        return {"monitor_active": True, "note": "War bereits aktiv"}
+    paused_at = state["monitor_paused_at"]
+    state["monitor_active"] = True
+    state["monitor_paused_at"] = None
+    log.info("Monitor GESTARTET - Polling aktiv")
+    return {
+        "monitor_active": True,
+        "was_paused_at": paused_at,
+        "note": "Monitor aktiv. ttyACM* wird beim naechsten Aufwachen erkannt."
+    }
 
 @mcp.tool()
 def serial_read_recent(lines: int = 50) -> dict:
@@ -263,13 +309,15 @@ def serial_set_baudrate(baud_rate: int) -> dict:
 
 @mcp.tool()
 def serial_status() -> dict:
-    """Aktueller Status: Port, Baudrate, offen/zu, Buffer-Fuellstand, Log-Groesse."""
+    """Aktueller Status: Port, Baudrate, Monitor aktiv/pausiert, Buffer-Fuellstand, Log-Groesse."""
     with ser_lock:
         s = ser
     log_files = list(LOG_DIR.glob("*.log"))
     with buffer_lock:
         buf_len = len(ring_buffer)
     return {
+        "monitor_active": state["monitor_active"],
+        "paused_at": state["monitor_paused_at"],
         "port": s.port if s else None,
         "configured_port": state["active_port"],
         "auto_detect": state["active_port"] is None,
@@ -283,7 +331,7 @@ def serial_status() -> dict:
 
 if __name__ == "__main__":
     threading.Thread(target=serial_loop, daemon=True).start()
-    log.info("MCP Serial HomeAssistant v1.0.5 gestartet auf Port %d", MCP_PORT)
-    log.info("Auto-Detect: ttyACM* bevorzugt, Burst-Splitter aktiv")
+    log.info("MCP Serial HomeAssistant v1.0.6 gestartet auf Port %d", MCP_PORT)
+    log.info("Auto-Detect: ttyACM* bevorzugt, Burst-Splitter aktiv, Monitor-Steuerung aktiv")
     app = mcp.http_app()
     uvicorn.run(app, host="0.0.0.0", port=MCP_PORT, log_level="warning")
