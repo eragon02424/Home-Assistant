@@ -16,8 +16,13 @@ if [ ! -f "${SYNC_CONFIG}" ]; then
   echo '{}' > "${SYNC_CONFIG}"
 fi
 
-# Read sync interval from options
-SYNC_INTERVAL=$(bashio::config 'sync_interval' '300')
+# Read sync interval directly from HA options.json (no bashio dependency)
+OPTIONS_FILE="/data/options.json"
+if [ -f "${OPTIONS_FILE}" ]; then
+  SYNC_INTERVAL=$(python3 -c "import json; d=json.load(open('${OPTIONS_FILE}')); print(d.get('sync_interval', 300))")
+else
+  SYNC_INTERVAL=300
+fi
 
 echo "[OneDrive SyncServer] Starting web UI on port 8765..."
 python3 /app/server.py &
