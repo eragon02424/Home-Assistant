@@ -10,6 +10,7 @@ _LOGGER = logging.getLogger("mcp_esphome.api")
 
 def setup_routes(app: web.Application):
     device_manager = app["device_manager"]
+    log_manager = app["log_manager"]
     job_manager = JobManager(device_manager.esphome_dashboard_url)
     app["job_manager"] = job_manager
     bearer_token = app.get("bearer_token", "")
@@ -41,6 +42,22 @@ def setup_routes(app: web.Application):
         if result is None:
             return web.json_response({"error": "device not found"}, status=404)
         return web.json_response(result)
+
+    async def get_logs_recent(request):
+        name = request.match_info["device_name"]
+        n = int(request.query.get("n", 100))
+        return web.json_response(log_manager.get_recent(name, n))
+
+    async def get_logs_range(request):
+        name = request.match_info["device_name"]
+        try:
+            seconds = float(request.query["seconds"])
+        except (KeyError, ValueError):
+            return web.json_response(
+                {"error": "query param 'seconds' is required, e.g. seconds=3600 for the last hour"},
+                status=400,
+            )
+        return web.json_response(log_manager.get_range(name, seconds))
 
     async def validate_config(request):
         name = request.match_info["device_name"]
@@ -88,6 +105,8 @@ def setup_routes(app: web.Application):
     app.router.add_get("/devices", list_devices)
     app.router.add_get("/devices/{device_name}/last_seen", get_last_seen)
     app.router.add_get("/devices/{device_name}/history", get_online_offline_history)
+    app.router.add_get("/devices/{device_name}/logs/recent", get_logs_recent)
+    app.router.add_get("/devices/{device_name}/logs/range", get_logs_range)
     app.router.add_post("/devices/{device_name}/validate", validate_config)
     app.router.add_post("/devices/{device_name}/compile", start_compile)
     app.router.add_get("/jobs/{job_id}/status", get_job_status)
