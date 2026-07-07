@@ -1,6 +1,6 @@
 """Device Manager - handles ESPHome device discovery and heartbeat history.
 
-Architecture (v0.15.2):
+Architecture (v0.15.3):
 ───────────────────────
 DISCOVERY (at startup, then every DISCOVERY_INTERVAL_SECONDS)
   Fetch /devices. For every device not yet known: register it (address,
@@ -40,10 +40,16 @@ BACKOFF CAP
 
 mDNS LISTENER (global)
   add_service/update_service fires for every announce. If the device is
-  known, its wake_event is set via loop.call_soon_threadsafe.
+  known, its wake_event is set via loop.call_soon_threadsafe, waking the
+  keepalive task. As of v0.15.3 the SAME announce is also forwarded to
+  LogManager.on_mdns_announce(), which wakes an already-running log
+  subscription task immediately (forces a fresh connect even if it
+  hasn't noticed a disconnect yet — see log_manager.py for why that
+  matters, especially for short deep-sleep wake windows). This is
+  independent of whether device.wake_event exists yet.
   This same AsyncZeroconf instance is exposed via get_zeroconf_instance()
   so LogManager's aioesphomeapi clients can share it instead of each
-  creating their own (see log_manager.py for why that matters).
+  creating their own.
 
 PERSISTENCE / HISTORY
   Every state transition (connected/disconnected) is appended to
@@ -56,18 +62,10 @@ fast TCP-ping keepalive on purpose.
   The log-subscription task's lifecycle (start/stop) is tied to
   device.esphome_reports_online (ESPHome's own "state" field, refreshed
   every DISCOVERY_INTERVAL_SECONDS), NOT to our own fast TCP-ping-based
-  online/offline flips. Reasoning: our TCP-ping keepalive is
-  deliberately sensitive to brief interruptions (that's the point, for
-  fast offline detection), but the ESP's native API log connection has
-  its own retry loop in LogManager that already reconnects
-  automatically on any disconnect, reboot, or deep-sleep wake-up. Tying
-  log-task start/stop to our fast pings caused the task to be cancelled
-  and restarted every time a brief TCP hiccup occurred, which
-  repeatedly interrupted the connection handshake mid-flight. ESPHome's
-  own reported state changes far less often, so it's a much steadier
-  signal for "should we even be trying to log this device at all".
-  The log connection's own state is used only for logging, never for
-  online/offline detection (see BACKOFF CAP section above).
+  online/offline flips. Once started, mDNS announces (see above) wake it
+  early on top of its normal RETRY_SECONDS cadence. The log connection's
+  own state is used only for logging, never for online/offline
+  detection (see BACKOFF CAP section above).
 
 Every TCP ping attempt logs its duration in ms.
 """
@@ -453,6 +451,10 @@ class DeviceManager:
         if not device.initialized:
             _LOGGER.info("mDNS %s [%s]: not yet initialized, ignoring", kind, device_name)
             return
+
+        if self.log_manager is not None:
+            self.log_manager.on_mdns_announce(device_name)
+
         if device.wake_event is None:
             _LOGGER.info("mDNS %s [%s]: no wake_event yet (task not started), ignoring",
                          kind, device_name)
