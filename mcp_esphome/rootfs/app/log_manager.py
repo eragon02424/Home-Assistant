@@ -1,30 +1,29 @@
 """Log Manager - persists ESPHome native API debug logs per device.
 
-ROOT CAUSE FOUND AND FIXED (v0.14.4):
-  Symptom: "Error while finishing connection: Finishing connection
-  cancelled" on EVERY device's log-subscription connection attempt,
-  simultaneously and permanently once it first occurred.
+ROOT CAUSE FOUND AND FIXED (v0.14.4): see git history / earlier
+docstring revisions for the get_local_timezone() singleton poisoning
+bug. Fixed by passing an explicit timezone to APIClient.
 
-  Full traceback (captured from inside the actual container) showed the
-  failure inside aioesphomeapi's connection.finish_connection() ->
-  get_timezone() -> get_local_timezone(), which is a process-wide
-  SINGLETON (aioesphomeapi/singleton.py: the first caller's coroutine is
-  cached and awaited by every subsequent caller). The very first time
-  this ran, it happened to be cancelled — because a device flapped
-  offline mid-connect, and DeviceManager._mark_offline() calls
-  LogManager.stop() -> task.cancel(), which propagated the
-  CancelledError into that shared singleton's in-flight coroutine. Once
-  poisoned, every later call (for any device, from any task) awaits the
-  same permanently-cancelled cached future and fails identically and
-  immediately — explaining why ALL devices failed in synchronized
-  lockstep after one single bad cancellation.
+v0.15.0: log-subscription task lifecycle decoupled from the fast
+TCP-ping keepalive, tied only to device.esphome_reports_online instead
+(see device_manager.py).
 
-  Fix: APIClient accepts an explicit `timezone` argument ("If not
-  provided, the system timezone will be detected automatically" per its
-  docstring). Passing it explicitly skips get_local_timezone() and its
-  cancellable singleton entirely. We read Home Assistant's own
-  configured timezone via the Supervisor Core API once at LogManager
-  construction and pass it to every APIClient.
+v0.15.1: this persistent connection's own connect/disconnect events are
+now ALSO used as a fast, immediate online/offline signal for
+DeviceManager, via an on_state_change callback. Rationale: ESPHome's
+own dashboard shows a device's online/offline status change instantly
+while a live log view is open, because that live connection's on_stop
+callback fires exactly when the connection drops (aioesphomeapi
+delivers this immediately, confirmed by direct testing earlier). We
+already hold exactly this kind of persistent connection whenever
+esphome_reports_online is True, but weren't previously using its own
+connect/disconnect transitions to update DeviceManager's fast online
+state at all -- only our separate TCP-ping keepalive did that, which
+has up to keepalive_interval seconds of latency. Wiring on_stop/connect
+into DeviceManager gives the same near-instant detection the native
+ESPHome dashboard shows, for any device that currently has a log
+subscription running. Devices ESPHome itself reports offline still rely
+purely on TCP-ping (no persistent connection is held for them at all).
 
 Other things verified/fixed along the way:
   - subscribe_logs(on_log, log_level=...) only delivers lines if
@@ -39,9 +38,9 @@ Other things verified/fixed along the way:
     clients don't each spin up their own mDNS resolver.
 
 Architecture:
-  - One persistent aioesphomeapi connection per device, started when
-    DeviceManager marks a device online, stopped (task cancelled) when
-    marked offline. Retries every RETRY_SECONDS on disconnect.
+  - One persistent aioesphomeapi connection per device, started/stopped
+    by DeviceManager based on esphome_reports_online. Retries every
+    RETRY_SECONDS on disconnect.
   - Every received log line is appended as one JSON line to
     /data/mcp_esphome/esplog_<name>.jsonl: {"ts": <epoch float>, "message": <str>}.
   - A periodic prune task rewrites each log file keeping only entries
@@ -53,7 +52,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 try:
     from aioesphomeapi import APIClient, LogLevel
@@ -79,13 +78,19 @@ class LogManager:
         self.retention_seconds = retention_days * 86400
         self.tasks: dict[str, asyncio.Task] = {}
         self.zeroconf_instance: Optional[object] = None
-        # Explicit timezone avoids aioesphomeapi's cancellable
-        # get_local_timezone() singleton entirely (see module docstring).
         self.timezone = timezone
+        # Called with (device_name, is_online) the instant this
+        # connection connects or disconnects. Lets DeviceManager treat
+        # this connection as a fast online/offline signal, same as the
+        # native ESPHome dashboard's live log view does.
+        self.on_state_change: Optional[Callable[[str, bool], None]] = None
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
     def set_zeroconf_instance(self, instance: object):
         self.zeroconf_instance = instance
+
+    def set_state_change_callback(self, callback: Callable[[str, bool], None]):
+        self.on_state_change = callback
 
     def _log_file(self, device_name: str) -> Path:
         return STORAGE_DIR / f"esplog_{device_name.replace('/', '_')}.jsonl"
@@ -120,11 +125,16 @@ class LogManager:
             )
             stop_event = asyncio.Event()
 
-            async def on_stop(expected, ev=stop_event):
+            async def on_stop(expected, ev=stop_event, dn=device_name):
                 ev.set()
+                if self.on_state_change is not None:
+                    self.on_state_change(dn, False)
 
             try:
                 await client.connect(login=False, on_stop=on_stop)
+
+                if self.on_state_change is not None:
+                    self.on_state_change(device_name, True)
 
                 def on_log(msg, dn=device_name):
                     line = msg.message
@@ -142,6 +152,8 @@ class LogManager:
             except Exception as err:
                 _LOGGER.info("Log subscription error for %s: %s — retry in %ds",
                              device_name, err, RETRY_SECONDS)
+                if self.on_state_change is not None:
+                    self.on_state_change(device_name, False)
             finally:
                 try:
                     await client.disconnect()
