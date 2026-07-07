@@ -1,11 +1,14 @@
 """
-MCP Serial HomeAssistant v1.0.6
+MCP Serial HomeAssistant v1.0.7
 Persistenter serieller Listener fuer ESP32-S2 USB-CDC.
 FastMCP HTTP Transport.
 Polling alle 0.5s (udev NETLINK in Docker geblockt).
 ttyACM* hat immer Vorrang vor ttyUSB*.
 Burst-Lines (CR-getrennt) werden in einzelne Eintraege aufgesplittet.
 Monitor kann per MCP-Tool pausiert/fortgesetzt werden (z.B. fuer Flash-Vorgang).
+Flash-Mode-Filter: ESP32-S2 im Download-Mode (VID:PID 303a:0002, USB JTAG/
+Serial Debug Unit) wird NIE geoeffnet - nur normaler Betrieb (303a:4001 CDC)
+oder unbekannte VID/PID werden verbunden.
 """
 import logging
 import os
@@ -45,11 +48,16 @@ state = {
     "ring_buffer_lines":   opts.get("ring_buffer_lines", 300),
     "log_retention_hours": opts.get("log_retention_hours", 24),
     "log_max_size_mb":     opts.get("log_max_size_mb", 20),
-    # Monitor-Steuerung: True = aktiv (default), False = pausiert
     "monitor_active":      True,
-    "monitor_paused_at":   None,   # ISO-Timestamp wann pausiert wurde
+    "monitor_paused_at":   None,
 }
 MCP_PORT = int(opts.get("port", 8769))
+
+# VID:PID Kombinationen die NIE als Serial-Monitor-Ziel geoeffnet werden.
+# 303a:0002 = Espressif USB JTAG/serial debug unit (Download/Flash-Mode)
+BLOCKED_VID_PID = {
+    ("303a", "0002"),
+}
 
 ring_buffer: deque = deque(maxlen=state["ring_buffer_lines"])
 buffer_lock = threading.Lock()
@@ -98,13 +106,61 @@ def split_and_clean(raw_line: str) -> list[str]:
             result.append(seg)
     return result
 
+# ---------------------------------------------------------------------------
+# USB VID/PID Erkennung ueber sysfs
+# ---------------------------------------------------------------------------
+def get_usb_vid_pid(tty_path: str) -> tuple[str, str] | None:
+    """
+    Ermittelt VID/PID des USB-Geraets hinter einem /dev/ttyACMx Node.
+    Traversiert /sys/class/tty/ttyACMx/device nach oben bis idVendor/idProduct
+    gefunden werden (max 6 Ebenen).
+    """
+    tty_name = os.path.basename(tty_path)
+    sys_path = f"/sys/class/tty/{tty_name}/device"
+    try:
+        current = os.path.realpath(sys_path)
+    except Exception:
+        return None
+
+    for _ in range(6):
+        vendor_file = os.path.join(current, "idVendor")
+        product_file = os.path.join(current, "idProduct")
+        if os.path.exists(vendor_file) and os.path.exists(product_file):
+            try:
+                with open(vendor_file) as f:
+                    vid = f.read().strip()
+                with open(product_file) as f:
+                    pid = f.read().strip()
+                return (vid, pid)
+            except Exception:
+                return None
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return None
+
+def is_flash_mode(tty_path: str) -> bool:
+    """True wenn das Geraet hinter tty_path im Flash/Download-Mode ist."""
+    vid_pid = get_usb_vid_pid(tty_path)
+    if vid_pid is None:
+        return False
+    return vid_pid in BLOCKED_VID_PID
+
 def find_target_port() -> str | None:
     target = state["active_port"]
     if target:
-        return target if os.path.exists(target) else None
+        if not os.path.exists(target):
+            return None
+        if is_flash_mode(target):
+            return None
+        return target
     acm = sorted(glob.glob("/dev/ttyACM*"))
-    if acm:
-        return acm[0]
+    for candidate in acm:
+        if is_flash_mode(candidate):
+            log.info("Ignoriere %s - Flash/Download-Mode erkannt (VID:PID 303a:0002)", candidate)
+            continue
+        return candidate
     return None
 
 ser: serial.Serial | None = None
@@ -152,7 +208,6 @@ def store_line(port_name: str, line: str):
 def serial_loop():
     last_seen_port = None
     while True:
-        # Monitor pausiert -> Port schliessen und warten
         if not state["monitor_active"]:
             close_port()
             last_seen_port = None
@@ -163,6 +218,14 @@ def serial_loop():
             s = ser
 
         if s and s.is_open:
+            # Laufend pruefen ob der offene Port evtl. jetzt Flash-Mode ist
+            # (z.B. wenn ESP mitten im Betrieb in Download-Mode versetzt wird)
+            if is_flash_mode(s.port):
+                log.info("Port %s ist jetzt im Flash-Mode - trenne Verbindung", s.port)
+                close_port()
+                last_seen_port = None
+                time.sleep(0.5)
+                continue
             try:
                 raw_bytes = s.readline()
                 if raw_bytes:
@@ -217,7 +280,8 @@ def serial_monitor_stop() -> dict:
 def serial_monitor_start() -> dict:
     """
     Startet den seriellen Monitor nach einer Pause wieder.
-    Der Monitor erkennt automatisch den naechsten verfuegbaren ttyACM* Port.
+    Der Monitor erkennt automatisch den naechsten verfuegbaren ttyACM* Port
+    (Geraete im Flash/Download-Mode werden dabei automatisch uebersprungen).
     """
     if state["monitor_active"]:
         return {"monitor_active": True, "note": "War bereits aktiv"}
@@ -228,7 +292,7 @@ def serial_monitor_start() -> dict:
     return {
         "monitor_active": True,
         "was_paused_at": paused_at,
-        "note": "Monitor aktiv. ttyACM* wird beim naechsten Aufwachen erkannt."
+        "note": "Monitor aktiv. ttyACM* wird erkannt (Flash-Mode-Geraete werden ignoriert)."
     }
 
 @mcp.tool()
@@ -270,7 +334,10 @@ def serial_read_timerange(since: str = "", until: str = "", max_lines: int = 500
 
 @mcp.tool()
 def serial_list_ports() -> dict:
-    """Zeigt alle verfuegbaren seriellen Ports (ttyACM*, ttyUSB*) inkl. by-id Symlinks."""
+    """
+    Zeigt alle verfuegbaren seriellen Ports (ttyACM*, ttyUSB*) inkl. by-id Symlinks
+    und VID/PID sowie Flash-Mode-Status fuer jeden ttyACM* Port.
+    """
     ports = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
     by_id = {}
     try:
@@ -279,7 +346,16 @@ def serial_list_ports() -> dict:
             by_id[name] = os.path.normpath(os.path.join("/dev/serial/by-id", target))
     except Exception:
         pass
-    return {"ports": ports, "by_id": by_id}
+
+    acm_details = {}
+    for p in glob.glob("/dev/ttyACM*"):
+        vid_pid = get_usb_vid_pid(p)
+        acm_details[p] = {
+            "vid_pid": f"{vid_pid[0]}:{vid_pid[1]}" if vid_pid else None,
+            "flash_mode": is_flash_mode(p),
+        }
+
+    return {"ports": ports, "by_id": by_id, "acm_details": acm_details}
 
 @mcp.tool()
 def serial_set_port(port: str) -> dict:
@@ -290,6 +366,8 @@ def serial_set_port(port: str) -> dict:
     state["active_port"] = port
     if not os.path.exists(port):
         return {"port": port, "opened": False, "note": "Existiert noch nicht, gilt beim naechsten Aufwachen"}
+    if is_flash_mode(port):
+        return {"port": port, "opened": False, "note": "Geraet ist im Flash/Download-Mode - wird nicht geoeffnet"}
     ok = open_port(port, state["baud_rate"])
     return {"port": port, "opened": ok}
 
@@ -331,7 +409,7 @@ def serial_status() -> dict:
 
 if __name__ == "__main__":
     threading.Thread(target=serial_loop, daemon=True).start()
-    log.info("MCP Serial HomeAssistant v1.0.6 gestartet auf Port %d", MCP_PORT)
-    log.info("Auto-Detect: ttyACM* bevorzugt, Burst-Splitter aktiv, Monitor-Steuerung aktiv")
+    log.info("MCP Serial HomeAssistant v1.0.7 gestartet auf Port %d", MCP_PORT)
+    log.info("Auto-Detect: ttyACM* bevorzugt, Burst-Splitter aktiv, Flash-Mode-Filter aktiv (303a:0002 blockiert)")
     app = mcp.http_app()
     uvicorn.run(app, host="0.0.0.0", port=MCP_PORT, log_level="warning")
