@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """OneDrive SyncServer - Web UI Backend
-Aufruf: python3 server.py [PORT]
-  Port 8765 = Ingress (BASE aus X-Ingress-Path Header)
-  Port 8771 = Direktzugriff Auth-Seite (BASE immer leer)
+Port 8765 = Ingress
+Port 8771 = Direktzugriff (Device Code Flow Auth)
 """
 
 import json
@@ -24,46 +23,106 @@ IS_DIRECT = (PORT == 8771)
 CONFIG_DIR = "/data"
 SYNC_CONFIG = f"{CONFIG_DIR}/sync_config.json"
 ONEDRIVE_CONFIG_DIR = f"{CONFIG_DIR}/onedrive"
-AUTH_URL_FILE = f"{ONEDRIVE_CONFIG_DIR}/authUrl"
-RESPONSE_URL_FILE = f"{ONEDRIVE_CONFIG_DIR}/responseUrl"
 AUTH_DEBUG_LOG = f"{CONFIG_DIR}/auth_debug.log"
+DEVICE_STATE_FILE = f"{CONFIG_DIR}/device_auth_state.json"
 SHARE_DIR = "/share/onedrive"
 DOWNLOAD_DIR = "/share/onedrive_downloads"
 LOG_FILE = f"{CONFIG_DIR}/sync.log"
 STATUS_FILE = f"{CONFIG_DIR}/sync_status.json"
 
+# abraunegg client_id - registriert fuer Device Code Flow bei Microsoft
 CLIENT_ID = "d50ca740-c83f-4d1b-b616-12c519384f0c"
+DEVICE_AUTH_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+SCOPE = "Files.ReadWrite Files.ReadWrite.All Sites.ReadWrite.All offline_access"
+
+# Globaler Polling-Thread State
+_poll_thread = None
+_poll_stop = threading.Event()
 
 def auth_log(msg):
     with open(AUTH_DEBUG_LOG, 'a') as f:
         f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
 
+def save_device_state(state):
+    with open(DEVICE_STATE_FILE, 'w') as f:
+        json.dump(state, f)
+
+def load_device_state():
+    if os.path.exists(DEVICE_STATE_FILE):
+        with open(DEVICE_STATE_FILE) as f:
+            return json.load(f)
+    return None
+
+def clear_device_state():
+    if os.path.exists(DEVICE_STATE_FILE):
+        os.remove(DEVICE_STATE_FILE)
+
+def ms_post(url, data):
+    """POST zu Microsoft OAuth Endpoint."""
+    encoded = urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(url, data=encoded, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+        return json.loads(resp.read()), None
+    except urllib.error.HTTPError as e:
+        body = json.loads(e.read())
+        return None, body
+
+def poll_for_token(device_code, interval, expires_at):
+    """Pollt im Hintergrund bis Token vorhanden oder abgelaufen."""
+    global _poll_stop
+    auth_log(f"Polling gestartet, laeuft bis {time.strftime('%H:%M:%S', time.localtime(expires_at))}")
+    while not _poll_stop.is_set():
+        time.sleep(interval)
+        if time.time() > expires_at:
+            auth_log("Device Code abgelaufen")
+            clear_device_state()
+            break
+        result, err = ms_post(TOKEN_URL, {
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "client_id": CLIENT_ID,
+            "device_code": device_code,
+        })
+        if err:
+            error = err.get("error", "")
+            if error == "authorization_pending":
+                continue
+            elif error == "slow_down":
+                interval += 5
+                continue
+            else:
+                auth_log(f"Polling Fehler: {err}")
+                clear_device_state()
+                break
+        if result and "refresh_token" in result:
+            os.makedirs(ONEDRIVE_CONFIG_DIR, exist_ok=True)
+            with open(f"{ONEDRIVE_CONFIG_DIR}/refresh_token", 'w') as f:
+                f.write(result["refresh_token"])
+            auth_log("SUCCESS: refresh_token gespeichert via Device Code Flow")
+            clear_device_state()
+            break
+
 def get_access_token():
     rt_file = f"{ONEDRIVE_CONFIG_DIR}/refresh_token"
     if not os.path.exists(rt_file):
-        raise Exception("Kein refresh_token - bitte zuerst authentifizieren")
+        raise Exception("Nicht authentifiziert")
     with open(rt_file) as f:
         refresh_token = f.read().strip()
-    data = urllib.parse.urlencode({
+    result, err = ms_post(TOKEN_URL, {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": CLIENT_ID,
-        "scope": "Files.ReadWrite offline_access"
-    }).encode()
-    req = urllib.request.Request(TOKEN_URL, data=data, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    try:
-        resp = urllib.request.urlopen(req, timeout=15)
-        token_data = json.loads(resp.read())
-        if "refresh_token" in token_data:
-            with open(rt_file, "w") as f:
-                f.write(token_data["refresh_token"])
-        return token_data["access_token"]
-    except urllib.error.HTTPError as e:
-        body = json.loads(e.read())
-        raise Exception(f"Token-Fehler: {body.get('error_description', body.get('error'))}")
+        "scope": SCOPE,
+    })
+    if err:
+        raise Exception(f"Token-Fehler: {err.get('error_description', err.get('error'))}")
+    if "refresh_token" in result:
+        with open(rt_file, 'w') as f:
+            f.write(result["refresh_token"])
+    return result["access_token"]
 
 def graph_get(access_token, path):
     url = f"{GRAPH_BASE}{path}"
@@ -74,7 +133,7 @@ def graph_get(access_token, path):
         return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = json.loads(e.read())
-        raise Exception(f"Graph API Fehler {e.code}: {body.get('error', {}).get('message', str(e))}")
+        raise Exception(f"Graph {e.code}: {body.get('error', {}).get('message', str(e))}")
 
 def graph_download(access_token, item_id, dest_path):
     url = f"{GRAPH_BASE}/me/drive/items/{item_id}/content"
@@ -86,7 +145,7 @@ def graph_download(access_token, item_id, dest_path):
             f.write(resp.read())
     except urllib.error.HTTPError as e:
         body = json.loads(e.read())
-        raise Exception(f"Download-Fehler {e.code}: {body.get('error', {}).get('message', str(e))}")
+        raise Exception(f"Download {e.code}: {body.get('error', {}).get('message', str(e))}")
 
 def load_sync_config():
     if os.path.exists(SYNC_CONFIG):
@@ -102,7 +161,7 @@ def load_status():
     if os.path.exists(STATUS_FILE):
         with open(STATUS_FILE) as f:
             return json.load(f)
-    return {"last_sync": None, "files_synced": 0, "errors": [], "authenticated": False}
+    return {"last_sync": None, "files_synced": 0, "errors": []}
 
 def is_authenticated():
     return os.path.exists(f"{ONEDRIVE_CONFIG_DIR}/refresh_token")
@@ -113,8 +172,7 @@ def get_local_folders():
         return folders
     for root, dirs, files in os.walk(SHARE_DIR):
         for d in sorted(dirs):
-            full = os.path.join(root, d)
-            rel = os.path.relpath(full, SHARE_DIR)
+            rel = os.path.relpath(os.path.join(root, d), SHARE_DIR)
             folders.append(rel)
     return sorted(folders)
 
@@ -166,21 +224,26 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   .status-item .label { font-size: 0.75rem; color: #6b7280; margin-bottom: 4px; }
   .status-item .value { font-size: 1rem; font-weight: 600; }
   .ok { color: #10b981; } .error-c { color: #ef4444; }
-  .auth-box { background: #111827; border: 1px solid #3b82f6; border-radius: 8px; padding: 16px; }
-  .auth-box p { color: #9ca3af; margin-bottom: 12px; font-size: 0.9rem; }
-  .auth-url-box { background: #1f2937; border: 1px solid #374151; border-radius: 6px;
-                  padding: 10px; margin-bottom: 12px; word-break: break-all;
-                  font-size: 0.8rem; color: #60a5fa; user-select: all; cursor: pointer; }
-  .auth-debug-box { background: #111827; border: 1px solid #374151; border-radius: 6px;
-                    padding: 10px; margin-top: 12px; font-family: monospace; font-size: 0.75rem;
-                    color: #9ca3af; max-height: 200px; overflow-y: auto; white-space: pre-wrap; }
+  .auth-box { background: #111827; border: 1px solid #3b82f6; border-radius: 8px; padding: 20px; }
+  .device-code { font-size: 2.5rem; font-weight: 700; letter-spacing: 0.3em;
+                  color: #f9fafb; background: #1f2937; border: 2px solid #3b82f6;
+                  border-radius: 8px; padding: 16px 24px; text-align: center;
+                  margin: 16px 0; font-family: monospace; }
+  .auth-link { display: inline-block; background: #3b82f6; color: white;
+                padding: 10px 20px; border-radius: 6px; text-decoration: none;
+                font-size: 1rem; font-weight: 500; margin-bottom: 12px; }
+  .polling-indicator { display: flex; align-items: center; gap: 8px; color: #9ca3af;
+                        font-size: 0.85rem; margin-top: 12px; }
+  .pulse { width: 8px; height: 8px; background: #10b981; border-radius: 50%;
+            animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  .expires-bar { height: 4px; background: #374151; border-radius: 2px; margin-top: 12px; }
+  .expires-fill { height: 100%; background: #3b82f6; border-radius: 2px;
+                   transition: width 1s linear; }
   .btn { padding: 8px 16px; border-radius: 6px; border: none; cursor: pointer;
          font-size: 0.9rem; font-weight: 500; margin-right: 4px; }
   .btn-primary { background: #3b82f6; color: white; }
   .btn-success { background: #10b981; color: white; }
-  .auth-input { width: 100%; background: #1f2937; border: 1px solid #374151;
-                color: #f9fafb; padding: 8px 12px; border-radius: 6px;
-                font-size: 0.9rem; margin: 8px 0; }
   .folder-item { border-bottom: 1px solid #374151; }
   .folder-item:last-child { border-bottom: none; }
   .folder-row { display: flex; align-items: center; gap: 8px; padding: 10px 8px; flex-wrap: wrap; }
@@ -246,9 +309,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       </div>
     </div>
     {% if status.errors %}
-      {% for err in status.errors[-3:] %}
-      <div class="error-item">&#9888; {{ err }}</div>
-      {% endfor %}
+      {% for err in status.errors[-3:] %}<div class="error-item">&#9888; {{ err }}</div>{% endfor %}
     {% endif %}
   </div>
 
@@ -256,18 +317,32 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   <div class="card">
     <h2>Microsoft Anmeldung</h2>
     <div class="auth-box">
-      {% if auth_url %}
-      <p><strong>Schritt 2:</strong> Klicke auf die URL um sie zu kopieren. Im Browser anmelden. Danach die komplette URL aus der Adressleiste kopieren (auch bei "wrongplace") und unten einsetzen.</p>
-      <div class="auth-url-box" onclick="navigator.clipboard.writeText(this.textContent).then(()=>showToast('URL kopiert'))">{{ auth_url }}</div>
-      <input type="text" class="auth-input" id="auth-code" placeholder="Antwort-URL einfuegen...">
-      <button class="btn btn-primary" onclick="submitAuth()">Bestaetigen</button>
-      {% if debug_log %}
-      <p style="color:#6b7280;font-size:0.75rem;margin-top:12px">Debug-Log:</p>
-      <div class="auth-debug-box">{{ debug_log }}</div>
-      {% endif %}
+      {% if device_state %}
+        <p style="color:#9ca3af;font-size:0.9rem;margin-bottom:8px">
+          Oeffne <strong>microsoft.com/devicelogin</strong> und gib diesen Code ein:
+        </p>
+        <a href="{{ device_state.verification_uri }}" target="_blank" class="auth-link">
+          &#128279; microsoft.com/devicelogin oeffnen
+        </a>
+        <div class="device-code">{{ device_state.user_code }}</div>
+        <div class="polling-indicator">
+          <div class="pulse"></div>
+          Warte auf Bestaetigung... (automatisch, kein Klick noetig)
+        </div>
+        <div class="expires-bar">
+          <div class="expires-fill" id="expires-fill" style="width:100%"></div>
+        </div>
+        <p style="color:#6b7280;font-size:0.75rem;margin-top:8px" id="expires-text">
+          Code gueltig fuer {{ device_state.expires_in }}s
+        </p>
       {% else %}
-      <p><strong>Schritt 1:</strong> Autorisierungs-Link generieren.</p>
-      <button class="btn btn-primary" id="auth-btn" onclick="startAuth()">&#128279; Autorisierungs-Link generieren</button>
+        <p style="color:#9ca3af;font-size:0.9rem;margin-bottom:16px">
+          Klicke auf den Button. Du wirst zu Microsoft weitergeleitet und gibst dort einen Code ein.
+          Die Seite aktualisiert sich automatisch nach der Anmeldung.
+        </p>
+        <button class="btn btn-primary" id="auth-btn" onclick="startDeviceAuth()">
+          &#128279; Mit Microsoft anmelden
+        </button>
       {% endif %}
     </div>
   </div>
@@ -321,7 +396,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
   <div class="card">
     <h2>Datei suchen &amp; herunterladen</h2>
-    <p style="color:#9ca3af;font-size:0.85rem;margin-bottom:16px">Sucht direkt in OneDrive via Graph API. Laedt exakt eine Datei herunter nach /share/onedrive_downloads/.</p>
+    <p style="color:#9ca3af;font-size:0.85rem;margin-bottom:16px">Sucht direkt in OneDrive. Laedt exakt eine Datei nach /share/onedrive_downloads/.</p>
     <p style="color:#6b7280;font-size:0.78rem;margin-bottom:8px;font-weight:600">SUCHE (nur Dateiname)</p>
     <div class="dl-row">
       <input type="text" id="search-name" placeholder="Dateiname (z.B. urlaub.jpg)">
@@ -357,6 +432,37 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 const BASE = "{{ base }}";
 function apiUrl(path) { return BASE + path; }
 
+{% if device_state and not authenticated %}
+// Countdown und Auto-Reload bei erfolgreicher Auth
+const expiresIn = {{ device_state.expires_in }};
+const startTime = Date.now();
+const fill = document.getElementById('expires-fill');
+const txt = document.getElementById('expires-text');
+
+function updateCountdown() {
+  const elapsed = (Date.now() - startTime) / 1000;
+  const remaining = Math.max(0, expiresIn - elapsed);
+  const pct = (remaining / expiresIn) * 100;
+  if (fill) fill.style.width = pct + '%';
+  if (txt) txt.textContent = 'Code gueltig fuer ' + Math.round(remaining) + 's';
+  if (remaining <= 0) { location.reload(); return; }
+  setTimeout(updateCountdown, 1000);
+}
+updateCountdown();
+
+// Poll ob Auth erfolgreich
+async function pollAuthStatus() {
+  const res = await fetch(apiUrl('/api/auth_status'));
+  const d = await res.json();
+  if (d.authenticated) {
+    location.reload();
+  } else {
+    setTimeout(pollAuthStatus, 3000);
+  }
+}
+setTimeout(pollAuthStatus, 3000);
+{% endif %}
+
 let pendingChanges = {};
 function showToast(msg, ok=true) {
   const t = document.getElementById('toast');
@@ -373,32 +479,17 @@ function toggleFolder(path, enabled) { updateConfig(path, 'sync', enabled); }
 function toggleCustomPath(path, useStandard) {
   updateConfig(path, 'custom_local_path', useStandard ? null : '/share/');
 }
-async function startAuth() {
+async function startDeviceAuth() {
   const btn = document.getElementById('auth-btn');
-  btn.textContent = 'Wird generiert...';
+  btn.textContent = 'Wird gestartet...';
   btn.disabled = true;
-  const res = await fetch(apiUrl('/auth/start'), {method: 'POST'});
+  const res = await fetch(apiUrl('/auth/device/start'), {method: 'POST'});
   if (res.ok) { location.reload(); }
   else {
     const d = await res.json();
     showToast('Fehler: ' + (d.error || 'unbekannt'), false);
-    btn.textContent = 'Autorisierungs-Link generieren';
+    btn.textContent = 'Mit Microsoft anmelden';
     btn.disabled = false;
-  }
-}
-async function submitAuth() {
-  const code = document.getElementById('auth-code').value.trim();
-  if (!code) return;
-  const res = await fetch(apiUrl('/auth/complete'), {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({response_url: code})
-  });
-  const d = await res.json();
-  if (res.ok) { showToast('Authentifizierung erfolgreich'); setTimeout(() => location.reload(), 1500); }
-  else {
-    showToast('Fehler: ' + (d.error_short || d.error || 'unbekannt'), false);
-    setTimeout(() => location.reload(), 2000);
   }
 }
 async function saveConfig() {
@@ -467,8 +558,10 @@ async function downloadByPath() {
 setInterval(async () => {
   const res = await fetch(apiUrl('/api/status'));
   const data = await res.json();
-  document.getElementById('last-sync').textContent = data.last_sync || 'Noch kein Sync';
-  document.getElementById('files-synced').textContent = data.files_synced;
+  if (document.getElementById('last-sync'))
+    document.getElementById('last-sync').textContent = data.last_sync || 'Noch kein Sync';
+  if (document.getElementById('files-synced'))
+    document.getElementById('files-synced').textContent = data.files_synced;
 }, 30000);
 </script>
 </body>
@@ -482,15 +575,7 @@ def index():
     authenticated = is_authenticated()
     folders = get_local_folders() if authenticated else []
     base = get_base()
-    auth_url = None
-    debug_log = None
-    if not authenticated:
-        if os.path.exists(AUTH_URL_FILE):
-            with open(AUTH_URL_FILE) as f:
-                auth_url = f.read().strip()
-        if os.path.exists(AUTH_DEBUG_LOG):
-            with open(AUTH_DEBUG_LOG) as f:
-                debug_log = f.read()
+    device_state = load_device_state() if not authenticated else None
     log = ""
     if os.path.exists(LOG_FILE):
         with open(LOG_FILE) as f:
@@ -499,76 +584,61 @@ def index():
         HTML_TEMPLATE,
         config=config, status=status, authenticated=authenticated,
         folders=folders, filter_options=FILTER_OPTIONS,
-        delete_options=DELETE_OPTIONS, auth_url=auth_url,
-        debug_log=debug_log, log=log,
-        base=base, is_direct=IS_DIRECT
+        delete_options=DELETE_OPTIONS, device_state=device_state,
+        log=log, base=base, is_direct=IS_DIRECT
     )
 
 
-@app.route('/auth/start', methods=['POST'])
-def auth_start():
-    if os.path.exists(AUTH_DEBUG_LOG):
-        os.remove(AUTH_DEBUG_LOG)
-    auth_log("=== Neuer Auth-Versuch ===")
+@app.route('/auth/device/start', methods=['POST'])
+def device_auth_start():
+    """Startet Device Code Flow: holt device_code + user_code von Microsoft."""
+    global _poll_thread, _poll_stop
     try:
         os.makedirs(ONEDRIVE_CONFIG_DIR, exist_ok=True)
-        for f in [AUTH_URL_FILE, RESPONSE_URL_FILE]:
-            if os.path.exists(f):
-                os.remove(f)
-        proc = subprocess.Popen(
-            ["onedrive", "--confdir", ONEDRIVE_CONFIG_DIR,
-             "--auth-files", f"{AUTH_URL_FILE}:{RESPONSE_URL_FILE}"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        result, err = ms_post(DEVICE_AUTH_URL, {
+            "client_id": CLIENT_ID,
+            "scope": SCOPE,
+        })
+        if err:
+            auth_log(f"Device Auth Fehler: {err}")
+            return jsonify({"success": False, "error": err.get("error_description", str(err))}), 500
+
+        auth_log(f"Device Code erhalten: user_code={result.get('user_code')}")
+
+        state = {
+            "user_code": result["user_code"],
+            "device_code": result["device_code"],
+            "verification_uri": result["verification_uri"],
+            "expires_in": result["expires_in"],
+            "interval": result.get("interval", 5),
+            "created_at": time.time()
+        }
+        save_device_state(state)
+
+        # Stoppe alten Polling-Thread falls vorhanden
+        _poll_stop.set()
+        if _poll_thread and _poll_thread.is_alive():
+            _poll_thread.join(timeout=2)
+
+        # Starte neuen Polling-Thread
+        _poll_stop = threading.Event()
+        expires_at = time.time() + result["expires_in"]
+        _poll_thread = threading.Thread(
+            target=poll_for_token,
+            args=(result["device_code"], result.get("interval", 5), expires_at),
+            daemon=True
         )
-        for _ in range(30):
-            time.sleep(0.5)
-            if os.path.exists(AUTH_URL_FILE):
-                break
-        proc.kill()
-        proc.wait()
-        if os.path.exists(AUTH_URL_FILE):
-            with open(AUTH_URL_FILE) as f:
-                url = f.read().strip()
-            auth_log(f"authUrl erstellt, Laenge: {len(url)}")
-            if url:
-                return jsonify({"success": True, "url": url})
-        auth_log("FEHLER: authUrl nicht erstellt")
-        return jsonify({"success": False, "error": "authUrl nicht erstellt"}), 500
+        _poll_thread.start()
+
+        return jsonify({"success": True})
     except Exception as e:
-        auth_log(f"EXCEPTION: {e}")
+        auth_log(f"EXCEPTION device_auth_start: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route('/auth/complete', methods=['POST'])
-def auth_complete():
-    data = request.json
-    response_url = data.get('response_url', '').strip()
-    auth_log("=== auth/complete ===")
-    auth_log(f"Laenge: {len(response_url)}, Anfang: {response_url[:80]}")
-    auth_log(f"Sonderzeichen: *={response_url.count('*')} !={response_url.count('!')} $={response_url.count('$')}")
-    try:
-        if not os.path.exists(AUTH_URL_FILE):
-            return jsonify({"success": False, "error": "Session abgelaufen - Link neu generieren", "error_short": "Session abgelaufen"}), 400
-        with open(RESPONSE_URL_FILE, 'w') as f:
-            f.write(response_url)
-        result = subprocess.run(
-            ["onedrive", "--confdir", ONEDRIVE_CONFIG_DIR,
-             "--auth-files", f"{AUTH_URL_FILE}:{RESPONSE_URL_FILE}"],
-            capture_output=True, text=True, timeout=60
-        )
-        auth_log(f"exit: {result.returncode}, stdout: {result.stdout[:500]}, stderr: {result.stderr[:500]}")
-        if os.path.exists(f"{ONEDRIVE_CONFIG_DIR}/refresh_token"):
-            auth_log("SUCCESS")
-            return jsonify({"success": True})
-        short_err = "Unbekannter Fehler"
-        for line in (result.stdout + result.stderr).splitlines():
-            if "AADSTS" in line or "Error Reason" in line:
-                short_err = line.strip()[:80]
-                break
-        return jsonify({"success": False, "error": result.stderr or result.stdout, "error_short": short_err}), 400
-    except Exception as e:
-        auth_log(f"EXCEPTION: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+@app.route('/api/auth_status')
+def auth_status():
+    return jsonify({"authenticated": is_authenticated()})
 
 
 @app.route('/api/search', methods=['POST'])
@@ -588,7 +658,8 @@ def search_file():
             parent = item.get("parentReference", {})
             parent_path = parent.get("path", "")
             clean_path = parent_path.split("root:", 1)[1].strip("/") if "root:" in parent_path else parent_path
-            locations.append({"item_id": item["id"], "name": item["name"], "path": clean_path or "/", "size": item.get("size", 0)})
+            locations.append({"item_id": item["id"], "name": item["name"],
+                               "path": clean_path or "/", "size": item.get("size", 0)})
         return jsonify({"success": True, "found": len(locations), "locations": locations})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
