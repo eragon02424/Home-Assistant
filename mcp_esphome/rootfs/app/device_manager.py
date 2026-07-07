@@ -1,6 +1,6 @@
 """Device Manager - handles ESPHome device discovery and heartbeat history.
 
-Architecture (v0.11.0):
+Architecture (v0.14.0):
 ───────────────────────
 DISCOVERY (at startup, then every DISCOVERY_INTERVAL_SECONDS)
   Fetch /devices. For every device not yet known: register it (address,
@@ -35,21 +35,17 @@ mDNS LISTENER (global)
 PERSISTENCE / HISTORY
   Every state transition (connected/disconnected) is appended to
   device.heartbeat_events and immediately written to
-  /data/mcp_esphome/heartbeat_<name>.json. This file is the durable
-  source of truth and is reloaded on addon/HA restart via
-  _load_heartbeat_history(), so online/offline history survives restarts.
+  /data/mcp_esphome/heartbeat_<name>.json. Reloaded on restart, so
+  online/offline history survives restarts.
 
-  list_devices() exposes, per device:
-    - last_online_duration_seconds / last_offline_duration_seconds:
-      duration of the last COMPLETED period of that kind (frozen once
-      that period ended).
-    - current_online_elapsed_seconds / current_offline_elapsed_seconds:
-      live elapsed time of the CURRENT period, only one of the two is
-      non-None depending on device.online.
+DEBUG LOGS (LogManager, optional)
+  On every ONLINE transition, DeviceManager starts a persistent
+  aioesphomeapi log-subscription task for that device (LogManager.start).
+  On every OFFLINE transition, that task is cancelled (LogManager.stop).
+  Verified by direct testing (see log_manager.py) that this coexists
+  cleanly with the TCP-ping keepalive without connection interference.
 
 Every TCP ping attempt logs its duration in ms.
-
-ZERO aioesphomeapi.
 """
 import asyncio
 import json
@@ -142,6 +138,7 @@ class DeviceManager:
         keepalive_ping_timeout_ms: int = 500,
         keepalive_max_backoff_seconds: int = 21600,
         bearer_token: str = "",
+        log_manager: Optional[object] = None,
     ):
         self.esphome_dashboard_url = esphome_dashboard_url.rstrip("/")
         self.heartbeat_retention_seconds = heartbeat_retention_days * 86400
@@ -158,6 +155,7 @@ class DeviceManager:
             keepalive_max_backoff_seconds,
         )
         self.bearer_token = load_or_generate_bearer_token(bearer_token)
+        self.log_manager = log_manager
         self.devices: dict[str, DeviceState] = {}
         self._azeroconf: Optional[object] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -453,6 +451,8 @@ class DeviceManager:
             self._prune_heartbeat(device_name)
             self._save_heartbeat_history(device_name)
             _LOGGER.info("State → ONLINE: %s", device_name)
+            if self.log_manager is not None:
+                self.log_manager.start(device_name, device.address, device.noise_psk)
         device.last_seen = now
 
     def _mark_offline(self, device_name: str):
@@ -467,6 +467,8 @@ class DeviceManager:
             self._prune_heartbeat(device_name)
             self._save_heartbeat_history(device_name)
             _LOGGER.info("State → OFFLINE: %s", device_name)
+            if self.log_manager is not None:
+                self.log_manager.stop(device_name)
 
     # ── Public query API ──────────────────────────────────────
 
