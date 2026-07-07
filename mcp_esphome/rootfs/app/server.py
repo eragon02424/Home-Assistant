@@ -69,6 +69,11 @@ async def main():
     # wake_events exist and announces during discovery aren't lost.
     await device_manager.start_mdns_listener()
 
+    # Share the addon's single AsyncZeroconf instance with LogManager so
+    # every aioesphomeapi log-subscription client reuses it instead of
+    # each spinning up (and tearing down) its own for .local resolution.
+    log_manager.set_zeroconf_instance(device_manager.get_zeroconf_instance())
+
     _LOGGER.info("Running initial device discovery...")
     await device_manager.run_initial_discovery()
     _LOGGER.info("Initial discovery complete — %d device(s) with keepalive tasks",
