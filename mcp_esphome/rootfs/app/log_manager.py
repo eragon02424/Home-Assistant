@@ -5,28 +5,32 @@ Verified by direct testing before implementation:
     lines if log_level is explicitly set (log_level=None yields zero
     lines, even over 60s of observation).
   - client.connect(on_stop=<async callback>) fires on_stop(expected: bool)
-    exactly when the connection drops. on_stop must be an async function
-    (Callable[[bool], Coroutine]), not a plain sync callback.
-  - No connection resets or interference were observed between this
-    log-subscription connection and the addon's separate TCP-ping
-    keepalive connections to the same device over a 30-40s test window.
+    exactly when the connection drops. on_stop must be an async function.
+  - CRITICAL, found after initial rollout: APIClient(), when given a
+    ".local" hostname and NO explicit zeroconf_instance, spins up its
+    OWN temporary AsyncZeroconf internally for the mDNS lookup on every
+    connection attempt (see aioesphomeapi host_resolver.py). With ~7
+    devices' log-subscription tasks all retrying/reconnecting
+    concurrently, plus the addon's own persistent AsyncZeroconf mDNS
+    listener already bound to UDP 5353, this caused simultaneous
+    "Error while finishing connection: Finishing connection cancelled"
+    across ALL devices at once (confirmed: a single isolated test
+    connection succeeded fine in isolation, but failed identically to
+    all 7 devices when run concurrently inside the addon). Fix: share
+    the addon's existing AsyncZeroconf instance
+    (ZeroconfInstanceType = Zeroconf | AsyncZeroconf, confirmed via
+    aioesphomeapi source) via APIClient(..., zeroconf_instance=...)
+    instead of letting every client create/tear down its own.
+  - CRITICAL: every attempt must explicitly call client.disconnect() in
+    a finally block, even on task cancellation (stop()). Without this,
+    cancelling the task on every offline transition abandons the
+    connection without a clean close, leaking a slot against the ESP's
+    small max-connections limit (observed: 5).
 
 Architecture:
   - One persistent aioesphomeapi connection per device, started when
     DeviceManager marks a device online, stopped (task cancelled) when
-    marked offline. On unexpected disconnect the connection retries
-    every RETRY_SECONDS until the task is cancelled.
-  - CRITICAL: every attempt explicitly calls client.disconnect() in a
-    finally block, regardless of whether the loop iteration ended via
-    normal disconnect, an exception, or task cancellation (stop()).
-    Without this, cancelling the task (as stop() does on every offline
-    transition) abandons the connection without a clean close — the ESP
-    only has a small max-connections limit (observed: 5), and repeated
-    online/offline flapping without a clean disconnect exhausts it
-    within minutes, causing "Max connections, rejecting" on the device
-    for ALL clients (including our own TCP-ping keepalive and ESPHome
-    itself). This was found and fixed after observing exactly that
-    warning while testing.
+    marked offline. Retries every RETRY_SECONDS on disconnect.
   - Every received log line is appended as one JSON line to
     /data/mcp_esphome/esplog_<name>.jsonl: {"ts": <epoch float>, "message": <str>}.
   - A periodic prune task rewrites each log file keeping only entries
@@ -63,7 +67,15 @@ class LogManager:
     def __init__(self, retention_days: int):
         self.retention_seconds = retention_days * 86400
         self.tasks: dict[str, asyncio.Task] = {}
+        self.zeroconf_instance: Optional[object] = None
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    def set_zeroconf_instance(self, instance: object):
+        """Share the addon's existing AsyncZeroconf instance so every
+        aioesphomeapi client reuses it instead of creating its own.
+        Must be called before the first start().
+        """
+        self.zeroconf_instance = instance
 
     def _log_file(self, device_name: str) -> Path:
         return STORAGE_DIR / f"esplog_{device_name.replace('/', '_')}.jsonl"
@@ -90,7 +102,11 @@ class LogManager:
 
     async def _run(self, device_name: str, address: str, noise_psk: Optional[str]):
         while True:
-            client = APIClient(address, 6053, None, noise_psk=noise_psk)
+            client = APIClient(
+                address, 6053, None,
+                noise_psk=noise_psk,
+                zeroconf_instance=self.zeroconf_instance,
+            )
             stop_event = asyncio.Event()
 
             async def on_stop(expected, ev=stop_event):
@@ -116,10 +132,6 @@ class LogManager:
                 _LOGGER.info("Log subscription error for %s: %s — retry in %ds",
                              device_name, err, RETRY_SECONDS)
             finally:
-                # Always close cleanly, whether we exit via normal
-                # disconnect, an exception, or task cancellation from
-                # stop(). Skipping this leaks a connection slot on the
-                # ESP (max-connections limit observed at 5).
                 try:
                     await client.disconnect()
                 except Exception:
