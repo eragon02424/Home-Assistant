@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""OneDrive SyncServer - Web UI Backend"""
+"""OneDrive SyncServer - Web UI Backend
+Aufruf: python3 server.py [PORT]
+  Port 8765 = Ingress (BASE aus X-Ingress-Path Header)
+  Port 8766 = Direktzugriff Auth-Seite (BASE immer leer)
+"""
 
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -12,6 +17,9 @@ import urllib.error
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
+
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+IS_DIRECT = (PORT == 8766)  # Direktzugriff ohne Ingress
 
 CONFIG_DIR = "/data"
 SYNC_CONFIG = f"{CONFIG_DIR}/sync_config.json"
@@ -35,7 +43,7 @@ def auth_log(msg):
 def get_access_token():
     rt_file = f"{ONEDRIVE_CONFIG_DIR}/refresh_token"
     if not os.path.exists(rt_file):
-        raise Exception("Kein refresh_token – bitte zuerst authentifizieren")
+        raise Exception("Kein refresh_token - bitte zuerst authentifizieren")
     with open(rt_file) as f:
         refresh_token = f.read().strip()
     data = urllib.parse.urlencode({
@@ -110,13 +118,11 @@ def get_local_folders():
             folders.append(rel)
     return sorted(folders)
 
-def get_ingress_base():
-    """
-    HA Ingress setzt den Header X-Ingress-Path auf den Basispfad
-    z.B. /api/hassio_ingress/abc123
-    Dieser Pfad wird an alle fetch()-Aufrufe im JS vorangestellt.
-    Ausserhalb von Ingress (direkter Aufruf) ist der Header nicht gesetzt -> leer.
-    """
+def get_base():
+    # Direktzugriff (Port 8766): BASE leer, fetch() nutzt relativen Pfad direkt
+    # Ingress (Port 8765): BASE aus X-Ingress-Path Header
+    if IS_DIRECT:
+        return ""
     return request.headers.get("X-Ingress-Path", "").rstrip("/")
 
 FILTER_OPTIONS = [
@@ -150,6 +156,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   .header { background: #1f2937; border-bottom: 1px solid #374151;
              padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
   .header h1 { font-size: 1.25rem; font-weight: 600; }
+  .direct-badge { background: #f59e0b; color: #111; font-size: 0.7rem;
+                   padding: 2px 8px; border-radius: 4px; font-weight: 600; }
   .container { max-width: 1000px; margin: 0 auto; padding: 24px; }
   .card { background: #1f2937; border: 1px solid #374151; border-radius: 12px;
           padding: 20px; margin-bottom: 20px; }
@@ -167,7 +175,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                   font-size: 0.8rem; color: #60a5fa; user-select: all; cursor: pointer; }
   .auth-debug-box { background: #111827; border: 1px solid #374151; border-radius: 6px;
                     padding: 10px; margin-top: 12px; font-family: monospace; font-size: 0.75rem;
-                    color: #9ca3af; max-height: 150px; overflow-y: auto; white-space: pre-wrap; }
+                    color: #9ca3af; max-height: 200px; overflow-y: auto; white-space: pre-wrap; }
   .btn { padding: 8px 16px; border-radius: 6px; border: none; cursor: pointer;
          font-size: 0.9rem; font-weight: 500; margin-right: 4px; }
   .btn-primary { background: #3b82f6; color: white; }
@@ -217,6 +225,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <div class="header">
   <span style="font-size:1.5rem">&#9729;</span>
   <h1>OneDrive SyncServer</h1>
+  {% if is_direct %}<span class="direct-badge">Direktzugriff Port 8766</span>{% endif %}
 </div>
 <div class="container">
 
@@ -347,13 +356,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <div class="toast" id="toast"></div>
 
 <script>
-// Ingress-Basispfad wird vom Server als Jinja-Variable injiziert.
-// Ausserhalb von Ingress ist dieser leer.
-const BASE = "{{ ingress_base }}";
-
-function apiUrl(path) {
-  return BASE + path;
-}
+const BASE = "{{ base }}";
+function apiUrl(path) { return BASE + path; }
 
 let pendingChanges = {};
 function showToast(msg, ok=true) {
@@ -479,7 +483,7 @@ def index():
     status = load_status()
     authenticated = is_authenticated()
     folders = get_local_folders() if authenticated else []
-    ingress_base = get_ingress_base()
+    base = get_base()
     auth_url = None
     debug_log = None
     if not authenticated:
@@ -499,7 +503,7 @@ def index():
         folders=folders, filter_options=FILTER_OPTIONS,
         delete_options=DELETE_OPTIONS, auth_url=auth_url,
         debug_log=debug_log, log=log,
-        ingress_base=ingress_base
+        base=base, is_direct=IS_DIRECT
     )
 
 
@@ -513,7 +517,6 @@ def auth_start():
         for f in [AUTH_URL_FILE, RESPONSE_URL_FILE]:
             if os.path.exists(f):
                 os.remove(f)
-        auth_log("Starte onedrive --auth-files Prozess...")
         proc = subprocess.Popen(
             ["onedrive", "--confdir", ONEDRIVE_CONFIG_DIR,
              "--auth-files", f"{AUTH_URL_FILE}:{RESPONSE_URL_FILE}"],
@@ -531,10 +534,10 @@ def auth_start():
             auth_log(f"authUrl erstellt, Laenge: {len(url)}")
             if url:
                 return jsonify({"success": True, "url": url})
-        auth_log("FEHLER: authUrl Datei nicht erstellt")
-        return jsonify({"success": False, "error": "authUrl Datei nicht erstellt"}), 500
+        auth_log("FEHLER: authUrl nicht erstellt")
+        return jsonify({"success": False, "error": "authUrl nicht erstellt"}), 500
     except Exception as e:
-        auth_log(f"EXCEPTION in auth_start: {e}")
+        auth_log(f"EXCEPTION: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -542,39 +545,32 @@ def auth_start():
 def auth_complete():
     data = request.json
     response_url = data.get('response_url', '').strip()
-    auth_log("=== auth/complete aufgerufen ===")
-    auth_log(f"response_url Laenge: {len(response_url)}")
-    auth_log(f"response_url Anfang: {response_url[:100]}")
-    auth_log(f"Sonderzeichen: *={response_url.count('*')} !={response_url.count('!')} $={response_url.count('$')} %%={response_url.count('%')}")
+    auth_log("=== auth/complete ===")
+    auth_log(f"Laenge: {len(response_url)}, Anfang: {response_url[:80]}")
+    auth_log(f"Sonderzeichen: *={response_url.count('*')} !={response_url.count('!')} $={response_url.count('$')}")
     try:
         if not os.path.exists(AUTH_URL_FILE):
-            auth_log("FEHLER: authUrl Datei fehlt")
-            return jsonify({"success": False, "error": "Auth-Session abgelaufen – Link neu generieren", "error_short": "Session abgelaufen"}), 400
+            return jsonify({"success": False, "error": "Session abgelaufen - Link neu generieren", "error_short": "Session abgelaufen"}), 400
         with open(RESPONSE_URL_FILE, 'w') as f:
             f.write(response_url)
-        auth_log("responseUrl geschrieben")
-        auth_log("Starte onedrive --auth-files...")
         result = subprocess.run(
             ["onedrive", "--confdir", ONEDRIVE_CONFIG_DIR,
              "--auth-files", f"{AUTH_URL_FILE}:{RESPONSE_URL_FILE}"],
             capture_output=True, text=True, timeout=60
         )
-        auth_log(f"exit code: {result.returncode}")
-        auth_log(f"stdout: {result.stdout[:800]}")
-        auth_log(f"stderr: {result.stderr[:800]}")
+        auth_log(f"exit: {result.returncode}, stdout: {result.stdout[:500]}, stderr: {result.stderr[:500]}")
         if os.path.exists(f"{ONEDRIVE_CONFIG_DIR}/refresh_token"):
-            auth_log("SUCCESS: refresh_token erstellt")
+            auth_log("SUCCESS")
             return jsonify({"success": True})
         short_err = "Unbekannter Fehler"
         for line in (result.stdout + result.stderr).splitlines():
             if "AADSTS" in line or "Error Reason" in line:
                 short_err = line.strip()[:80]
                 break
-        auth_log(f"FEHLER: {short_err}")
         return jsonify({"success": False, "error": result.stderr or result.stdout, "error_short": short_err}), 400
     except Exception as e:
         auth_log(f"EXCEPTION: {e}")
-        return jsonify({"success": False, "error": str(e), "error_short": str(e)[:80]}), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route('/api/search', methods=['POST'])
@@ -593,16 +589,8 @@ def search_file():
         for item in exact:
             parent = item.get("parentReference", {})
             parent_path = parent.get("path", "")
-            if "root:" in parent_path:
-                clean_path = parent_path.split("root:", 1)[1].strip("/")
-            else:
-                clean_path = parent_path
-            locations.append({
-                "item_id": item["id"],
-                "name": item["name"],
-                "path": clean_path or "/",
-                "size": item.get("size", 0)
-            })
+            clean_path = parent_path.split("root:", 1)[1].strip("/") if "root:" in parent_path else parent_path
+            locations.append({"item_id": item["id"], "name": item["name"], "path": clean_path or "/", "size": item.get("size", 0)})
         return jsonify({"success": True, "found": len(locations), "locations": locations})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -635,12 +623,10 @@ def download_by_path():
     try:
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         token = get_access_token()
-        full_path = f"{onedrive_path}/{filename}"
-        encoded_path = urllib.parse.quote(full_path)
+        encoded_path = urllib.parse.quote(f"{onedrive_path}/{filename}")
         item = graph_get(token, f"/me/drive/root:/{encoded_path}")
-        item_id = item["id"]
         dest = os.path.join(DOWNLOAD_DIR, filename)
-        graph_download(token, item_id, dest)
+        graph_download(token, item["id"], dest)
         return jsonify({"success": True, "local_path": dest})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -674,4 +660,4 @@ def trigger_sync():
 if __name__ == '__main__':
     os.makedirs(CONFIG_DIR, exist_ok=True)
     os.makedirs(ONEDRIVE_CONFIG_DIR, exist_ok=True)
-    app.run(host='0.0.0.0', port=8765, debug=False)
+    app.run(host='0.0.0.0', port=PORT, debug=False)
