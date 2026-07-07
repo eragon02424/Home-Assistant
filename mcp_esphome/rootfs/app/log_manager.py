@@ -10,23 +10,27 @@ Verified by direct testing before implementation:
   - No connection resets or interference were observed between this
     log-subscription connection and the addon's separate TCP-ping
     keepalive connections to the same device over a 30-40s test window.
-    This is expected: the keepalive opens/closes bare TCP connections
-    with no ESPHome protocol handshake, while this is a single
-    persistent Noise-encrypted API connection — they don't share state.
 
 Architecture:
   - One persistent aioesphomeapi connection per device, started when
     DeviceManager marks a device online, stopped (task cancelled) when
     marked offline. On unexpected disconnect the connection retries
     every RETRY_SECONDS until the task is cancelled.
+  - CRITICAL: every attempt explicitly calls client.disconnect() in a
+    finally block, regardless of whether the loop iteration ended via
+    normal disconnect, an exception, or task cancellation (stop()).
+    Without this, cancelling the task (as stop() does on every offline
+    transition) abandons the connection without a clean close — the ESP
+    only has a small max-connections limit (observed: 5), and repeated
+    online/offline flapping without a clean disconnect exhausts it
+    within minutes, causing "Max connections, rejecting" on the device
+    for ALL clients (including our own TCP-ping keepalive and ESPHome
+    itself). This was found and fixed after observing exactly that
+    warning while testing.
   - Every received log line is appended as one JSON line to
     /data/mcp_esphome/esplog_<name>.jsonl: {"ts": <epoch float>, "message": <str>}.
   - A periodic prune task rewrites each log file keeping only entries
-    newer than retention_days, so old data doesn't grow forever and
-    survives HA/addon restarts up to the retention window (the file
-    itself persists across restarts; only in-flight retry loops need
-    to be re-started via _mark_online after restart, same lifecycle as
-    the keepalive task).
+    newer than retention_days.
 """
 import asyncio
 import json
@@ -82,17 +86,17 @@ class LogManager:
         task = self.tasks.get(device_name)
         if task is not None and not task.done():
             task.cancel()
-            _LOGGER.info("Log subscription task stopped for %s", device_name)
+            _LOGGER.info("Log subscription task cancel requested for %s", device_name)
 
     async def _run(self, device_name: str, address: str, noise_psk: Optional[str]):
         while True:
+            client = APIClient(address, 6053, None, noise_psk=noise_psk)
+            stop_event = asyncio.Event()
+
+            async def on_stop(expected, ev=stop_event):
+                ev.set()
+
             try:
-                client = APIClient(address, 6053, None, noise_psk=noise_psk)
-                stop_event = asyncio.Event()
-
-                async def on_stop(expected, ev=stop_event):
-                    ev.set()
-
                 await client.connect(login=False, on_stop=on_stop)
 
                 def on_log(msg, dn=device_name):
@@ -111,6 +115,17 @@ class LogManager:
             except Exception as err:
                 _LOGGER.info("Log subscription error for %s: %s — retry in %ds",
                              device_name, err, RETRY_SECONDS)
+            finally:
+                # Always close cleanly, whether we exit via normal
+                # disconnect, an exception, or task cancellation from
+                # stop(). Skipping this leaks a connection slot on the
+                # ESP (max-connections limit observed at 5).
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                _LOGGER.info("Log subscription connection closed for %s", device_name)
+
             await asyncio.sleep(RETRY_SECONDS)
 
     def _append(self, device_name: str, line: str):
