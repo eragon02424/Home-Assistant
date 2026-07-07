@@ -2,9 +2,11 @@
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
+import aiohttp
 from aiohttp import web
 
 from device_manager import DeviceManager
@@ -28,6 +30,31 @@ def load_options() -> dict:
     return {}
 
 
+async def fetch_ha_timezone() -> str | None:
+    """Reads Home Assistant's configured timezone via the Supervisor's
+    Core API proxy. Used to give aioesphomeapi an explicit timezone so
+    it skips its own get_local_timezone() lookup entirely (see
+    log_manager.py docstring for why that lookup is unsafe here).
+    """
+    token = os.environ.get("SUPERVISOR_TOKEN", "")
+    if not token:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "http://supervisor/core/api/config",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                return data.get("time_zone")
+    except Exception as err:
+        _LOGGER.warning("Could not fetch HA timezone from Supervisor: %s", err)
+        return None
+
+
 async def main():
     opts = load_options()
 
@@ -40,8 +67,11 @@ async def main():
     keepalive_ping_timeout_ms = opts.get("keepalive_ping_timeout_ms", 500)
     keepalive_max_backoff_seconds = opts.get("keepalive_max_backoff_seconds", 21600)
     log_retention_days = opts.get("log_retention_days", 10)
+    configured_timezone = opts.get("timezone", "") or None
 
-    log_manager = LogManager(retention_days=log_retention_days)
+    timezone = configured_timezone or await fetch_ha_timezone()
+
+    log_manager = LogManager(retention_days=log_retention_days, timezone=timezone)
 
     device_manager = DeviceManager(
         esphome_dashboard_url=esphome_dashboard_url,
@@ -62,6 +92,7 @@ async def main():
                  keepalive_interval, keepalive_retries, keepalive_ping_timeout_ms,
                  keepalive_max_backoff_seconds)
     _LOGGER.info("Log retention: %d days", log_retention_days)
+    _LOGGER.info("Timezone for aioesphomeapi clients: %s", timezone)
     _LOGGER.info("Bearer Token: %s", device_manager.bearer_token)
     _LOGGER.info("=" * 60)
 
