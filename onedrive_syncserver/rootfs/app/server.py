@@ -3,10 +3,12 @@
 
 import json
 import os
-import signal
 import subprocess
 import threading
 import time
+import urllib.request
+import urllib.parse
+import urllib.error
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
@@ -21,6 +23,67 @@ DOWNLOAD_DIR = "/share/onedrive_downloads"
 LOG_FILE = f"{CONFIG_DIR}/sync.log"
 STATUS_FILE = f"{CONFIG_DIR}/sync_status.json"
 
+# abraunegg/onedrive client_id (from logs: d50ca740-...)
+CLIENT_ID = "d50ca740-c83f-4d1b-b616-12c519384f0c"
+TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+# --- Helper: Microsoft Graph API ---
+
+def get_access_token():
+    """Exchange refresh_token for access_token via Microsoft Identity Platform."""
+    rt_file = f"{ONEDRIVE_CONFIG_DIR}/refresh_token"
+    if not os.path.exists(rt_file):
+        raise Exception("Kein refresh_token – bitte zuerst authentifizieren")
+    with open(rt_file) as f:
+        refresh_token = f.read().strip()
+    data = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLIENT_ID,
+        "scope": "Files.ReadWrite offline_access"
+    }).encode()
+    req = urllib.request.Request(TOKEN_URL, data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        resp = urllib.request.urlopen(req, timeout=15)
+        token_data = json.loads(resp.read())
+        # Save new refresh_token if returned
+        if "refresh_token" in token_data:
+            with open(rt_file, "w") as f:
+                f.write(token_data["refresh_token"])
+        return token_data["access_token"]
+    except urllib.error.HTTPError as e:
+        body = json.loads(e.read())
+        raise Exception(f"Token-Fehler: {body.get('error_description', body.get('error'))}")
+
+def graph_get(access_token, path):
+    """GET request against Microsoft Graph API."""
+    url = f"{GRAPH_BASE}{path}"
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Bearer {access_token}")
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+        return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = json.loads(e.read())
+        raise Exception(f"Graph API Fehler {e.code}: {body.get('error', {}).get('message', str(e))}")
+
+def graph_download(access_token, item_id, dest_path):
+    """Download file content from Graph API by item ID."""
+    url = f"{GRAPH_BASE}/me/drive/items/{item_id}/content"
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Bearer {access_token}")
+    try:
+        resp = urllib.request.urlopen(req, timeout=60)
+        with open(dest_path, "wb") as f:
+            f.write(resp.read())
+    except urllib.error.HTTPError as e:
+        body = json.loads(e.read())
+        raise Exception(f"Download-Fehler {e.code}: {body.get('error', {}).get('message', str(e))}")
+
+# --- Config / Status helpers ---
+
 def load_sync_config():
     if os.path.exists(SYNC_CONFIG):
         with open(SYNC_CONFIG) as f:
@@ -28,7 +91,7 @@ def load_sync_config():
     return {}
 
 def save_sync_config(config):
-    with open(SYNC_CONFIG, 'w') as f:
+    with open(SYNC_CONFIG, "w") as f:
         json.dump(config, f, indent=2)
 
 def load_status():
@@ -91,17 +154,17 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   .status-item { background: #111827; border-radius: 8px; padding: 12px; }
   .status-item .label { font-size: 0.75rem; color: #6b7280; margin-bottom: 4px; }
   .status-item .value { font-size: 1rem; font-weight: 600; }
-  .ok { color: #10b981; }
-  .error { color: #ef4444; }
+  .ok { color: #10b981; } .error-c { color: #ef4444; }
   .auth-box { background: #111827; border: 1px solid #3b82f6; border-radius: 8px; padding: 16px; }
   .auth-box p { color: #9ca3af; margin-bottom: 12px; font-size: 0.9rem; }
   .auth-url-box { background: #1f2937; border: 1px solid #374151; border-radius: 6px;
                   padding: 10px; margin-bottom: 12px; word-break: break-all;
                   font-size: 0.8rem; color: #60a5fa; user-select: all; cursor: pointer; }
   .btn { padding: 8px 16px; border-radius: 6px; border: none; cursor: pointer;
-         font-size: 0.9rem; font-weight: 500; }
+         font-size: 0.9rem; font-weight: 500; margin-right: 4px; }
   .btn-primary { background: #3b82f6; color: white; }
   .btn-success { background: #10b981; color: white; }
+  .btn-warn { background: #f59e0b; color: white; }
   .auth-input { width: 100%; background: #1f2937; border: 1px solid #374151;
                 color: #f9fafb; padding: 8px 12px; border-radius: 6px;
                 font-size: 0.9rem; margin: 8px 0; }
@@ -129,10 +192,19 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
            opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 100; }
   .toast.show { opacity: 1; }
   .error-item { color: #ef4444; font-size: 0.8rem; padding: 4px 0; }
-  .download-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
-  .download-row input { flex: 1; min-width: 150px; width: auto; }
-  .download-result { margin-top: 10px; font-size: 0.85rem; color: #10b981; }
-  .download-result.err { color: #ef4444; }
+  .dl-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  .dl-row input { flex: 1; min-width: 150px; width: auto; }
+  .dl-result { margin-top: 10px; font-size: 0.85rem; }
+  .dl-result.ok { color: #10b981; }
+  .dl-result.err { color: #ef4444; }
+  .search-results { margin-top: 12px; }
+  .search-result-item { display: flex; justify-content: space-between; align-items: center;
+                         padding: 8px 10px; background: #111827; border-radius: 6px;
+                         margin-bottom: 6px; font-size: 0.85rem; }
+  .search-result-item .path { color: #9ca3af; font-size: 0.78rem; margin-top: 2px; }
+  .search-result-item .dl-btn { background: #3b82f6; color: white; border: none;
+                                  padding: 4px 10px; border-radius: 4px; cursor: pointer;
+                                  font-size: 0.8rem; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -147,7 +219,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <div class="status-grid">
       <div class="status-item">
         <div class="label">Verbindung</div>
-        <div class="value {% if authenticated %}ok{% else %}error{% endif %}">
+        <div class="value {% if authenticated %}ok{% else %}error-c{% endif %}">
           {% if authenticated %}&#10003; Authentifiziert{% else %}&#10007; Nicht verbunden{% endif %}
         </div>
       </div>
@@ -172,10 +244,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <h2>Microsoft Anmeldung</h2>
     <div class="auth-box">
       {% if auth_url %}
-      <p><strong>Schritt 2:</strong> Klicke auf die URL unten um sie zu kopieren, offne sie in einem Browser, melde dich bei Microsoft an. Nach der Weiterleitung kopiere die komplette Antwort-URL aus der Adressleiste und fuge sie unten ein.</p>
+      <p><strong>Schritt 2:</strong> Klicke auf die URL um sie in die Zwischenablage zu kopieren. Oeffne sie im Browser, melde dich bei Microsoft an. Nach der Weiterleitung kopiere die <strong>komplette URL aus der Adressleiste</strong> (auch wenn sie "wrongplace" zeigt) und fuege sie unten ein.</p>
       <div class="auth-url-box" onclick="navigator.clipboard.writeText(this.textContent).then(()=>showToast('URL kopiert'))">{{ auth_url }}</div>
       <input type="text" class="auth-input" id="auth-code" placeholder="Antwort-URL (https://login.microsoftonline.com/common/oauth2/nativeclient?code=...)">
-      <button class="btn btn-primary" onclick="submitAuth()">Bestatigen</button>
+      <button class="btn btn-primary" onclick="submitAuth()">Bestaetigen</button>
       {% else %}
       <p><strong>Schritt 1:</strong> Klicke auf den Button um den Autorisierungs-Link zu generieren.</p>
       <button class="btn btn-primary" id="auth-btn" onclick="startAuth()">&#128279; Autorisierungs-Link generieren</button>
@@ -231,14 +303,27 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <h2>Einzelne Datei herunterladen</h2>
-    <p style="color:#9ca3af;font-size:0.85rem;margin-bottom:12px">Ladt eine einzelne Datei aus OneDrive herunter nach /share/onedrive_downloads/ – ohne den Sync-Ordner zu beeinflussen.</p>
-    <div class="download-row">
-      <input type="text" id="dl-path" placeholder="OneDrive-Pfad (z.B. Dokumente/Fotos/2024)">
-      <input type="text" id="dl-file" placeholder="Dateiname (z.B. urlaub.jpg)">
-      <button class="btn btn-primary" onclick="downloadFile()">&#8659; Herunterladen</button>
+    <h2>Datei suchen &amp; herunterladen</h2>
+    <p style="color:#9ca3af;font-size:0.85rem;margin-bottom:16px">
+      Sucht direkt in OneDrive (auch nicht synchronisierte Ordner). Laedt exakt eine Datei herunter nach /share/onedrive_downloads/.
+    </p>
+
+    <p style="color:#6b7280;font-size:0.78rem;margin-bottom:8px;font-weight:600">SUCHE (nur Dateiname – findet alle Treffer in OneDrive)</p>
+    <div class="dl-row">
+      <input type="text" id="search-name" placeholder="Dateiname (z.B. urlaub.jpg)">
+      <button class="btn btn-primary" onclick="searchFile()">&#128269; Suchen</button>
     </div>
-    <div id="dl-result"></div>
+    <div id="search-results" class="search-results"></div>
+
+    <hr style="border-color:#374151;margin:16px 0">
+
+    <p style="color:#6b7280;font-size:0.78rem;margin-bottom:8px;font-weight:600">DIREKTER DOWNLOAD (Pfad + Dateiname – eindeutig)</p>
+    <div class="dl-row">
+      <input type="text" id="dl-path" placeholder="OneDrive-Pfad (z.B. Fotos/2024/Italien)">
+      <input type="text" id="dl-file" placeholder="Dateiname (z.B. urlaub.jpg)">
+      <button class="btn btn-success" onclick="downloadByPath()">&#8659; Herunterladen</button>
+    </div>
+    <div id="dl-result" class="dl-result"></div>
   </div>
 
   <div class="card">
@@ -295,15 +380,11 @@ async function submitAuth() {
     body: JSON.stringify({response_url: code})
   });
   if (res.ok) { showToast('Authentifizierung erfolgreich'); setTimeout(() => location.reload(), 1500); }
-  else {
-    const d = await res.json();
-    showToast('Fehler: ' + (d.error || 'unbekannt'), false);
-  }
+  else { const d = await res.json(); showToast('Fehler: ' + (d.error || 'unbekannt'), false); }
 }
 async function saveConfig() {
   const res = await fetch('/api/config', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
+    method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(pendingChanges)
   });
   if (res.ok) { showToast('Konfiguration gespeichert'); pendingChanges = {}; }
@@ -314,25 +395,61 @@ async function triggerSync() {
   await fetch('/api/sync', {method: 'POST'});
   setTimeout(() => location.reload(), 3000);
 }
-async function downloadFile() {
+async function searchFile() {
+  const name = document.getElementById('search-name').value.trim();
+  if (!name) return;
+  const container = document.getElementById('search-results');
+  container.innerHTML = '<p style="color:#9ca3af;font-size:0.85rem">Suche laeuft...</p>';
+  const res = await fetch('/api/search', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({filename: name})
+  });
+  const d = await res.json();
+  if (!res.ok) {
+    container.innerHTML = '<p style="color:#ef4444;font-size:0.85rem">Fehler: ' + (d.error || 'unbekannt') + '</p>';
+    return;
+  }
+  if (d.found === 0) {
+    container.innerHTML = '<p style="color:#f59e0b;font-size:0.85rem">Keine Treffer gefunden.</p>';
+    return;
+  }
+  let html = '<p style="color:#9ca3af;font-size:0.78rem;margin-bottom:8px">' + d.found + ' Treffer gefunden:</p>';
+  d.locations.forEach(loc => {
+    html += '<div class="search-result-item">' +
+      '<div><div>' + loc.name + '</div><div class="path">' + loc.path + '</div></div>' +
+      '<button class="dl-btn" onclick="downloadById(\'' + loc.item_id + '\', \'' + loc.name + '\')">&#8659; Download</button>' +
+      '</div>';
+  });
+  container.innerHTML = html;
+}
+async function downloadById(itemId, filename) {
+  showToast('Download gestartet...');
+  const res = await fetch('/api/download_by_id', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({item_id: itemId, filename: filename})
+  });
+  const d = await res.json();
+  if (res.ok) { showToast('Gespeichert: ' + d.local_path); }
+  else { showToast('Fehler: ' + (d.error || 'unbekannt'), false); }
+}
+async function downloadByPath() {
   const path = document.getElementById('dl-path').value.trim();
   const file = document.getElementById('dl-file').value.trim();
   const result = document.getElementById('dl-result');
-  if (!path || !file) { showToast('Pfad und Dateiname benotigt', false); return; }
+  if (!path || !file) { showToast('Pfad und Dateiname benoetigt', false); return; }
   result.textContent = 'Wird heruntergeladen...';
-  result.className = 'download-result';
-  const res = await fetch('/api/download', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({path, filename: file})
+  result.className = 'dl-result';
+  const res = await fetch('/api/download_by_path', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({path: path, filename: file})
   });
   const d = await res.json();
   if (res.ok) {
     result.textContent = 'Gespeichert: ' + d.local_path;
-    result.className = 'download-result';
+    result.className = 'dl-result ok';
   } else {
     result.textContent = 'Fehler: ' + (d.error || 'unbekannt');
-    result.className = 'download-result err';
+    result.className = 'dl-result err';
   }
 }
 setInterval(async () => {
@@ -344,6 +461,7 @@ setInterval(async () => {
 </script>
 </body>
 </html>'''
+
 
 @app.route('/')
 def index():
@@ -366,9 +484,9 @@ def index():
         delete_options=DELETE_OPTIONS, auth_url=auth_url, log=log
     )
 
+
 @app.route('/auth/start', methods=['POST'])
 def auth_start():
-    """Start onedrive auth via Popen, wait for authUrl file, then kill process."""
     try:
         os.makedirs(ONEDRIVE_CONFIG_DIR, exist_ok=True)
         for f in [AUTH_URL_FILE, RESPONSE_URL_FILE]:
@@ -379,7 +497,6 @@ def auth_start():
              "--auth-files", f"{AUTH_URL_FILE}:{RESPONSE_URL_FILE}"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        # Wait up to 15s for authUrl file to appear
         for _ in range(30):
             time.sleep(0.5)
             if os.path.exists(AUTH_URL_FILE):
@@ -391,13 +508,13 @@ def auth_start():
                 url = f.read().strip()
             if url:
                 return jsonify({"success": True, "url": url})
-        return jsonify({"success": False, "error": "authUrl file not created"}), 500
+        return jsonify({"success": False, "error": "authUrl Datei nicht erstellt"}), 500
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
+
 @app.route('/auth/complete', methods=['POST'])
 def auth_complete():
-    """Write response URL and complete auth."""
     data = request.json
     response_url = data.get('response_url', '')
     try:
@@ -414,6 +531,95 @@ def auth_complete():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
+
+@app.route('/api/search', methods=['POST'])
+def search_file():
+    """
+    Sucht eine Datei nach Namen direkt in OneDrive via Graph API.
+    Gibt alle Treffer mit item_id und Pfad zurueck.
+    """
+    data = request.json
+    filename = data.get('filename', '').strip()
+    if not filename:
+        return jsonify({"success": False, "error": "filename benoetigt"}), 400
+    try:
+        token = get_access_token()
+        encoded = urllib.parse.quote(filename)
+        results = graph_get(token, f"/me/drive/root/search(q='{encoded}')")
+        items = results.get("value", [])
+        # Filter: nur exakter Dateiname (Graph search gibt auch Teilmatches zurueck)
+        exact = [i for i in items if i.get("name", "").lower() == filename.lower() and "folder" not in i]
+        locations = []
+        for item in exact:
+            parent = item.get("parentReference", {})
+            parent_path = parent.get("path", "")
+            # path hat Format: /drive/root:/Ordner/Unterordner
+            if "root:" in parent_path:
+                clean_path = parent_path.split("root:", 1)[1].strip("/")
+            else:
+                clean_path = parent_path
+            locations.append({
+                "item_id": item["id"],
+                "name": item["name"],
+                "path": clean_path or "/",
+                "size": item.get("size", 0)
+            })
+        return jsonify({
+            "success": True,
+            "found": len(locations),
+            "locations": locations
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/download_by_id', methods=['POST'])
+def download_by_id():
+    """
+    Laedt eine Datei direkt per Graph API item_id herunter.
+    Kein Ordner-Sync – nur exakt diese eine Datei.
+    """
+    data = request.json
+    item_id = data.get('item_id', '').strip()
+    filename = data.get('filename', '').strip()
+    if not item_id or not filename:
+        return jsonify({"success": False, "error": "item_id und filename benoetigt"}), 400
+    try:
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        token = get_access_token()
+        dest = os.path.join(DOWNLOAD_DIR, filename)
+        graph_download(token, item_id, dest)
+        return jsonify({"success": True, "local_path": dest})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/download_by_path', methods=['POST'])
+def download_by_path():
+    """
+    Laedt eine Datei per explizitem OneDrive-Pfad + Dateiname herunter.
+    Nutzt Graph API direkt – kein Ordner-Sync.
+    """
+    data = request.json
+    onedrive_path = data.get('path', '').strip('/')
+    filename = data.get('filename', '').strip()
+    if not onedrive_path or not filename:
+        return jsonify({"success": False, "error": "path und filename benoetigt"}), 400
+    try:
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        token = get_access_token()
+        full_path = f"{onedrive_path}/{filename}"
+        encoded_path = urllib.parse.quote(full_path)
+        # Get item metadata to retrieve item_id
+        item = graph_get(token, f"/me/drive/root:/{encoded_path}")
+        item_id = item["id"]
+        dest = os.path.join(DOWNLOAD_DIR, filename)
+        graph_download(token, item_id, dest)
+        return jsonify({"success": True, "local_path": dest})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route('/api/config', methods=['POST'])
 def update_config():
     changes = request.json
@@ -425,9 +631,11 @@ def update_config():
     save_sync_config(config)
     return jsonify({"success": True})
 
+
 @app.route('/api/status')
 def get_status():
     return jsonify(load_status())
+
 
 @app.route('/api/sync', methods=['POST'])
 def trigger_sync():
@@ -436,43 +644,6 @@ def trigger_sync():
     threading.Thread(target=run_sync, daemon=True).start()
     return jsonify({"success": True})
 
-@app.route('/api/download', methods=['POST'])
-def download_file():
-    """Download a single file from OneDrive to /share/onedrive_downloads/"""
-    data = request.json
-    onedrive_path = data.get('path', '').strip('/')
-    filename = data.get('filename', '').strip()
-    if not onedrive_path or not filename:
-        return jsonify({"success": False, "error": "path und filename benoetigt"}), 400
-    try:
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        # Use a temp sync dir to download only the target folder
-        tmp_dir = f"/tmp/onedrive_dl_{int(time.time())}"
-        os.makedirs(tmp_dir, exist_ok=True)
-        result = subprocess.run(
-            ["onedrive", "--confdir", ONEDRIVE_CONFIG_DIR,
-             "--synchronize", "--download-only",
-             "--single-directory", onedrive_path,
-             "--syncdir", tmp_dir],
-            capture_output=True, text=True, timeout=120
-        )
-        # Find the requested file in tmp_dir
-        found = None
-        for root, dirs, files in os.walk(tmp_dir):
-            for f in files:
-                if f == filename:
-                    found = os.path.join(root, f)
-                    break
-        if found:
-            dest = os.path.join(DOWNLOAD_DIR, filename)
-            os.rename(found, dest)
-            # Clean up tmp
-            subprocess.run(["rm", "-rf", tmp_dir])
-            return jsonify({"success": True, "local_path": dest})
-        subprocess.run(["rm", "-rf", tmp_dir])
-        return jsonify({"success": False, "error": f"Datei '{filename}' nicht in '{onedrive_path}' gefunden"}), 404
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
 
 if __name__ == '__main__':
     os.makedirs(CONFIG_DIR, exist_ok=True)
