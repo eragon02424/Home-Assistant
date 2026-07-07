@@ -1,6 +1,6 @@
 """Device Manager - handles ESPHome device discovery and heartbeat history.
 
-Architecture (v0.15.1):
+Architecture (v0.15.2):
 ───────────────────────
 DISCOVERY (at startup, then every DISCOVERY_INTERVAL_SECONDS)
   Fetch /devices. For every device not yet known: register it (address,
@@ -23,6 +23,16 @@ PER-DEVICE KEEPALIVE TASK (never dies once started)
   The wait is interruptible: an mDNS announce for this device sets an
   asyncio.Event which wakes the task immediately, resets backoff to 1,
   and triggers an immediate re-ping.
+
+  This TCP-ping keepalive is the ONLY source of online/offline
+  detection. Measured directly against a real power-loss test (device
+  physically unplugged/replugged, timestamps compared): it detected
+  both offline and online transitions in 1.5-6.3s. A prior attempt
+  (v0.15.1) to also use the LogManager persistent connection's own
+  connect/on_stop events as a second, supposedly-faster signal was
+  tested the same way and found to be unreliable — it did not notice
+  the actual power loss at all until the device reconnected 21-35s
+  later, and was reverted (see log_manager.py history).
 
 BACKOFF CAP
   cap_multiplier is the smallest power of two such that
@@ -56,17 +66,8 @@ fast TCP-ping keepalive on purpose.
   repeatedly interrupted the connection handshake mid-flight. ESPHome's
   own reported state changes far less often, so it's a much steadier
   signal for "should we even be trying to log this device at all".
-
-  HOWEVER: while that persistent log connection IS open (i.e. whenever
-  esphome_reports_online is True), its own connect/disconnect events are
-  ALSO wired back into _mark_online/_mark_offline via
-  on_log_connection_state(), giving near-instant online/offline
-  detection — matching what the native ESPHome dashboard's live log
-  view shows the instant a device drops or reconnects, since that same
-  underlying connection mechanism (aioesphomeapi's on_stop callback)
-  fires immediately, not on a polling interval. Devices ESPHome itself
-  reports offline have no persistent connection at all and fall back to
-  the TCP-ping keepalive only.
+  The log connection's own state is used only for logging, never for
+  online/offline detection (see BACKOFF CAP section above).
 
 Every TCP ping attempt logs its duration in ms.
 """
@@ -492,24 +493,6 @@ class DeviceManager:
         _LOGGER.info("Global mDNS listener started")
 
     # ── State transitions ─────────────────────────────────────
-
-    def on_log_connection_state(self, device_name: str, is_online: bool):
-        """Callback for LogManager.on_state_change: the persistent log
-        connection itself just connected or disconnected. LogManager
-        runs on the same event loop as everything else in this process
-        (no separate thread), so calling _mark_online/_mark_offline
-        directly here is safe.
-        This gives near-instant online/offline detection whenever a log
-        subscription is active — matching what the native ESPHome
-        dashboard's own live log view shows the moment a device drops
-        or reconnects.
-        """
-        if device_name not in self.devices:
-            return
-        if is_online:
-            self._mark_online(device_name)
-        else:
-            self._mark_offline(device_name)
 
     def _mark_online(self, device_name: str):
         device = self.devices[device_name]
