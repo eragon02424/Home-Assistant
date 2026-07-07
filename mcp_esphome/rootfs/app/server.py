@@ -84,11 +84,6 @@ async def main():
         log_manager=log_manager,
     )
 
-    # LogManager's persistent connection connect/disconnect events feed
-    # back into DeviceManager's fast online/offline state, matching what
-    # the native ESPHome dashboard's live log view shows instantly.
-    log_manager.set_state_change_callback(device_manager.on_log_connection_state)
-
     _LOGGER.info("=" * 60)
     _LOGGER.info("MCP ESPHome starting")
     _LOGGER.info("Dashboard URL: %s", esphome_dashboard_url)
