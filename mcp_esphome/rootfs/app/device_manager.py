@@ -1,6 +1,6 @@
 """Device Manager - handles ESPHome device discovery and heartbeat history.
 
-Architecture (v0.14.0):
+Architecture (v0.14.2):
 ───────────────────────
 DISCOVERY (at startup, then every DISCOVERY_INTERVAL_SECONDS)
   Fetch /devices. For every device not yet known: register it (address,
@@ -31,6 +31,9 @@ BACKOFF CAP
 mDNS LISTENER (global)
   add_service/update_service fires for every announce. If the device is
   known, its wake_event is set via loop.call_soon_threadsafe.
+  This same AsyncZeroconf instance is exposed via get_zeroconf_instance()
+  so LogManager's aioesphomeapi clients can share it instead of each
+  creating their own (see log_manager.py for why that matters).
 
 PERSISTENCE / HISTORY
   Every state transition (connected/disconnected) is appended to
@@ -42,8 +45,6 @@ DEBUG LOGS (LogManager, optional)
   On every ONLINE transition, DeviceManager starts a persistent
   aioesphomeapi log-subscription task for that device (LogManager.start).
   On every OFFLINE transition, that task is cancelled (LogManager.stop).
-  Verified by direct testing (see log_manager.py) that this coexists
-  cleanly with the TCP-ping keepalive without connection interference.
 
 Every TCP ping attempt logs its duration in ms.
 """
@@ -161,6 +162,13 @@ class DeviceManager:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
         self._load_heartbeat_history()
+
+    def get_zeroconf_instance(self) -> Optional[object]:
+        """The addon's single persistent AsyncZeroconf instance, set up
+        in start_mdns_listener(). None if that hasn't run yet or
+        zeroconf isn't available.
+        """
+        return self._azeroconf
 
     # ── Persistence ──────────────────────────────────────────────
 
