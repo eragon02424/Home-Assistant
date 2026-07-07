@@ -10,19 +10,30 @@ TCP-ping keepalive, tied only to device.esphome_reports_online instead
 
 v0.15.1 (REVERTED in v0.15.2): tried using this connection's own
 connect/on_stop events as a fast online/offline signal for
-DeviceManager. Measured directly against a real power-loss test
-(device physically unplugged/replugged, exact timestamps compared in
-conversation): the log connection's on_stop did NOT detect the actual
-outage at all -- it only fired ~35s later, as a side effect of the
-device reconnecting and resetting the stale socket, not from
-proactively noticing the drop. The TCP-ping keepalive detected both the
-offline and online transitions faster in all four measured cases (1.5s,
-4.2s, 5.9s, 6.3s vs. no detection at all / 21-35s for the log
-connection). Reverted: this signal is unreliable for real disconnects,
-only fires promptly for clean/graceful disconnects (e.g. ESPHome's own
-dashboard log view appearing instant is likely from a controlled
-reboot with a goodbye message, not a power loss). Keeping it caused
-conflicting online/offline signals and confusing rapid flapping.
+DeviceManager. Measured directly against a real power-loss test: the
+log connection's on_stop did NOT detect the actual outage promptly (up
+to 35s, sometimes not at all until the device itself reconnected). The
+TCP-ping keepalive was consistently faster. Reverted; this connection's
+state is used only for logging now, never for online/offline detection.
+
+v0.15.3: mDNS announces now wake the log-subscription task immediately,
+via on_mdns_announce(). Rationale: RETRY_SECONDS=15 is a fixed timer
+with no relation to when a device actually becomes reachable again. For
+short deep-sleep wake windows (observed as short as ~6.5s), a 15s fixed
+retry frequently misses the window's start (or the whole window)
+depending on where the retry timer's phase happens to land relative to
+the device's own wake cycle. A device coming back (deep-sleep wake,
+reboot, reconnect) always re-announces via mDNS -- the addon's global
+mDNS listener already exists for the TCP-ping keepalive wakeup
+(device_manager.py); it now also wakes the log task the same way.
+This forces an immediate reconnect attempt even if the log task hasn't
+detected a disconnect yet (the old connection may simply be stale
+without having fired on_stop -- confirmed unreliable in v0.15.1's
+test), and also short-circuits the RETRY_SECONDS backoff wait if the
+task was already in a retry cycle. A device that was previously offline
+(esphome_reports_online False) is unaffected: it still gets a normal
+first-time start() via DeviceManager, with the usual 15s retry timer,
+exactly as before -- this only adds an EARLY-WAKE path on top.
 
 Other things verified/fixed along the way:
   - subscribe_logs(on_log, log_level=...) only delivers lines if
@@ -39,14 +50,16 @@ Other things verified/fixed along the way:
 Architecture:
   - One persistent aioesphomeapi connection per device, started/stopped
     by DeviceManager based on esphome_reports_online. Retries every
-    RETRY_SECONDS on disconnect.
+    RETRY_SECONDS on disconnect, but an mDNS announce for that device
+    interrupts the wait (whether connected-and-idle or backing off) and
+    forces an immediate reconnect.
   - Every received log line is appended as one JSON line to
     /data/mcp_esphome/esplog_<name>.jsonl: {"ts": <epoch float>, "message": <str>}.
   - A periodic prune task rewrites each log file keeping only entries
     newer than retention_days.
-  - This connection's own state is used ONLY for logging, not for
-    online/offline detection. Online/offline detection is purely the
-    TCP-ping keepalive in device_manager.py.
+  - This connection's own state is used ONLY for logging, never for
+    online/offline detection (see device_manager.py's TCP-ping
+    keepalive for that).
 """
 import asyncio
 import json
@@ -79,6 +92,7 @@ class LogManager:
     def __init__(self, retention_days: int, timezone: Optional[str] = None):
         self.retention_seconds = retention_days * 86400
         self.tasks: dict[str, asyncio.Task] = {}
+        self.wake_events: dict[str, asyncio.Event] = {}
         self.zeroconf_instance: Optional[object] = None
         self.timezone = timezone
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -91,7 +105,9 @@ class LogManager:
 
     def start(self, device_name: str, address: str, noise_psk: Optional[str]):
         """Starts (or leaves running) the persistent log-subscription
-        task for a device. Safe to call repeatedly.
+        task for a device. Safe to call repeatedly. This is the normal
+        offline->online path (via DeviceManager.esphome_reports_online);
+        the task starts fresh with the usual RETRY_SECONDS cadence.
         """
         if not HAS_AIOESPHOMEAPI:
             return
@@ -109,8 +125,24 @@ class LogManager:
             task.cancel()
             _LOGGER.info("Log subscription task cancel requested for %s", device_name)
 
+    def on_mdns_announce(self, device_name: str):
+        """Wakes an already-running log task immediately -- forces a
+        reconnect attempt right now, whether the task currently believes
+        itself connected (the old connection may be silently stale) or
+        is waiting out its RETRY_SECONDS backoff. No-op if no task is
+        running for this device yet (the normal esphome_reports_online
+        path via start() handles that case).
+        """
+        event = self.wake_events.get(device_name)
+        if event is None:
+            return
+        _LOGGER.info("mDNS announce for %s — waking log subscription task", device_name)
+        event.set()
+
     async def _run(self, device_name: str, address: str, noise_psk: Optional[str]):
+        wake_event = self.wake_events.setdefault(device_name, asyncio.Event())
         while True:
+            wake_event.clear()
             client = APIClient(
                 address, 6053, None,
                 noise_psk=noise_psk,
@@ -122,6 +154,7 @@ class LogManager:
             async def on_stop(expected, ev=stop_event):
                 ev.set()
 
+            woken_early = False
             try:
                 await client.connect(login=False, on_stop=on_stop)
 
@@ -133,9 +166,23 @@ class LogManager:
 
                 client.subscribe_logs(on_log, log_level=LogLevel.LOG_LEVEL_VERY_VERBOSE)
                 _LOGGER.info("Log subscription connected for %s", device_name)
-                await stop_event.wait()
-                _LOGGER.info("Log subscription disconnected for %s — retry in %ds",
-                             device_name, RETRY_SECONDS)
+
+                stop_wait = asyncio.create_task(stop_event.wait())
+                wake_wait = asyncio.create_task(wake_event.wait())
+                done, pending = await asyncio.wait(
+                    {stop_wait, wake_wait}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in pending:
+                    t.cancel()
+                if wake_wait in done and stop_wait not in done:
+                    woken_early = True
+                    _LOGGER.info(
+                        "mDNS-forced reconnect for %s (connection may have been stale)",
+                        device_name,
+                    )
+                else:
+                    _LOGGER.info("Log subscription disconnected for %s — retry in %ds",
+                                 device_name, RETRY_SECONDS)
             except asyncio.CancelledError:
                 raise
             except Exception as err:
@@ -148,7 +195,17 @@ class LogManager:
                     pass
                 _LOGGER.info("Log subscription connection closed for %s", device_name)
 
-            await asyncio.sleep(RETRY_SECONDS)
+            if woken_early or wake_event.is_set():
+                wake_event.clear()
+                continue
+
+            try:
+                await asyncio.wait_for(wake_event.wait(), timeout=RETRY_SECONDS)
+                _LOGGER.info("mDNS announce for %s — skipping remaining retry wait",
+                             device_name)
+            except asyncio.TimeoutError:
+                pass
+            wake_event.clear()
 
     def _append(self, device_name: str, line: str):
         try:
