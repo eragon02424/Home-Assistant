@@ -13,7 +13,7 @@ RUN apk add --no-cache \
     onedrive
 
 # Install Python deps
-RUN pip3 install flask requests --break-system-packages
+RUN pip3 install flask flask-cors requests --break-system-packages
 
 # Copy addon files
 COPY rootfs /
