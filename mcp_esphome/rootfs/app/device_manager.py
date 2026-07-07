@@ -1,6 +1,6 @@
 """Device Manager - handles ESPHome device discovery and heartbeat history.
 
-Architecture (v0.15.0):
+Architecture (v0.15.1):
 ───────────────────────
 DISCOVERY (at startup, then every DISCOVERY_INTERVAL_SECONDS)
   Fetch /devices. For every device not yet known: register it (address,
@@ -41,24 +41,32 @@ PERSISTENCE / HISTORY
   /data/mcp_esphome/heartbeat_<name>.json. Reloaded on restart, so
   online/offline history survives restarts.
 
-DEBUG LOGS (LogManager, optional) — DECOUPLED FROM THE FAST TCP-PING
-KEEPALIVE ON PURPOSE.
-  The log-subscription task's lifecycle is tied to
+DEBUG LOGS (LogManager, optional) — task lifecycle DECOUPLED from the
+fast TCP-ping keepalive on purpose.
+  The log-subscription task's lifecycle (start/stop) is tied to
   device.esphome_reports_online (ESPHome's own "state" field, refreshed
   every DISCOVERY_INTERVAL_SECONDS), NOT to our own fast TCP-ping-based
-  online/offline flips (_mark_online/_mark_offline). Reasoning: our
-  TCP-ping keepalive is deliberately sensitive to brief interruptions
-  (that's the point, for fast offline detection), but the ESP's native
-  API log connection has its own retry loop in LogManager that already
-  reconnects automatically on any disconnect, reboot, or deep-sleep
-  wake-up. Tying log-task start/stop to our fast pings caused the task
-  to be cancelled and restarted every time a brief TCP hiccup occurred,
-  which repeatedly interrupted the connection handshake mid-flight.
-  ESPHome's own reported state changes far less often (it only flips
-  after roughly the mDNS TTL of no announce), so it's a much steadier
+  online/offline flips. Reasoning: our TCP-ping keepalive is
+  deliberately sensitive to brief interruptions (that's the point, for
+  fast offline detection), but the ESP's native API log connection has
+  its own retry loop in LogManager that already reconnects
+  automatically on any disconnect, reboot, or deep-sleep wake-up. Tying
+  log-task start/stop to our fast pings caused the task to be cancelled
+  and restarted every time a brief TCP hiccup occurred, which
+  repeatedly interrupted the connection handshake mid-flight. ESPHome's
+  own reported state changes far less often, so it's a much steadier
   signal for "should we even be trying to log this device at all".
-  Log subscription starts on esphome_reports_online False->True and
-  stops on True->False, checked every discovery cycle.
+
+  HOWEVER: while that persistent log connection IS open (i.e. whenever
+  esphome_reports_online is True), its own connect/disconnect events are
+  ALSO wired back into _mark_online/_mark_offline via
+  on_log_connection_state(), giving near-instant online/offline
+  detection — matching what the native ESPHome dashboard's live log
+  view shows the instant a device drops or reconnects, since that same
+  underlying connection mechanism (aioesphomeapi's on_stop callback)
+  fires immediately, not on a polling interval. Devices ESPHome itself
+  reports offline have no persistent connection at all and fall back to
+  the TCP-ping keepalive only.
 
 Every TCP ping attempt logs its duration in ms.
 """
@@ -484,6 +492,24 @@ class DeviceManager:
         _LOGGER.info("Global mDNS listener started")
 
     # ── State transitions ─────────────────────────────────────
+
+    def on_log_connection_state(self, device_name: str, is_online: bool):
+        """Callback for LogManager.on_state_change: the persistent log
+        connection itself just connected or disconnected. LogManager
+        runs on the same event loop as everything else in this process
+        (no separate thread), so calling _mark_online/_mark_offline
+        directly here is safe.
+        This gives near-instant online/offline detection whenever a log
+        subscription is active — matching what the native ESPHome
+        dashboard's own live log view shows the moment a device drops
+        or reconnects.
+        """
+        if device_name not in self.devices:
+            return
+        if is_online:
+            self._mark_online(device_name)
+        else:
+            self._mark_offline(device_name)
 
     def _mark_online(self, device_name: str):
         device = self.devices[device_name]
