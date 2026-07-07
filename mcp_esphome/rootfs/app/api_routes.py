@@ -62,21 +62,21 @@ def setup_routes(app: web.Application):
 
     async def get_job_status(request):
         job_id = request.match_info["job_id"]
-        status = await job_manager.get_status(job_id)
+        status = job_manager.get_status(job_id)
         if status is None:
             return web.json_response({"error": "job not found"}, status=404)
         return web.json_response(status)
 
     async def get_error_summary(request):
         job_id = request.match_info["job_id"]
-        summary = await job_manager.get_error_summary(job_id)
+        summary = job_manager.get_error_summary(job_id)
         if summary is None:
-            return web.json_response({"error": "job not found"}, status=404)
+            return web.json_response({"error": "job not found or no error"}, status=404)
         return web.json_response({"summary": summary})
 
     async def get_full_log(request):
         job_id = request.match_info["job_id"]
-        log = await job_manager.get_full_log(job_id)
+        log = job_manager.get_full_log(job_id)
         if log is None:
             return web.json_response({"error": "job not found"}, status=404)
         return web.json_response({"log": log})
