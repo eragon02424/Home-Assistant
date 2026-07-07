@@ -1,17 +1,57 @@
 """Log Manager - persists ESPHome native API debug logs per device.
 
-DEBUG BUILD: temporarily logs full tracebacks on connection failure to
-diagnose "Error while finishing connection: Finishing connection
-cancelled" occurring identically and in lockstep across all devices —
-root cause not yet confirmed. See device_manager.py / server.py for the
-rest of the architecture notes.
+ROOT CAUSE FOUND AND FIXED (v0.14.4):
+  Symptom: "Error while finishing connection: Finishing connection
+  cancelled" on EVERY device's log-subscription connection attempt,
+  simultaneously and permanently once it first occurred.
+
+  Full traceback (captured from inside the actual container) showed the
+  failure inside aioesphomeapi's connection.finish_connection() ->
+  get_timezone() -> get_local_timezone(), which is a process-wide
+  SINGLETON (aioesphomeapi/singleton.py: the first caller's coroutine is
+  cached and awaited by every subsequent caller). The very first time
+  this ran, it happened to be cancelled — because a device flapped
+  offline mid-connect, and DeviceManager._mark_offline() calls
+  LogManager.stop() -> task.cancel(), which propagated the
+  CancelledError into that shared singleton's in-flight coroutine. Once
+  poisoned, every later call (for any device, from any task) awaits the
+  same permanently-cancelled cached future and fails identically and
+  immediately — explaining why ALL devices failed in synchronized
+  lockstep after one single bad cancellation.
+
+  Fix: APIClient accepts an explicit `timezone` argument ("If not
+  provided, the system timezone will be detected automatically" per its
+  docstring). Passing it explicitly skips get_local_timezone() and its
+  cancellable singleton entirely. We read Home Assistant's own
+  configured timezone via the Supervisor Core API once at LogManager
+  construction and pass it to every APIClient.
+
+Other things verified/fixed along the way:
+  - subscribe_logs(on_log, log_level=...) only delivers lines if
+    log_level is explicitly set.
+  - client.connect(on_stop=<async callback>) must get an async callback.
+  - client.disconnect() must run in a finally block on every loop
+    iteration (including on task cancellation) or the ESP's small
+    max-connections limit (observed: 5) gets exhausted by abandoned
+    half-open connections.
+  - APIClient's zeroconf_instance is shared with the addon's own
+    AsyncZeroconf (set via set_zeroconf_instance()) so log-subscription
+    clients don't each spin up their own mDNS resolver.
+
+Architecture:
+  - One persistent aioesphomeapi connection per device, started when
+    DeviceManager marks a device online, stopped (task cancelled) when
+    marked offline. Retries every RETRY_SECONDS on disconnect.
+  - Every received log line is appended as one JSON line to
+    /data/mcp_esphome/esplog_<name>.jsonl: {"ts": <epoch float>, "message": <str>}.
+  - A periodic prune task rewrites each log file keeping only entries
+    newer than retention_days.
 """
 import asyncio
 import json
 import logging
 import re
 import time
-import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -35,11 +75,13 @@ def _strip_ansi(line: str) -> str:
 
 
 class LogManager:
-    def __init__(self, retention_days: int):
+    def __init__(self, retention_days: int, timezone: Optional[str] = None):
         self.retention_seconds = retention_days * 86400
         self.tasks: dict[str, asyncio.Task] = {}
         self.zeroconf_instance: Optional[object] = None
-        self._debug_traceback_logged = False
+        # Explicit timezone avoids aioesphomeapi's cancellable
+        # get_local_timezone() singleton entirely (see module docstring).
+        self.timezone = timezone
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
     def set_zeroconf_instance(self, instance: object):
@@ -49,6 +91,9 @@ class LogManager:
         return STORAGE_DIR / f"esplog_{device_name.replace('/', '_')}.jsonl"
 
     def start(self, device_name: str, address: str, noise_psk: Optional[str]):
+        """Starts (or leaves running) the persistent log-subscription
+        task for a device. Safe to call repeatedly.
+        """
         if not HAS_AIOESPHOMEAPI:
             return
         existing = self.tasks.get(device_name)
@@ -71,6 +116,7 @@ class LogManager:
                 address, 6053, None,
                 noise_psk=noise_psk,
                 zeroconf_instance=self.zeroconf_instance,
+                timezone=self.timezone,
             )
             stop_event = asyncio.Event()
 
@@ -96,10 +142,6 @@ class LogManager:
             except Exception as err:
                 _LOGGER.info("Log subscription error for %s: %s — retry in %ds",
                              device_name, err, RETRY_SECONDS)
-                if not self._debug_traceback_logged:
-                    self._debug_traceback_logged = True
-                    _LOGGER.error("DEBUG full traceback for %s:\n%s",
-                                  device_name, traceback.format_exc())
             finally:
                 try:
                     await client.disconnect()
