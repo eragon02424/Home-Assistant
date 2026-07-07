@@ -1,6 +1,6 @@
 """Device Manager - handles ESPHome device discovery and heartbeat history.
 
-Architecture (v0.14.2):
+Architecture (v0.15.0):
 ───────────────────────
 DISCOVERY (at startup, then every DISCOVERY_INTERVAL_SECONDS)
   Fetch /devices. For every device not yet known: register it (address,
@@ -41,10 +41,24 @@ PERSISTENCE / HISTORY
   /data/mcp_esphome/heartbeat_<name>.json. Reloaded on restart, so
   online/offline history survives restarts.
 
-DEBUG LOGS (LogManager, optional)
-  On every ONLINE transition, DeviceManager starts a persistent
-  aioesphomeapi log-subscription task for that device (LogManager.start).
-  On every OFFLINE transition, that task is cancelled (LogManager.stop).
+DEBUG LOGS (LogManager, optional) — DECOUPLED FROM THE FAST TCP-PING
+KEEPALIVE ON PURPOSE.
+  The log-subscription task's lifecycle is tied to
+  device.esphome_reports_online (ESPHome's own "state" field, refreshed
+  every DISCOVERY_INTERVAL_SECONDS), NOT to our own fast TCP-ping-based
+  online/offline flips (_mark_online/_mark_offline). Reasoning: our
+  TCP-ping keepalive is deliberately sensitive to brief interruptions
+  (that's the point, for fast offline detection), but the ESP's native
+  API log connection has its own retry loop in LogManager that already
+  reconnects automatically on any disconnect, reboot, or deep-sleep
+  wake-up. Tying log-task start/stop to our fast pings caused the task
+  to be cancelled and restarted every time a brief TCP hiccup occurred,
+  which repeatedly interrupted the connection handshake mid-flight.
+  ESPHome's own reported state changes far less often (it only flips
+  after roughly the mDNS TTL of no announce), so it's a much steadier
+  signal for "should we even be trying to log this device at all".
+  Log subscription starts on esphome_reports_online False->True and
+  stops on True->False, checked every discovery cycle.
 
 Every TCP ping attempt logs its duration in ms.
 """
@@ -253,6 +267,19 @@ class DeviceManager:
             except Exception as err:
                 _LOGGER.error("Discovery loop error: %s", err)
 
+    def _sync_log_subscription(self, device: "DeviceState"):
+        """Starts/stops the LogManager task for this device based purely
+        on device.esphome_reports_online. Called whenever that field is
+        set (both on first discovery and on later changes). Idempotent:
+        LogManager.start()/stop() are both safe to call repeatedly.
+        """
+        if self.log_manager is None:
+            return
+        if device.esphome_reports_online:
+            self.log_manager.start(device.name, device.address, device.noise_psk)
+        else:
+            self.log_manager.stop(device.name)
+
     async def _discover_new_devices(self):
         try:
             async with aiohttp.ClientSession() as session:
@@ -294,7 +321,10 @@ class DeviceManager:
                         "online" if device.esphome_reports_online else "offline",
                         "online" if esphome_online else "offline",
                     )
-                device.esphome_reports_online = esphome_online
+                    device.esphome_reports_online = esphome_online
+                    self._sync_log_subscription(device)
+                else:
+                    device.esphome_reports_online = esphome_online
 
                 if not device.initialized:
                     device.configuration_file = configuration_file
@@ -305,6 +335,10 @@ class DeviceManager:
                         _LOGGER.info("Noise PSK loaded (stub) for %s", name)
                     elif api_encrypted:
                         _LOGGER.warning("No noise PSK for encrypted device %s", name)
+                    # Stub just got its address/psk for the first time —
+                    # (re)sync log subscription now that we actually have
+                    # what's needed to connect.
+                    self._sync_log_subscription(device)
 
                 self._ensure_keepalive_task(name)
                 continue
@@ -327,6 +361,7 @@ class DeviceManager:
             _LOGGER.info("New device discovered: %s @ %s (esphome_state=%s)",
                          name, address, "online" if esphome_online else "offline")
             self._ensure_keepalive_task(name)
+            self._sync_log_subscription(device)
 
     def _ensure_keepalive_task(self, device_name: str):
         device = self.devices.get(device_name)
@@ -459,8 +494,6 @@ class DeviceManager:
             self._prune_heartbeat(device_name)
             self._save_heartbeat_history(device_name)
             _LOGGER.info("State → ONLINE: %s", device_name)
-            if self.log_manager is not None:
-                self.log_manager.start(device_name, device.address, device.noise_psk)
         device.last_seen = now
 
     def _mark_offline(self, device_name: str):
@@ -475,8 +508,6 @@ class DeviceManager:
             self._prune_heartbeat(device_name)
             self._save_heartbeat_history(device_name)
             _LOGGER.info("State → OFFLINE: %s", device_name)
-            if self.log_manager is not None:
-                self.log_manager.stop(device_name)
 
     # ── Public query API ──────────────────────────────────────
 
