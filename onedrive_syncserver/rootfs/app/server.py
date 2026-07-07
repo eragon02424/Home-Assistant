@@ -338,6 +338,18 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <div class="toast" id="toast"></div>
 
 <script>
+// Ingress-kompatibler Basispfad:
+// Hinter HA Ingress lautet die URL z.B. /api/hassio_ingress/TOKEN/
+// window.location.pathname enthaelt diesen Pfad.
+// Wir ermitteln den Basispfad indem wir alles bis zum letzten / behalten.
+const BASE = window.location.pathname.endsWith('/')
+  ? window.location.pathname.slice(0, -1)
+  : window.location.pathname.split('/').slice(0, -1).join('/') || '';
+
+function apiUrl(path) {
+  return BASE + path;
+}
+
 let pendingChanges = {};
 function showToast(msg, ok=true) {
   const t = document.getElementById('toast');
@@ -358,7 +370,7 @@ async function startAuth() {
   const btn = document.getElementById('auth-btn');
   btn.textContent = 'Wird generiert...';
   btn.disabled = true;
-  const res = await fetch('/auth/start', {method: 'POST'});
+  const res = await fetch(apiUrl('/auth/start'), {method: 'POST'});
   if (res.ok) { location.reload(); }
   else {
     const d = await res.json();
@@ -370,7 +382,7 @@ async function startAuth() {
 async function submitAuth() {
   const code = document.getElementById('auth-code').value.trim();
   if (!code) return;
-  const res = await fetch('/auth/complete', {
+  const res = await fetch(apiUrl('/auth/complete'), {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({response_url: code})
@@ -383,7 +395,7 @@ async function submitAuth() {
   }
 }
 async function saveConfig() {
-  const res = await fetch('/api/config', {
+  const res = await fetch(apiUrl('/api/config'), {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(pendingChanges)
   });
@@ -392,7 +404,7 @@ async function saveConfig() {
 }
 async function triggerSync() {
   showToast('Sync gestartet...');
-  await fetch('/api/sync', {method: 'POST'});
+  await fetch(apiUrl('/api/sync'), {method: 'POST'});
   setTimeout(() => location.reload(), 3000);
 }
 async function searchFile() {
@@ -400,7 +412,7 @@ async function searchFile() {
   if (!name) return;
   const container = document.getElementById('search-results');
   container.innerHTML = '<p style="color:#9ca3af;font-size:0.85rem">Suche laeuft...</p>';
-  const res = await fetch('/api/search', {
+  const res = await fetch(apiUrl('/api/search'), {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({filename: name})
   });
@@ -422,7 +434,7 @@ async function searchFile() {
 }
 async function downloadById(itemId, filename) {
   showToast('Download gestartet...');
-  const res = await fetch('/api/download_by_id', {
+  const res = await fetch(apiUrl('/api/download_by_id'), {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({item_id: itemId, filename: filename})
   });
@@ -437,7 +449,7 @@ async function downloadByPath() {
   if (!path || !file) { showToast('Pfad und Dateiname benoetigt', false); return; }
   result.textContent = 'Wird heruntergeladen...';
   result.className = 'dl-result';
-  const res = await fetch('/api/download_by_path', {
+  const res = await fetch(apiUrl('/api/download_by_path'), {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({path: path, filename: file})
   });
@@ -446,7 +458,7 @@ async function downloadByPath() {
   else { result.textContent = 'Fehler: ' + (d.error || 'unbekannt'); result.className = 'dl-result err'; }
 }
 setInterval(async () => {
-  const res = await fetch('/api/status');
+  const res = await fetch(apiUrl('/api/status'));
   const data = await res.json();
   document.getElementById('last-sync').textContent = data.last_sync || 'Noch kein Sync';
   document.getElementById('files-synced').textContent = data.files_synced;
@@ -486,7 +498,6 @@ def index():
 
 @app.route('/auth/start', methods=['POST'])
 def auth_start():
-    # Clear old debug log on new auth attempt
     if os.path.exists(AUTH_DEBUG_LOG):
         os.remove(AUTH_DEBUG_LOG)
     auth_log("=== Neuer Auth-Versuch ===")
@@ -529,22 +540,21 @@ def auth_complete():
     auth_log(f"response_url Anfang: {response_url[:100]}")
     auth_log(f"Sonderzeichen: *={response_url.count('*')} !={response_url.count('!')} $={response_url.count('$')} %%={response_url.count('%')}")
     try:
-        # authUrl muss noch existieren
         if not os.path.exists(AUTH_URL_FILE):
-            auth_log("FEHLER: authUrl Datei fehlt – Auth neu starten noetig")
-            return jsonify({"success": False, "error": "Auth-Session abgelaufen – bitte Link neu generieren", "error_short": "Session abgelaufen"}), 400
+            auth_log("FEHLER: authUrl Datei fehlt")
+            return jsonify({"success": False, "error": "Auth-Session abgelaufen – Link neu generieren", "error_short": "Session abgelaufen"}), 400
 
         with open(RESPONSE_URL_FILE, 'w') as f:
             f.write(response_url)
-        auth_log(f"responseUrl geschrieben")
+        auth_log("responseUrl geschrieben")
 
-        auth_log("Starte onedrive --auth-files mit responseUrl...")
+        auth_log("Starte onedrive --auth-files...")
         result = subprocess.run(
             ["onedrive", "--confdir", ONEDRIVE_CONFIG_DIR,
              "--auth-files", f"{AUTH_URL_FILE}:{RESPONSE_URL_FILE}"],
             capture_output=True, text=True, timeout=60
         )
-        auth_log(f"onedrive exit code: {result.returncode}")
+        auth_log(f"exit code: {result.returncode}")
         auth_log(f"stdout: {result.stdout[:800]}")
         auth_log(f"stderr: {result.stderr[:800]}")
 
@@ -552,14 +562,13 @@ def auth_complete():
             auth_log("SUCCESS: refresh_token erstellt")
             return jsonify({"success": True})
 
-        # Extrahiere kurze Fehlermeldung fuer Toast
         short_err = "Unbekannter Fehler"
         for line in (result.stdout + result.stderr).splitlines():
             if "AADSTS" in line or "Error Reason" in line:
                 short_err = line.strip()[:80]
                 break
 
-        auth_log(f"FEHLER: refresh_token nicht erstellt. Kurzfehler: {short_err}")
+        auth_log(f"FEHLER: {short_err}")
         return jsonify({"success": False, "error": result.stderr or result.stdout, "error_short": short_err}), 400
     except Exception as e:
         auth_log(f"EXCEPTION: {e}")
