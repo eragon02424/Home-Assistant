@@ -1,46 +1,17 @@
 """Log Manager - persists ESPHome native API debug logs per device.
 
-Verified by direct testing before implementation:
-  - aioesphomeapi.subscribe_logs(on_log, log_level=...) only delivers
-    lines if log_level is explicitly set (log_level=None yields zero
-    lines, even over 60s of observation).
-  - client.connect(on_stop=<async callback>) fires on_stop(expected: bool)
-    exactly when the connection drops. on_stop must be an async function.
-  - CRITICAL, found after initial rollout: APIClient(), when given a
-    ".local" hostname and NO explicit zeroconf_instance, spins up its
-    OWN temporary AsyncZeroconf internally for the mDNS lookup on every
-    connection attempt (see aioesphomeapi host_resolver.py). With ~7
-    devices' log-subscription tasks all retrying/reconnecting
-    concurrently, plus the addon's own persistent AsyncZeroconf mDNS
-    listener already bound to UDP 5353, this caused simultaneous
-    "Error while finishing connection: Finishing connection cancelled"
-    across ALL devices at once (confirmed: a single isolated test
-    connection succeeded fine in isolation, but failed identically to
-    all 7 devices when run concurrently inside the addon). Fix: share
-    the addon's existing AsyncZeroconf instance
-    (ZeroconfInstanceType = Zeroconf | AsyncZeroconf, confirmed via
-    aioesphomeapi source) via APIClient(..., zeroconf_instance=...)
-    instead of letting every client create/tear down its own.
-  - CRITICAL: every attempt must explicitly call client.disconnect() in
-    a finally block, even on task cancellation (stop()). Without this,
-    cancelling the task on every offline transition abandons the
-    connection without a clean close, leaking a slot against the ESP's
-    small max-connections limit (observed: 5).
-
-Architecture:
-  - One persistent aioesphomeapi connection per device, started when
-    DeviceManager marks a device online, stopped (task cancelled) when
-    marked offline. Retries every RETRY_SECONDS on disconnect.
-  - Every received log line is appended as one JSON line to
-    /data/mcp_esphome/esplog_<name>.jsonl: {"ts": <epoch float>, "message": <str>}.
-  - A periodic prune task rewrites each log file keeping only entries
-    newer than retention_days.
+DEBUG BUILD: temporarily logs full tracebacks on connection failure to
+diagnose "Error while finishing connection: Finishing connection
+cancelled" occurring identically and in lockstep across all devices —
+root cause not yet confirmed. See device_manager.py / server.py for the
+rest of the architecture notes.
 """
 import asyncio
 import json
 import logging
 import re
 import time
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -68,22 +39,16 @@ class LogManager:
         self.retention_seconds = retention_days * 86400
         self.tasks: dict[str, asyncio.Task] = {}
         self.zeroconf_instance: Optional[object] = None
+        self._debug_traceback_logged = False
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
     def set_zeroconf_instance(self, instance: object):
-        """Share the addon's existing AsyncZeroconf instance so every
-        aioesphomeapi client reuses it instead of creating its own.
-        Must be called before the first start().
-        """
         self.zeroconf_instance = instance
 
     def _log_file(self, device_name: str) -> Path:
         return STORAGE_DIR / f"esplog_{device_name.replace('/', '_')}.jsonl"
 
     def start(self, device_name: str, address: str, noise_psk: Optional[str]):
-        """Starts (or leaves running) the persistent log-subscription
-        task for a device. Safe to call repeatedly.
-        """
         if not HAS_AIOESPHOMEAPI:
             return
         existing = self.tasks.get(device_name)
@@ -131,6 +96,10 @@ class LogManager:
             except Exception as err:
                 _LOGGER.info("Log subscription error for %s: %s — retry in %ds",
                              device_name, err, RETRY_SECONDS)
+                if not self._debug_traceback_logged:
+                    self._debug_traceback_logged = True
+                    _LOGGER.error("DEBUG full traceback for %s:\n%s",
+                                  device_name, traceback.format_exc())
             finally:
                 try:
                     await client.disconnect()
