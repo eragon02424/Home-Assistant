@@ -110,6 +110,15 @@ def get_local_folders():
             folders.append(rel)
     return sorted(folders)
 
+def get_ingress_base():
+    """
+    HA Ingress setzt den Header X-Ingress-Path auf den Basispfad
+    z.B. /api/hassio_ingress/abc123
+    Dieser Pfad wird an alle fetch()-Aufrufe im JS vorangestellt.
+    Ausserhalb von Ingress (direkter Aufruf) ist der Header nicht gesetzt -> leer.
+    """
+    return request.headers.get("X-Ingress-Path", "").rstrip("/")
+
 FILTER_OPTIONS = [
     {"value": "all", "label": "Alle Dateien"},
     {"value": "pdf", "label": "Nur PDF"},
@@ -338,13 +347,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <div class="toast" id="toast"></div>
 
 <script>
-// Ingress-kompatibler Basispfad:
-// Hinter HA Ingress lautet die URL z.B. /api/hassio_ingress/TOKEN/
-// window.location.pathname enthaelt diesen Pfad.
-// Wir ermitteln den Basispfad indem wir alles bis zum letzten / behalten.
-const BASE = window.location.pathname.endsWith('/')
-  ? window.location.pathname.slice(0, -1)
-  : window.location.pathname.split('/').slice(0, -1).join('/') || '';
+// Ingress-Basispfad wird vom Server als Jinja-Variable injiziert.
+// Ausserhalb von Ingress ist dieser leer.
+const BASE = "{{ ingress_base }}";
 
 function apiUrl(path) {
   return BASE + path;
@@ -474,6 +479,7 @@ def index():
     status = load_status()
     authenticated = is_authenticated()
     folders = get_local_folders() if authenticated else []
+    ingress_base = get_ingress_base()
     auth_url = None
     debug_log = None
     if not authenticated:
@@ -492,7 +498,8 @@ def index():
         config=config, status=status, authenticated=authenticated,
         folders=folders, filter_options=FILTER_OPTIONS,
         delete_options=DELETE_OPTIONS, auth_url=auth_url,
-        debug_log=debug_log, log=log
+        debug_log=debug_log, log=log,
+        ingress_base=ingress_base
     )
 
 
@@ -543,11 +550,9 @@ def auth_complete():
         if not os.path.exists(AUTH_URL_FILE):
             auth_log("FEHLER: authUrl Datei fehlt")
             return jsonify({"success": False, "error": "Auth-Session abgelaufen – Link neu generieren", "error_short": "Session abgelaufen"}), 400
-
         with open(RESPONSE_URL_FILE, 'w') as f:
             f.write(response_url)
         auth_log("responseUrl geschrieben")
-
         auth_log("Starte onedrive --auth-files...")
         result = subprocess.run(
             ["onedrive", "--confdir", ONEDRIVE_CONFIG_DIR,
@@ -557,17 +562,14 @@ def auth_complete():
         auth_log(f"exit code: {result.returncode}")
         auth_log(f"stdout: {result.stdout[:800]}")
         auth_log(f"stderr: {result.stderr[:800]}")
-
         if os.path.exists(f"{ONEDRIVE_CONFIG_DIR}/refresh_token"):
             auth_log("SUCCESS: refresh_token erstellt")
             return jsonify({"success": True})
-
         short_err = "Unbekannter Fehler"
         for line in (result.stdout + result.stderr).splitlines():
             if "AADSTS" in line or "Error Reason" in line:
                 short_err = line.strip()[:80]
                 break
-
         auth_log(f"FEHLER: {short_err}")
         return jsonify({"success": False, "error": result.stderr or result.stdout, "error_short": short_err}), 400
     except Exception as e:
