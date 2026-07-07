@@ -14,7 +14,7 @@ host_network: false
 ports:
   8766/tcp: 8766
 ports_description:
-  8766/tcp: "Auth-Seite (nur fuer einmalige Microsoft Anmeldung)"
+  8766/tcp: "Auth-Seite (einmalige Microsoft Anmeldung)"
 options:
   sync_interval: 300
 schema:
