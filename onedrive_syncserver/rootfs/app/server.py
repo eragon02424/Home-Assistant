@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """OneDrive SyncServer - Web UI Backend
-Port 8765 = Ingress
+Port 8772 = Ingress
 Port 8771 = Direktzugriff (Device Code Flow Auth)
 """
 
@@ -17,8 +17,8 @@ from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
-IS_DIRECT = (PORT == 8771)
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8772
+IS_DIRECT = PORT in (8771, 8772)
 
 CONFIG_DIR = "/data"
 SYNC_CONFIG = f"{CONFIG_DIR}/sync_config.json"
@@ -30,14 +30,12 @@ DOWNLOAD_DIR = "/share/onedrive_downloads"
 LOG_FILE = f"{CONFIG_DIR}/sync.log"
 STATUS_FILE = f"{CONFIG_DIR}/sync_status.json"
 
-# abraunegg client_id - registriert fuer Device Code Flow bei Microsoft
 CLIENT_ID = "d50ca740-c83f-4d1b-b616-12c519384f0c"
 DEVICE_AUTH_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 SCOPE = "Files.ReadWrite Files.ReadWrite.All Sites.ReadWrite.All offline_access"
 
-# Globaler Polling-Thread State
 _poll_thread = None
 _poll_stop = threading.Event()
 
@@ -50,17 +48,28 @@ def save_device_state(state):
         json.dump(state, f)
 
 def load_device_state():
-    if os.path.exists(DEVICE_STATE_FILE):
-        with open(DEVICE_STATE_FILE) as f:
-            return json.load(f)
-    return None
+    """Laedt State-Datei, loescht sie automatisch wenn Code abgelaufen."""
+    if not os.path.exists(DEVICE_STATE_FILE):
+        return None
+    with open(DEVICE_STATE_FILE) as f:
+        state = json.load(f)
+    # Pruefen ob Code noch gueltig
+    created_at = state.get("created_at", 0)
+    expires_in = state.get("expires_in", 900)
+    if time.time() > created_at + expires_in:
+        os.remove(DEVICE_STATE_FILE)
+        auth_log("Device Code abgelaufen - State-Datei geloescht")
+        return None
+    # Verbleibende Zeit berechnen
+    remaining = int((created_at + expires_in) - time.time())
+    state["remaining_seconds"] = remaining
+    return state
 
 def clear_device_state():
     if os.path.exists(DEVICE_STATE_FILE):
         os.remove(DEVICE_STATE_FILE)
 
 def ms_post(url, data):
-    """POST zu Microsoft OAuth Endpoint."""
     encoded = urllib.parse.urlencode(data).encode()
     req = urllib.request.Request(url, data=encoded, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
@@ -72,9 +81,8 @@ def ms_post(url, data):
         return None, body
 
 def poll_for_token(device_code, interval, expires_at):
-    """Pollt im Hintergrund bis Token vorhanden oder abgelaufen."""
     global _poll_stop
-    auth_log(f"Polling gestartet, laeuft bis {time.strftime('%H:%M:%S', time.localtime(expires_at))}")
+    auth_log(f"Polling gestartet")
     while not _poll_stop.is_set():
         time.sleep(interval)
         if time.time() > expires_at:
@@ -101,7 +109,7 @@ def poll_for_token(device_code, interval, expires_at):
             os.makedirs(ONEDRIVE_CONFIG_DIR, exist_ok=True)
             with open(f"{ONEDRIVE_CONFIG_DIR}/refresh_token", 'w') as f:
                 f.write(result["refresh_token"])
-            auth_log("SUCCESS: refresh_token gespeichert via Device Code Flow")
+            auth_log("SUCCESS: refresh_token gespeichert")
             clear_device_state()
             break
 
@@ -231,19 +239,19 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                   margin: 16px 0; font-family: monospace; }
   .auth-link { display: inline-block; background: #3b82f6; color: white;
                 padding: 10px 20px; border-radius: 6px; text-decoration: none;
-                font-size: 1rem; font-weight: 500; margin-bottom: 12px; }
+                font-size: 1rem; font-weight: 500; margin-bottom: 4px; }
   .polling-indicator { display: flex; align-items: center; gap: 8px; color: #9ca3af;
                         font-size: 0.85rem; margin-top: 12px; }
   .pulse { width: 8px; height: 8px; background: #10b981; border-radius: 50%;
-            animation: pulse 1.5s infinite; }
+            animation: pulse 1.5s infinite; flex-shrink: 0; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
   .expires-bar { height: 4px; background: #374151; border-radius: 2px; margin-top: 12px; }
-  .expires-fill { height: 100%; background: #3b82f6; border-radius: 2px;
-                   transition: width 1s linear; }
+  .expires-fill { height: 100%; background: #3b82f6; border-radius: 2px; transition: width 1s linear; }
   .btn { padding: 8px 16px; border-radius: 6px; border: none; cursor: pointer;
          font-size: 0.9rem; font-weight: 500; margin-right: 4px; }
   .btn-primary { background: #3b82f6; color: white; }
   .btn-success { background: #10b981; color: white; }
+  .btn-warn { background: #6b7280; color: white; font-size: 0.8rem; padding: 6px 12px; }
   .folder-item { border-bottom: 1px solid #374151; }
   .folder-item:last-child { border-bottom: none; }
   .folder-row { display: flex; align-items: center; gap: 8px; padding: 10px 8px; flex-wrap: wrap; }
@@ -271,8 +279,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   .dl-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
   .dl-row input { flex: 1; min-width: 150px; width: auto; }
   .dl-result { margin-top: 10px; font-size: 0.85rem; }
-  .dl-result.ok { color: #10b981; }
-  .dl-result.err { color: #ef4444; }
+  .dl-result.ok { color: #10b981; } .dl-result.err { color: #ef4444; }
   .search-results { margin-top: 12px; }
   .search-result-item { display: flex; justify-content: space-between; align-items: center;
                          padding: 8px 10px; background: #111827; border-radius: 6px;
@@ -286,7 +293,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <div class="header">
   <span style="font-size:1.5rem">&#9729;</span>
   <h1>OneDrive SyncServer</h1>
-  {% if is_direct %}<span class="direct-badge">Direktzugriff Port 8771</span>{% endif %}
+  {% if is_direct %}<span class="direct-badge">Direktzugriff Port {{ port }}</span>{% endif %}
 </div>
 <div class="container">
 
@@ -308,9 +315,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         <div class="value" id="files-synced">{{ status.files_synced }}</div>
       </div>
     </div>
-    {% if status.errors %}
-      {% for err in status.errors[-3:] %}<div class="error-item">&#9888; {{ err }}</div>{% endfor %}
-    {% endif %}
+    {% if status.errors %}{% for err in status.errors[-3:] %}<div class="error-item">&#9888; {{ err }}</div>{% endfor %}{% endif %}
   </div>
 
   {% if not authenticated %}
@@ -318,27 +323,30 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <h2>Microsoft Anmeldung</h2>
     <div class="auth-box">
       {% if device_state %}
-        <p style="color:#9ca3af;font-size:0.9rem;margin-bottom:8px">
+        <p style="color:#9ca3af;font-size:0.9rem;margin-bottom:12px">
           Oeffne <strong>microsoft.com/devicelogin</strong> und gib diesen Code ein:
         </p>
-        <a href="{{ device_state.verification_uri }}" target="_blank" class="auth-link">
-          &#128279; microsoft.com/devicelogin oeffnen
-        </a>
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:4px">
+          <a href="{{ device_state.verification_uri }}" target="_blank" class="auth-link">
+            &#128279; microsoft.com/devicelogin oeffnen
+          </a>
+          <button class="btn btn-warn" onclick="newCode()">&#8635; Neuen Code generieren</button>
+        </div>
         <div class="device-code">{{ device_state.user_code }}</div>
         <div class="polling-indicator">
           <div class="pulse"></div>
-          Warte auf Bestaetigung... (automatisch, kein Klick noetig)
+          Warte auf Bestaetigung... (automatisch)
         </div>
         <div class="expires-bar">
-          <div class="expires-fill" id="expires-fill" style="width:100%"></div>
+          <div class="expires-fill" id="expires-fill" style="width:{{ ((device_state.remaining_seconds / device_state.expires_in) * 100)|int }}%"></div>
         </div>
         <p style="color:#6b7280;font-size:0.75rem;margin-top:8px" id="expires-text">
-          Code gueltig fuer {{ device_state.expires_in }}s
+          Code gueltig noch {{ device_state.remaining_seconds }}s
         </p>
       {% else %}
         <p style="color:#9ca3af;font-size:0.9rem;margin-bottom:16px">
-          Klicke auf den Button. Du wirst zu Microsoft weitergeleitet und gibst dort einen Code ein.
-          Die Seite aktualisiert sich automatisch nach der Anmeldung.
+          Klicke auf den Button. Oeffne dann microsoft.com/devicelogin, gib den angezeigten Code ein
+          und melde dich bei Microsoft an. Die Seite aktualisiert sich automatisch.
         </p>
         <button class="btn btn-primary" id="auth-btn" onclick="startDeviceAuth()">
           &#128279; Mit Microsoft anmelden
@@ -367,14 +375,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
           {% if enabled %}
           <div class="folder-controls">
             <select onchange="updateConfig('{{ folder }}', 'filter', this.value)">
-              {% for opt in filter_options %}
-              <option value="{{ opt.value }}" {% if cfg.get('filter','all') == opt.value %}selected{% endif %}>{{ opt.label }}</option>
-              {% endfor %}
+              {% for opt in filter_options %}<option value="{{ opt.value }}" {% if cfg.get('filter','all') == opt.value %}selected{% endif %}>{{ opt.label }}</option>{% endfor %}
             </select>
             <select onchange="updateConfig('{{ folder }}', 'delete_after', this.value)">
-              {% for opt in delete_options %}
-              <option value="{{ opt.value }}" {% if cfg.get('delete_after','never') == opt.value %}selected{% endif %}>{{ opt.label }}</option>
-              {% endfor %}
+              {% for opt in delete_options %}<option value="{{ opt.value }}" {% if cfg.get('delete_after','never') == opt.value %}selected{% endif %}>{{ opt.label }}</option>{% endfor %}
             </select>
             <label class="checkbox-label">
               <input type="checkbox" {% if not cfg.get('custom_local_path') %}checked{% endif %}
@@ -433,32 +437,27 @@ const BASE = "{{ base }}";
 function apiUrl(path) { return BASE + path; }
 
 {% if device_state and not authenticated %}
-// Countdown und Auto-Reload bei erfolgreicher Auth
 const expiresIn = {{ device_state.expires_in }};
-const startTime = Date.now();
+const remainingStart = {{ device_state.remaining_seconds }};
+let remaining = remainingStart;
 const fill = document.getElementById('expires-fill');
 const txt = document.getElementById('expires-text');
-
 function updateCountdown() {
-  const elapsed = (Date.now() - startTime) / 1000;
-  const remaining = Math.max(0, expiresIn - elapsed);
+  remaining--;
+  if (remaining <= 0) { location.reload(); return; }
   const pct = (remaining / expiresIn) * 100;
   if (fill) fill.style.width = pct + '%';
-  if (txt) txt.textContent = 'Code gueltig fuer ' + Math.round(remaining) + 's';
-  if (remaining <= 0) { location.reload(); return; }
+  if (txt) txt.textContent = 'Code gueltig noch ' + remaining + 's';
   setTimeout(updateCountdown, 1000);
 }
-updateCountdown();
-
-// Poll ob Auth erfolgreich
+setTimeout(updateCountdown, 1000);
 async function pollAuthStatus() {
-  const res = await fetch(apiUrl('/api/auth_status'));
-  const d = await res.json();
-  if (d.authenticated) {
-    location.reload();
-  } else {
-    setTimeout(pollAuthStatus, 3000);
-  }
+  try {
+    const res = await fetch(apiUrl('/api/auth_status'));
+    const d = await res.json();
+    if (d.authenticated) { location.reload(); return; }
+  } catch(e) {}
+  setTimeout(pollAuthStatus, 3000);
 }
 setTimeout(pollAuthStatus, 3000);
 {% endif %}
@@ -481,16 +480,20 @@ function toggleCustomPath(path, useStandard) {
 }
 async function startDeviceAuth() {
   const btn = document.getElementById('auth-btn');
-  btn.textContent = 'Wird gestartet...';
-  btn.disabled = true;
+  if (btn) { btn.textContent = 'Wird gestartet...'; btn.disabled = true; }
   const res = await fetch(apiUrl('/auth/device/start'), {method: 'POST'});
   if (res.ok) { location.reload(); }
   else {
     const d = await res.json();
     showToast('Fehler: ' + (d.error || 'unbekannt'), false);
-    btn.textContent = 'Mit Microsoft anmelden';
-    btn.disabled = false;
+    if (btn) { btn.textContent = 'Mit Microsoft anmelden'; btn.disabled = false; }
   }
+}
+async function newCode() {
+  showToast('Generiere neuen Code...');
+  const res = await fetch(apiUrl('/auth/device/reset'), {method: 'POST'});
+  if (res.ok) { location.reload(); }
+  else { showToast('Fehler beim Zuruecksetzen', false); }
 }
 async function saveConfig() {
   const res = await fetch(apiUrl('/api/config'), {
@@ -515,14 +518,8 @@ async function searchFile() {
     body: JSON.stringify({filename: name})
   });
   const d = await res.json();
-  if (!res.ok) {
-    container.innerHTML = '<p style="color:#ef4444;font-size:0.85rem">Fehler: ' + (d.error || 'unbekannt') + '</p>';
-    return;
-  }
-  if (d.found === 0) {
-    container.innerHTML = '<p style="color:#f59e0b;font-size:0.85rem">Keine Treffer.</p>';
-    return;
-  }
+  if (!res.ok) { container.innerHTML = '<p style="color:#ef4444;font-size:0.85rem">Fehler: ' + (d.error||'unbekannt') + '</p>'; return; }
+  if (d.found === 0) { container.innerHTML = '<p style="color:#f59e0b;font-size:0.85rem">Keine Treffer.</p>'; return; }
   let html = '<p style="color:#9ca3af;font-size:0.78rem;margin-bottom:8px">' + d.found + ' Treffer:</p>';
   d.locations.forEach(loc => {
     html += '<div class="search-result-item"><div><div>' + loc.name + '</div><div class="path">' + loc.path + '</div></div>' +
@@ -538,30 +535,29 @@ async function downloadById(itemId, filename) {
   });
   const d = await res.json();
   if (res.ok) { showToast('Gespeichert: ' + d.local_path); }
-  else { showToast('Fehler: ' + (d.error || 'unbekannt'), false); }
+  else { showToast('Fehler: ' + (d.error||'unbekannt'), false); }
 }
 async function downloadByPath() {
   const path = document.getElementById('dl-path').value.trim();
   const file = document.getElementById('dl-file').value.trim();
   const result = document.getElementById('dl-result');
   if (!path || !file) { showToast('Pfad und Dateiname benoetigt', false); return; }
-  result.textContent = 'Wird heruntergeladen...';
-  result.className = 'dl-result';
+  result.textContent = 'Wird heruntergeladen...'; result.className = 'dl-result';
   const res = await fetch(apiUrl('/api/download_by_path'), {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({path: path, filename: file})
   });
   const d = await res.json();
   if (res.ok) { result.textContent = 'Gespeichert: ' + d.local_path; result.className = 'dl-result ok'; }
-  else { result.textContent = 'Fehler: ' + (d.error || 'unbekannt'); result.className = 'dl-result err'; }
+  else { result.textContent = 'Fehler: ' + (d.error||'unbekannt'); result.className = 'dl-result err'; }
 }
 setInterval(async () => {
-  const res = await fetch(apiUrl('/api/status'));
-  const data = await res.json();
-  if (document.getElementById('last-sync'))
-    document.getElementById('last-sync').textContent = data.last_sync || 'Noch kein Sync';
-  if (document.getElementById('files-synced'))
-    document.getElementById('files-synced').textContent = data.files_synced;
+  try {
+    const res = await fetch(apiUrl('/api/status'));
+    const data = await res.json();
+    if (document.getElementById('last-sync')) document.getElementById('last-sync').textContent = data.last_sync || 'Noch kein Sync';
+    if (document.getElementById('files-synced')) document.getElementById('files-synced').textContent = data.files_synced;
+  } catch(e) {}
 }, 30000);
 </script>
 </body>
@@ -585,26 +581,20 @@ def index():
         config=config, status=status, authenticated=authenticated,
         folders=folders, filter_options=FILTER_OPTIONS,
         delete_options=DELETE_OPTIONS, device_state=device_state,
-        log=log, base=base, is_direct=IS_DIRECT
+        log=log, base=base, is_direct=IS_DIRECT, port=PORT
     )
 
 
 @app.route('/auth/device/start', methods=['POST'])
 def device_auth_start():
-    """Startet Device Code Flow: holt device_code + user_code von Microsoft."""
     global _poll_thread, _poll_stop
     try:
         os.makedirs(ONEDRIVE_CONFIG_DIR, exist_ok=True)
-        result, err = ms_post(DEVICE_AUTH_URL, {
-            "client_id": CLIENT_ID,
-            "scope": SCOPE,
-        })
+        result, err = ms_post(DEVICE_AUTH_URL, {"client_id": CLIENT_ID, "scope": SCOPE})
         if err:
             auth_log(f"Device Auth Fehler: {err}")
             return jsonify({"success": False, "error": err.get("error_description", str(err))}), 500
-
-        auth_log(f"Device Code erhalten: user_code={result.get('user_code')}")
-
+        auth_log(f"Device Code: user_code={result.get('user_code')}")
         state = {
             "user_code": result["user_code"],
             "device_code": result["device_code"],
@@ -614,13 +604,9 @@ def device_auth_start():
             "created_at": time.time()
         }
         save_device_state(state)
-
-        # Stoppe alten Polling-Thread falls vorhanden
         _poll_stop.set()
         if _poll_thread and _poll_thread.is_alive():
             _poll_thread.join(timeout=2)
-
-        # Starte neuen Polling-Thread
         _poll_stop = threading.Event()
         expires_at = time.time() + result["expires_in"]
         _poll_thread = threading.Thread(
@@ -629,11 +615,19 @@ def device_auth_start():
             daemon=True
         )
         _poll_thread.start()
-
         return jsonify({"success": True})
     except Exception as e:
-        auth_log(f"EXCEPTION device_auth_start: {e}")
+        auth_log(f"EXCEPTION: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/auth/device/reset', methods=['POST'])
+def device_auth_reset():
+    """Loescht alten Code und startet neuen Device Flow."""
+    global _poll_stop
+    _poll_stop.set()
+    clear_device_state()
+    return device_auth_start()
 
 
 @app.route('/api/auth_status')
