@@ -8,6 +8,7 @@ from pathlib import Path
 from aiohttp import web
 
 from device_manager import DeviceManager
+from log_manager import LogManager
 from api_routes import setup_routes
 
 logging.basicConfig(
@@ -38,6 +39,9 @@ async def main():
     keepalive_retries = opts.get("keepalive_retries", 5)
     keepalive_ping_timeout_ms = opts.get("keepalive_ping_timeout_ms", 500)
     keepalive_max_backoff_seconds = opts.get("keepalive_max_backoff_seconds", 21600)
+    log_retention_days = opts.get("log_retention_days", 10)
+
+    log_manager = LogManager(retention_days=log_retention_days)
 
     device_manager = DeviceManager(
         esphome_dashboard_url=esphome_dashboard_url,
@@ -47,6 +51,7 @@ async def main():
         keepalive_ping_timeout_ms=keepalive_ping_timeout_ms,
         keepalive_max_backoff_seconds=keepalive_max_backoff_seconds,
         bearer_token=bearer_token,
+        log_manager=log_manager,
     )
 
     _LOGGER.info("=" * 60)
@@ -56,6 +61,7 @@ async def main():
     _LOGGER.info("Keepalive: interval=%ds retries=%d timeout=%dms max_backoff=%ds",
                  keepalive_interval, keepalive_retries, keepalive_ping_timeout_ms,
                  keepalive_max_backoff_seconds)
+    _LOGGER.info("Log retention: %d days", log_retention_days)
     _LOGGER.info("Bearer Token: %s", device_manager.bearer_token)
     _LOGGER.info("=" * 60)
 
@@ -69,9 +75,11 @@ async def main():
                  len(device_manager.devices))
 
     asyncio.create_task(device_manager.run_discovery_loop())
+    asyncio.create_task(log_manager.run_prune_loop())
 
     app = web.Application()
     app["device_manager"] = device_manager
+    app["log_manager"] = log_manager
     app["bearer_token"] = device_manager.bearer_token
     setup_routes(app)
 
