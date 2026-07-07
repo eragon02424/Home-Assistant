@@ -1,0 +1,26 @@
+name: "OneDrive SyncServer"
+description: "Synchronisiert Ordner zwischen Home Assistant und Microsoft OneDrive. OneDrive ist immer Master. Pro-Ordner Filter, Vererbung und automatisches lokales Löschen nach Zeit."
+version: "1.0.0"
+slug: "onedrive_syncserver"
+init: false
+arch:
+  - amd64
+  - aarch64
+startup: services
+boot: auto
+ingress: true
+ingress_port: 8765
+host_network: false
+options:
+  sync_interval: 300
+schema:
+  sync_interval: int
+map:
+  - type: share
+    path: /share
+    read_only: false
+  - type: config
+    path: /config
+    read_only: true
+panel_icon: mdi:microsoft-onedrive
+panel_title: OneDrive Sync
