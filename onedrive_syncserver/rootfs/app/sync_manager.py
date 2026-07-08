@@ -6,12 +6,17 @@ Fuehrt den eigentlichen Sync durch:
    sync_list Datei mit Include/Exclude-Zeilen an den "Grenzen" zwischen
    aktivierten und deaktivierten Aesten - so werden abgewaehlte Ordner
    (auch verschachtelt) GAR NICHT erst heruntergeladen.
+   Wenn sich die sync_list gegenueber dem letzten Lauf geaendert hat,
+   verlangt onedrive einen --resync (Sicherheitsmechanismus gegen
+   ungewollten Datenverlust) - das wird automatisch erkannt und mit
+   --resync --resync-auth bestaetigt, aber NUR wenn wirklich noetig.
 2. onedrive --synchronize (OneDrive ist Master, no-remote-delete fuer
    lokale Loeschungen)
 3. Filtert Dateien innerhalb synchronisierter Ordner nach Dateityp/Alter
 4. Schreibt Status in sync_status.json
 """
 
+import hashlib
 import json
 import os
 import subprocess
@@ -25,6 +30,7 @@ CONFIG_DIR = "/data"
 SYNC_CONFIG = f"{CONFIG_DIR}/sync_config.json"
 ONEDRIVE_CONFIG_DIR = f"{CONFIG_DIR}/onedrive"
 SYNC_LIST_FILE = f"{ONEDRIVE_CONFIG_DIR}/sync_list"
+SYNC_LIST_HASH_FILE = f"{CONFIG_DIR}/sync_list.hash"
 SHARE_DIR = "/share/onedrive"
 STATUS_FILE = f"{CONFIG_DIR}/sync_status.json"
 
@@ -147,6 +153,8 @@ def resolve_enabled(path, config):
 def write_sync_list(config, all_folders):
     """
     Schreibt eine onedrive sync_list Datei mit Include/Exclude-Zeilen.
+    Gibt zurueck ob sich der Inhalt gegenueber dem letzten Lauf geaendert
+    hat (per Hash-Vergleich) - das entscheidet ob ein --resync noetig ist.
 
     WICHTIG: onedrive's sync_list ist eine reine POSITIVLISTE - sobald die
     Datei existiert, wird NUR synchronisiert was explizit als Include-Zeile
@@ -160,13 +168,13 @@ def write_sync_list(config, all_folders):
     (aktiviert->deaktiviert bzw. umgekehrt) eine Zeile - das erlaubt auch
     verschachteltes Ein-/Ausschalten (z.B. Dokumente an, Dokumente/Anno1404
     aus, Dokumente/Anno1800 und Anno2205 an).
-    Wenn nirgendwo eine Abweichung vom Standard (alles an) vorliegt, wird
-    keine sync_list geschrieben - dann laeuft der volle Sync wie gewohnt.
     """
+    changed = False
+
     if not all_folders:
         # Ordnerliste konnte nicht ermittelt werden - keine Einschraenkung
         # setzen, um nichts kaputt zu machen.
-        return
+        return changed
 
     top_level_folders = [f for f in all_folders if "/" not in f]
     includes = []
@@ -175,8 +183,6 @@ def write_sync_list(config, all_folders):
         cur_enabled = resolve_enabled(path, config)
         parts = path.split("/")
         if len(parts) == 1:
-            # Root-Ebene: IMMER als "nicht inklusiv" behandeln, damit jeder
-            # aktivierte Top-Ordner eine eigene Include-Zeile bekommt.
             parent_enabled = False
         else:
             parent_enabled = resolve_enabled("/".join(parts[:-1]), config)
@@ -185,46 +191,66 @@ def write_sync_list(config, all_folders):
         elif not cur_enabled and parent_enabled:
             excludes.append(f"!{path}/*")
 
-    # Wenn keine Ausschluesse existieren UND jeder Top-Ordner enthalten ist,
-    # ist alles Standard (an) - keine Einschraenkung noetig.
     if not excludes and len(includes) == len(top_level_folders):
+        # Alles Standard (an) - keine Einschraenkung noetig.
+        new_content = ""
+    else:
+        new_content = "\n".join(includes + excludes) + "\n"
+
+    new_hash = hashlib.sha256(new_content.encode()).hexdigest()
+    old_hash = None
+    if os.path.exists(SYNC_LIST_HASH_FILE):
+        with open(SYNC_LIST_HASH_FILE) as f:
+            old_hash = f.read().strip()
+
+    if new_hash != old_hash:
+        changed = True
+        with open(SYNC_LIST_HASH_FILE, 'w') as f:
+            f.write(new_hash)
+
+    if not new_content:
         if os.path.exists(SYNC_LIST_FILE):
             os.remove(SYNC_LIST_FILE)
         print("[sync_list] Alle Ordner aktiv - keine Einschraenkung")
-        return
+    else:
+        with open(SYNC_LIST_FILE, "w") as f:
+            f.write(new_content)
+        print(f"[sync_list] {len(includes)} Einschluss-, {len(excludes)} Ausschluss-Regeln geschrieben")
 
-    with open(SYNC_LIST_FILE, "w") as f:
-        for line in includes:
-            f.write(line + "\n")
-        for line in excludes:
-            f.write(line + "\n")
-    print(f"[sync_list] {len(includes)} Einschluss-, {len(excludes)} Ausschluss-Regeln geschrieben")
+    if changed:
+        print("[sync_list] Aenderung erkannt - naechster Sync laeuft mit --resync")
+
+    return changed
 
 
-def run_onedrive_sync():
+def run_onedrive_sync(need_resync):
     """Run onedrive sync with OneDrive as master.
     --no-remote-delete: local deletes don't propagate to OneDrive
     OneDrive deletions DO propagate locally (master behavior)
     sync_list (falls vorhanden) beschraenkt was ueberhaupt geladen wird.
+    --resync --resync-auth wird NUR mitgegeben wenn sich die sync_list
+    seit dem letzten Lauf geaendert hat (onedrive verlangt das sonst
+    interaktiv als Sicherheitsmechanismus und wuerde sonst gar nichts tun).
     """
+    cmd = [
+        "onedrive",
+        "--confdir", ONEDRIVE_CONFIG_DIR,
+        "--synchronize",
+        "--no-remote-delete",  # local deletes stay local
+        "--verbose"
+    ]
+    if need_resync:
+        cmd += ["--resync", "--resync-auth"]
     try:
-        result = subprocess.run(
-            [
-                "onedrive",
-                "--confdir", ONEDRIVE_CONFIG_DIR,
-                "--synchronize",
-                "--no-remote-delete",  # local deletes stay local
-                "--verbose"
-            ],
-            capture_output=True, text=True, timeout=300
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         print(result.stdout)
         if result.returncode != 0:
-            print(f"[WARN] onedrive exited with {result.returncode}: {result.stderr}")
-            return False, result.stderr
+            err_msg = result.stderr.strip() or result.stdout.strip()[-500:] or f"Exit-Code {result.returncode} ohne Fehlertext"
+            print(f"[WARN] onedrive exited with {result.returncode}: {err_msg}")
+            return False, err_msg
         return True, None
     except subprocess.TimeoutExpired:
-        return False, "Sync timeout after 300s"
+        return False, "Sync timeout after 600s"
     except Exception as e:
         return False, str(e)
 
@@ -303,18 +329,18 @@ def main():
     status = load_status()
     errors = []
 
-    # 0. sync_list VOR dem Sync setzen (rekursiv, alle Ebenen), damit
-    #    abgewaehlte Ordner - auch verschachtelt - gar nicht erst
-    #    heruntergeladen werden.
+    # 0. sync_list VOR dem Sync setzen (rekursiv, alle Ebenen). Erkennt
+    #    dabei ob sich die Auswahl geaendert hat - dann ist --resync noetig.
+    need_resync = False
     try:
         all_folders = list_all_folders()
-        write_sync_list(config, all_folders)
+        need_resync = write_sync_list(config, all_folders)
     except Exception as e:
         print(f"[WARN] Konnte sync_list nicht aktualisieren: {e}")
         errors.append(f"{datetime.now().strftime('%H:%M')} sync_list Fehler: {e}")
 
     # 1. Run onedrive sync
-    ok, err = run_onedrive_sync()
+    ok, err = run_onedrive_sync(need_resync)
     if not ok:
         errors.append(f"{datetime.now().strftime('%H:%M')} Sync error: {err}")
 
