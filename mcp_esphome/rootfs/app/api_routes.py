@@ -3,6 +3,8 @@ import logging
 
 from aiohttp import web
 
+import serial_flash
+
 _LOGGER = logging.getLogger("mcp_esphome.api")
 
 
@@ -119,6 +121,31 @@ def setup_routes(app: web.Application):
             return web.json_response(result, status=409)
         return web.json_response(result)
 
+    async def prepare_serial_flash(request):
+        name = request.match_info["device_name"]
+        result = device_manager.ensure_build_path(name)
+        if "error" in result:
+            return web.json_response(result, status=409)
+        return web.json_response(result)
+
+    async def flash_serial(request):
+        name = request.match_info["device_name"]
+        port = request.query.get("port")
+        if not port:
+            return web.json_response(
+                {"error": "query param 'port' is required, e.g. port=/dev/ttyACM0"},
+                status=400,
+            )
+        bin_path = device_manager.get_factory_bin_path(name)
+        try:
+            result = await serial_flash.flash_factory_bin(bin_path, port)
+        except FileNotFoundError as err:
+            return web.json_response({"error": str(err)}, status=404)
+        except Exception as err:
+            _LOGGER.error("Serial flash failed for %s: %s", name, err)
+            return web.json_response({"error": str(err)}, status=502)
+        return web.json_response(result)
+
     async def health(request):
         return web.json_response({"status": "ok", "devices": len(device_manager.devices)})
 
@@ -132,6 +159,8 @@ def setup_routes(app: web.Application):
     app.router.add_post("/devices/{device_name}/compile", start_compile)
     app.router.add_post("/devices/{device_name}/install", start_install)
     app.router.add_post("/devices/{device_name}/fix_serial_upload_speed", fix_serial_upload_speed)
+    app.router.add_post("/devices/{device_name}/prepare_serial_flash", prepare_serial_flash)
+    app.router.add_post("/devices/{device_name}/flash_serial", flash_serial)
     app.router.add_get("/jobs/{job_id}/status", get_job_status)
     app.router.add_get("/jobs/{job_id}/error_summary", get_error_summary)
     app.router.add_get("/jobs/{job_id}/full_log", get_full_log)
