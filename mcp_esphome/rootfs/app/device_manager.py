@@ -1,6 +1,6 @@
 """Device Manager - handles ESPHome device discovery and heartbeat history.
 
-Architecture (v0.17.2):
+Architecture (v0.18.0):
 ───────────────────────
 DISCOVERY (at startup, then every DISCOVERY_INTERVAL_SECONDS)
   Fetch /devices. For every device not yet known: register it (address,
@@ -54,16 +54,36 @@ fast TCP-ping keepalive on purpose.
   every DISCOVERY_INTERVAL_SECONDS), NOT to our own fast TCP-ping-based
   online/offline flips.
 
-SERIAL UPLOAD FIX (ensure_serial_upload_speed, v0.17.2)
-  ESP32-S2/S3 boards with native USB-CDC (no external USB-serial chip)
-  are known to lose their serial port mid-flash: ESPHome resets the
-  device before uploading, which makes the native-USB peripheral
-  re-enumerate, and the automatic baud-rate fallback (460800, then
-  retry at 115200) fails because by the second attempt the port is
-  already gone. Forcing upload_speed: 115200 from the start often
-  avoids the race outright. See github.com/esphome/issues/issues/4090.
-  ensure_serial_upload_speed() edits the device's YAML to add this,
-  safely (only when no conflicting platformio_options block exists).
+SERIAL FLASH (v0.18.0) — the ACTUAL fix from esphome/issues#4090,
+NOT the upload_speed workaround (v0.17.2, kept but confirmed
+insufficient by itself). ESPHome's own serial upload always resets the
+device before writing, which kills the ESP32-S2/S3's native-USB port
+mid-flash. The working fix is to have ESPHome only COMPILE (never let
+it touch the serial port at all) and flash the result with a separate
+tool that uses --before no_reset.
+
+This requires the compiled .bin to be somewhere our OWN addon container
+can read. By default it is not: ESPHome's build artifacts live under
+the ESPHome ADDON's private /data volume, a different container's
+private Docker volume with no supported cross-addon mapping in Home
+Assistant's addon permission model (checked: no map: type exposes
+another addon's /data; HA File Server's allowed paths are /config and
+/addons only). The fix: ESPHome's own esphome: build_path YAML option
+(documented core config, confirmed still honored in this ESPHome
+version by direct testing) can redirect the build directory to
+anywhere ESPHome's OWN process can write -- including /config/esphome/,
+which IS mapped into our container (map: config:rw). Setting
+build_path: /config/esphome/.build/<name> makes the compiled
+firmware.factory.bin (single merged image: bootloader + partitions +
+app at their correct flash offsets, exactly what a fresh serial flash
+needs) land at a path our addon can read directly.
+  ensure_build_path() sets this (same safe-insertion pattern as
+  ensure_serial_upload_speed).
+  get_factory_bin_path() resolves where the compiled binary should be
+  once a compile has succeeded.
+Actual flashing (esptool subprocess with --before no_reset) lives in
+serial_flash.py, since it's a separate concern from YAML/file
+management.
 
 Every TCP ping attempt logs its duration in ms.
 """
@@ -91,6 +111,7 @@ _LOGGER = logging.getLogger("mcp_esphome.device_manager")
 
 STORAGE_DIR = Path("/data/mcp_esphome")
 ESPHOME_CONFIG_DIR = Path("/config/esphome")
+BUILD_DIR_ROOT = ESPHOME_CONFIG_DIR / ".build"
 DISCOVERY_INTERVAL_SECONDS = 120
 BEARER_TOKEN_FILE = STORAGE_DIR / "bearer_token.txt"
 MDNS_SERVICE_TYPE = "_esphomelib._tcp.local."
@@ -238,68 +259,113 @@ class DeviceManager:
         match = _NOISE_KEY_RE.search(content)
         return match.group(1) if match else None
 
-    # ── Serial upload speed fix (esphome/issues#4090) ──────────
+    # ── YAML config helpers ─────────────────────────────────────
 
-    def ensure_serial_upload_speed(self, device_name: str, speed: int = 115200) -> dict:
-        """Ensures esphome.platformio_options.upload_speed is set in the
-        device's YAML config. Fixes a known ESP32-S2/S3 (native
-        USB-CDC) serial-upload failure: ESPHome resets the device
-        before uploading, which makes the native-USB peripheral
-        re-enumerate and drop its port out from under the flash tool;
-        the automatic baud-rate fallback (tries 460800 first, then
-        retries at 115200) fails because by the second attempt the
-        port is already gone. Forcing 115200 from the very first
-        attempt often avoids that race entirely.
-        Source: github.com/esphome/issues/issues/4090.
-
-        Only two safe outcomes are attempted:
-          - The exact setting is already present -> no-op.
-          - No platformio_options block exists at all -> inserted right
-            after the top-level 'esphome:' line.
-        Anything else (a platformio_options block exists but without
-        this exact upload_speed) is reported as an error asking for a
-        manual edit, rather than risking corrupting the existing YAML
-        with a naive text insertion.
-
-        Returns {"changed": bool, "already_present": bool, "path": str}
-        on success, or {"error": str} otherwise.
-        """
+    def _config_path(self, device_name: str) -> Path:
         device = self.devices.get(device_name)
         configuration_file = device.configuration_file if device else f"{device_name}.yaml"
         filename = Path(configuration_file).name if configuration_file else f"{device_name}.yaml"
-        path = ESPHOME_CONFIG_DIR / filename
+        return ESPHOME_CONFIG_DIR / filename
 
+    def _insert_after_esphome_line(self, device_name: str, insertion: str) -> dict:
+        """Shared helper: inserts `insertion` right after the top-level
+        'esphome:' line in the device's YAML, IF that exact text isn't
+        already present anywhere in the file. Returns
+        {"changed": bool, "already_present": bool, "path": str} or
+        {"error": str}.
+        """
+        path = self._config_path(device_name)
         try:
             content = path.read_text(encoding="utf-8")
         except Exception as err:
             return {"error": f"Could not read {path}: {err}"}
 
-        if re.search(rf"upload_speed\s*:\s*{speed}\b", content):
+        if insertion.strip() in content:
             return {"changed": False, "already_present": True, "path": str(path)}
-
-        if re.search(r"^\s*platformio_options\s*:", content, re.MULTILINE):
-            return {
-                "error": (
-                    "platformio_options: existiert bereits in der Config, aber ohne "
-                    f"upload_speed: {speed} — automatisches Einfügen übersprungen, "
-                    "um die bestehende YAML nicht zu beschädigen. Bitte manuell ergänzen."
-                )
-            }
 
         lines = content.splitlines(keepends=True)
         for i, line in enumerate(lines):
             if re.match(r"^esphome:\s*$", line):
-                insertion = f"  platformio_options:\n    upload_speed: {speed}\n"
                 lines.insert(i + 1, insertion)
-                new_content = "".join(lines)
                 try:
-                    path.write_text(new_content, encoding="utf-8")
+                    path.write_text("".join(lines), encoding="utf-8")
                 except Exception as err:
                     return {"error": f"Could not write {path}: {err}"}
-                _LOGGER.info("Added platformio_options.upload_speed: %d to %s", speed, path)
                 return {"changed": True, "already_present": False, "path": str(path)}
 
         return {"error": f"No top-level 'esphome:' block found in {path}"}
+
+    def ensure_serial_upload_speed(self, device_name: str, speed: int = 115200) -> dict:
+        """Ensures esphome.platformio_options.upload_speed is set.
+        By itself this does NOT reliably fix the ESP32-S2/S3 native-USB
+        serial-upload issue (confirmed insufficient in practice) -- see
+        ensure_build_path() / serial_flash.py for the fix that actually
+        works. Kept as a harmless secondary measure.
+        Source: github.com/esphome/issues/issues/4090.
+        """
+        device = self.devices.get(device_name)
+        configuration_file = device.configuration_file if device else f"{device_name}.yaml"
+        path = self._config_path(device_name)
+        try:
+            content = path.read_text(encoding="utf-8")
+        except Exception as err:
+            return {"error": f"Could not read {path}: {err}"}
+        if re.search(rf"upload_speed\s*:\s*{speed}\b", content):
+            return {"changed": False, "already_present": True, "path": str(path)}
+        if re.search(r"^\s*platformio_options\s*:", content, re.MULTILINE):
+            return {
+                "error": (
+                    "platformio_options: existiert bereits, aber ohne "
+                    f"upload_speed: {speed} — automatisches Einfügen übersprungen."
+                )
+            }
+        return self._insert_after_esphome_line(
+            device_name, f"  platformio_options:\n    upload_speed: {speed}\n"
+        )
+
+    def ensure_build_path(self, device_name: str) -> dict:
+        """Ensures esphome.build_path points at
+        /config/esphome/.build/<name> -- a location our OWN addon
+        container can read (unlike the default build location, which
+        lives in the ESPHome addon's private /data volume). This is
+        the prerequisite for serial_flash.py to find the compiled
+        firmware.factory.bin after a compile.
+        """
+        if re.search(r"^\s*build_path\s*:", self._safe_read(device_name), re.MULTILINE):
+            path = self._config_path(device_name)
+            content = self._safe_read(device_name)
+            match = re.search(r"^\s*build_path\s*:\s*(.+)$", content, re.MULTILINE)
+            configured = match.group(1).strip() if match else "?"
+            expected = str(self.get_build_dir(device_name))
+            if configured == expected:
+                return {"changed": False, "already_present": True, "path": str(path)}
+            return {
+                "error": (
+                    f"build_path ist bereits gesetzt, aber auf einen anderen Wert "
+                    f"({configured!r} statt {expected!r}) — automatisches Ändern übersprungen."
+                )
+            }
+        build_dir = self.get_build_dir(device_name)
+        return self._insert_after_esphome_line(
+            device_name, f"  build_path: {build_dir}\n"
+        )
+
+    def _safe_read(self, device_name: str) -> str:
+        try:
+            return self._config_path(device_name).read_text(encoding="utf-8")
+        except Exception:
+            return ""
+
+    def get_build_dir(self, device_name: str) -> Path:
+        return BUILD_DIR_ROOT / device_name
+
+    def get_factory_bin_path(self, device_name: str) -> Path:
+        """Where firmware.factory.bin (the single merged image: bootloader
+        + partitions + app at their correct offsets -- exactly what a
+        fresh serial flash needs in one write) lands after a successful
+        compile, ASSUMING ensure_build_path() has been applied.
+        """
+        return self.get_build_dir(device_name) / ".pioenvs" / device_name / "firmware.factory.bin"
 
     # ── TCP ping ──────────────────────────────────────────────
 
