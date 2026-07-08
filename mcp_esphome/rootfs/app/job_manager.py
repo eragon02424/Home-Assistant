@@ -17,28 +17,29 @@ command/response protocol.
   - firmware/install {configuration, port}: same shape as compile, but
     once the compile phase succeeds ESPHome AUTOMATICALLY chains a
     SEPARATE upload job (its own new job_id, linked via depends_on back
-    to the compile job_id) that performs the actual flash. Confirmed by
-    testing: this chained job_id is never returned to the caller
-    directly by firmware/install, and there is no documented WS command
-    to list jobs for a device/configuration. The only way found to
-    discover it is to watch the ESPHome addon's OWN service log for the
-    line "Starting job <id>: upload <configuration>" that appears the
-    moment the chained job starts. This requires hassio_api/manager
-    permissions (see config.yaml) to read that addon's Supervisor logs
-    from inside our own container.
+    to the compile job_id) that performs the actual flash. This chained
+    job_id is never returned to the caller directly, and there is no
+    documented WS command to list jobs for a device/configuration. The
+    only way found to discover it is to watch the ESPHome addon's OWN
+    service log for "Starting job <id>: upload <configuration>". This
+    requires hassio_api/manager permissions (see config.yaml).
   - firmware/get_job {job_id}: returns the current FirmwareJob snapshot.
     CONFIRMED: once a job reaches a terminal state, ESPHome clears
     "output" back to [] and "error" stays null, even for real errors.
-    Polling get_job AFTER completion cannot recover the error text.
   - firmware/follow_job {job_id}: streams the SAME output frames live,
     terminated by a "result" event. This is the ONLY way to capture
     build/upload output/errors -- must be attached while the job runs.
 
 Because of this, jobs here are tracked with our OWN in-memory Job
-objects that accumulate output via firmware/follow_job as it streams,
-independent of what ESPHome's own job objects still hold once finished.
+objects that accumulate output via firmware/follow_job as it streams.
 For install(), TWO phases (compile, then upload) are followed in
-sequence and their output is concatenated into the same Job.
+sequence and concatenated into the same Job.output. Compile can already
+be inspected separately via start_compile(), so install() additionally
+tracks flash_output_start_index -- the position in job.output where the
+upload/flash phase's own output begins (right after our own marker
+line) -- letting callers fetch ONLY the flash-phase log via
+get_flash_log(), skipping the compile portion they may not care about
+here since it's redundant with the standalone compile endpoint.
 """
 import asyncio
 import logging
@@ -73,6 +74,9 @@ class Job:
     created_at: float = field(default_factory=time.time)
     completed_at: Optional[float] = None
     follow_task: Optional[asyncio.Task] = None
+    # For job_type "install" only: index into `output` where the
+    # upload/flash phase's own lines start (None until that phase begins).
+    flash_output_start_index: Optional[int] = None
 
 
 class JobManager:
@@ -168,8 +172,11 @@ class JobManager:
     async def start_install(self, device_name: str) -> str:
         """Starts firmware/install with port=OTA (WiFi). ESPHome chains
         a compile phase followed automatically by a separate upload
-        phase (own job_id). Both are followed live and their output is
-        concatenated into the same Job.
+        phase (own job_id). Both are followed live; job.output holds
+        the combined log, while job.flash_output_start_index marks where
+        the upload/flash portion begins, so callers who already know
+        compile succeeded (e.g. via a prior start_compile() call) can
+        fetch just the flash-phase log via get_flash_log().
         """
         configuration = f"{device_name}.yaml"
         session, ws = await self._connect()
@@ -206,19 +213,20 @@ class JobManager:
         if not compile_ok:
             return  # compile itself failed; job.status/exit_code/error already set
 
-        job.output.append("\n--- compile OK — suche verketteten Upload-Job ---\n")
         upload_job_id = await self._find_chained_job_id(configuration, timeout=30)
         if upload_job_id is None:
             job.output.append(
                 "Kein Upload-Job innerhalb von 30s gefunden — "
                 "Installation eventuell nicht fortgesetzt oder Erkennung fehlgeschlagen.\n"
             )
+            job.flash_output_start_index = len(job.output) - 1
             job.status = "unknown"
             job.completed_at = time.time()
             _LOGGER.warning("Could not discover chained upload job for %s", job.device_name)
             return
 
-        job.output.append(f"Upload-Job gefunden: {upload_job_id}\n")
+        # Mark exactly where the flash-phase's own output will start.
+        job.flash_output_start_index = len(job.output)
         await self._follow_one_phase(job, upload_job_id, "upload")
 
     async def _follow_one_phase(self, job: Job, esphome_job_id: str, phase_label: str) -> bool:
@@ -341,6 +349,7 @@ class JobManager:
             "created_at": job.created_at,
             "completed_at": job.completed_at,
             "output_lines": len(job.output),
+            "flash_phase_started": job.flash_output_start_index is not None,
         }
 
     def get_full_log(self, job_id: str) -> Optional[str]:
@@ -348,6 +357,22 @@ class JobManager:
         if job is None:
             return None
         return "".join(job.output)
+
+    def get_flash_log(self, job_id: str) -> Optional[dict]:
+        """Only the flash/upload phase's own output, skipping the
+        compile portion. For job_type='compile' jobs (no flash phase
+        at all), or an 'install' job where the flash phase hasn't
+        started yet (still compiling, or compile failed), returns an
+        empty log with a note explaining why.
+        """
+        job = self.jobs.get(job_id)
+        if job is None:
+            return None
+        if job.job_type != "install":
+            return {"log": "", "note": "Dieser Job hat keine Flash-Phase (job_type != 'install')."}
+        if job.flash_output_start_index is None:
+            return {"log": "", "note": "Flash-Phase hat noch nicht begonnen (Compile läuft noch oder ist fehlgeschlagen)."}
+        return {"log": "".join(job.output[job.flash_output_start_index:]), "note": None}
 
     def get_error_summary(self, job_id: str, context_lines: int = 30) -> Optional[str]:
         job = self.jobs.get(job_id)
