@@ -146,12 +146,20 @@ def resolve_enabled(path, config):
 
 def write_sync_list(config, all_folders):
     """
-    Schreibt eine onedrive sync_list Datei mit Include/Exclude-Zeilen genau
-    an den UEBERGAENGEN zwischen aktiviertem und deaktiviertem Zustand -
-    das erlaubt auch verschachteltes Ein-/Ausschalten (z.B. Unterordner
-    innerhalb eines aktivierten Ordners gezielt ausschliessen, oder
-    umgekehrt ein Unterordner innerhalb eines deaktivierten Astes gezielt
-    wieder einschliessen).
+    Schreibt eine onedrive sync_list Datei mit Include/Exclude-Zeilen.
+
+    WICHTIG: onedrive's sync_list ist eine reine POSITIVLISTE - sobald die
+    Datei existiert, wird NUR synchronisiert was explizit als Include-Zeile
+    drinsteht. Deshalb bekommt JEDER aktivierte Top-Level-Ordner immer eine
+    explizite Include-Zeile (Root-Ebene wird bewusst als "nicht inklusiv"
+    behandelt, anders als tiefere Ebenen die vom Elternordner erben) -
+    andernfalls wuerden default-aktive Top-Ordner beim Schreiben der Datei
+    versehentlich mit ausgeschlossen, sobald IRGENDWO im Baum eine
+    Abweichung vorliegt.
+    Tiefere Ebenen bekommen nur an den tatsaechlichen Uebergaengen
+    (aktiviert->deaktiviert bzw. umgekehrt) eine Zeile - das erlaubt auch
+    verschachteltes Ein-/Ausschalten (z.B. Dokumente an, Dokumente/Anno1404
+    aus, Dokumente/Anno1800 und Anno2205 an).
     Wenn nirgendwo eine Abweichung vom Standard (alles an) vorliegt, wird
     keine sync_list geschrieben - dann laeuft der volle Sync wie gewohnt.
     """
@@ -160,18 +168,26 @@ def write_sync_list(config, all_folders):
         # setzen, um nichts kaputt zu machen.
         return
 
+    top_level_folders = [f for f in all_folders if "/" not in f]
     includes = []
     excludes = []
     for path in all_folders:
         cur_enabled = resolve_enabled(path, config)
         parts = path.split("/")
-        parent_enabled = True if len(parts) == 1 else resolve_enabled("/".join(parts[:-1]), config)
+        if len(parts) == 1:
+            # Root-Ebene: IMMER als "nicht inklusiv" behandeln, damit jeder
+            # aktivierte Top-Ordner eine eigene Include-Zeile bekommt.
+            parent_enabled = False
+        else:
+            parent_enabled = resolve_enabled("/".join(parts[:-1]), config)
         if cur_enabled and not parent_enabled:
             includes.append(f"{path}/*")
         elif not cur_enabled and parent_enabled:
             excludes.append(f"!{path}/*")
 
-    if not includes and not excludes:
+    # Wenn keine Ausschluesse existieren UND jeder Top-Ordner enthalten ist,
+    # ist alles Standard (an) - keine Einschraenkung noetig.
+    if not excludes and len(includes) == len(top_level_folders):
         if os.path.exists(SYNC_LIST_FILE):
             os.remove(SYNC_LIST_FILE)
         print("[sync_list] Alle Ordner aktiv - keine Einschraenkung")
