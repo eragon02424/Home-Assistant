@@ -111,6 +111,14 @@ def setup_routes(app: web.Application):
             return web.json_response({"error": "job not found"}, status=404)
         return web.json_response(result)
 
+    async def fix_serial_upload_speed(request):
+        name = request.match_info["device_name"]
+        speed = int(request.query.get("speed", 115200))
+        result = device_manager.ensure_serial_upload_speed(name, speed)
+        if "error" in result:
+            return web.json_response(result, status=409)
+        return web.json_response(result)
+
     async def health(request):
         return web.json_response({"status": "ok", "devices": len(device_manager.devices)})
 
@@ -123,6 +131,7 @@ def setup_routes(app: web.Application):
     app.router.add_post("/devices/{device_name}/validate", validate_config)
     app.router.add_post("/devices/{device_name}/compile", start_compile)
     app.router.add_post("/devices/{device_name}/install", start_install)
+    app.router.add_post("/devices/{device_name}/fix_serial_upload_speed", fix_serial_upload_speed)
     app.router.add_get("/jobs/{job_id}/status", get_job_status)
     app.router.add_get("/jobs/{job_id}/error_summary", get_error_summary)
     app.router.add_get("/jobs/{job_id}/full_log", get_full_log)
