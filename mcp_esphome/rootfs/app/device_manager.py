@@ -1,6 +1,6 @@
 """Device Manager - handles ESPHome device discovery and heartbeat history.
 
-Architecture (v0.15.3):
+Architecture (v0.17.2):
 ───────────────────────
 DISCOVERY (at startup, then every DISCOVERY_INTERVAL_SECONDS)
   Fetch /devices. For every device not yet known: register it (address,
@@ -25,14 +25,7 @@ PER-DEVICE KEEPALIVE TASK (never dies once started)
   and triggers an immediate re-ping.
 
   This TCP-ping keepalive is the ONLY source of online/offline
-  detection. Measured directly against a real power-loss test (device
-  physically unplugged/replugged, timestamps compared): it detected
-  both offline and online transitions in 1.5-6.3s. A prior attempt
-  (v0.15.1) to also use the LogManager persistent connection's own
-  connect/on_stop events as a second, supposedly-faster signal was
-  tested the same way and found to be unreliable — it did not notice
-  the actual power loss at all until the device reconnected 21-35s
-  later, and was reverted (see log_manager.py history).
+  detection.
 
 BACKOFF CAP
   cap_multiplier is the smallest power of two such that
@@ -41,12 +34,9 @@ BACKOFF CAP
 mDNS LISTENER (global)
   add_service/update_service fires for every announce. If the device is
   known, its wake_event is set via loop.call_soon_threadsafe, waking the
-  keepalive task. As of v0.15.3 the SAME announce is also forwarded to
+  keepalive task. The SAME announce is also forwarded to
   LogManager.on_mdns_announce(), which wakes an already-running log
-  subscription task immediately (forces a fresh connect even if it
-  hasn't noticed a disconnect yet — see log_manager.py for why that
-  matters, especially for short deep-sleep wake windows). This is
-  independent of whether device.wake_event exists yet.
+  subscription task immediately.
   This same AsyncZeroconf instance is exposed via get_zeroconf_instance()
   so LogManager's aioesphomeapi clients can share it instead of each
   creating their own.
@@ -62,10 +52,18 @@ fast TCP-ping keepalive on purpose.
   The log-subscription task's lifecycle (start/stop) is tied to
   device.esphome_reports_online (ESPHome's own "state" field, refreshed
   every DISCOVERY_INTERVAL_SECONDS), NOT to our own fast TCP-ping-based
-  online/offline flips. Once started, mDNS announces (see above) wake it
-  early on top of its normal RETRY_SECONDS cadence. The log connection's
-  own state is used only for logging, never for online/offline
-  detection (see BACKOFF CAP section above).
+  online/offline flips.
+
+SERIAL UPLOAD FIX (ensure_serial_upload_speed, v0.17.2)
+  ESP32-S2/S3 boards with native USB-CDC (no external USB-serial chip)
+  are known to lose their serial port mid-flash: ESPHome resets the
+  device before uploading, which makes the native-USB peripheral
+  re-enumerate, and the automatic baud-rate fallback (460800, then
+  retry at 115200) fails because by the second attempt the port is
+  already gone. Forcing upload_speed: 115200 from the start often
+  avoids the race outright. See github.com/esphome/issues/issues/4090.
+  ensure_serial_upload_speed() edits the device's YAML to add this,
+  safely (only when no conflicting platformio_options block exists).
 
 Every TCP ping attempt logs its duration in ms.
 """
@@ -239,6 +237,69 @@ class DeviceManager:
             return None
         match = _NOISE_KEY_RE.search(content)
         return match.group(1) if match else None
+
+    # ── Serial upload speed fix (esphome/issues#4090) ──────────
+
+    def ensure_serial_upload_speed(self, device_name: str, speed: int = 115200) -> dict:
+        """Ensures esphome.platformio_options.upload_speed is set in the
+        device's YAML config. Fixes a known ESP32-S2/S3 (native
+        USB-CDC) serial-upload failure: ESPHome resets the device
+        before uploading, which makes the native-USB peripheral
+        re-enumerate and drop its port out from under the flash tool;
+        the automatic baud-rate fallback (tries 460800 first, then
+        retries at 115200) fails because by the second attempt the
+        port is already gone. Forcing 115200 from the very first
+        attempt often avoids that race entirely.
+        Source: github.com/esphome/issues/issues/4090.
+
+        Only two safe outcomes are attempted:
+          - The exact setting is already present -> no-op.
+          - No platformio_options block exists at all -> inserted right
+            after the top-level 'esphome:' line.
+        Anything else (a platformio_options block exists but without
+        this exact upload_speed) is reported as an error asking for a
+        manual edit, rather than risking corrupting the existing YAML
+        with a naive text insertion.
+
+        Returns {"changed": bool, "already_present": bool, "path": str}
+        on success, or {"error": str} otherwise.
+        """
+        device = self.devices.get(device_name)
+        configuration_file = device.configuration_file if device else f"{device_name}.yaml"
+        filename = Path(configuration_file).name if configuration_file else f"{device_name}.yaml"
+        path = ESPHOME_CONFIG_DIR / filename
+
+        try:
+            content = path.read_text(encoding="utf-8")
+        except Exception as err:
+            return {"error": f"Could not read {path}: {err}"}
+
+        if re.search(rf"upload_speed\s*:\s*{speed}\b", content):
+            return {"changed": False, "already_present": True, "path": str(path)}
+
+        if re.search(r"^\s*platformio_options\s*:", content, re.MULTILINE):
+            return {
+                "error": (
+                    "platformio_options: existiert bereits in der Config, aber ohne "
+                    f"upload_speed: {speed} — automatisches Einfügen übersprungen, "
+                    "um die bestehende YAML nicht zu beschädigen. Bitte manuell ergänzen."
+                )
+            }
+
+        lines = content.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            if re.match(r"^esphome:\s*$", line):
+                insertion = f"  platformio_options:\n    upload_speed: {speed}\n"
+                lines.insert(i + 1, insertion)
+                new_content = "".join(lines)
+                try:
+                    path.write_text(new_content, encoding="utf-8")
+                except Exception as err:
+                    return {"error": f"Could not write {path}: {err}"}
+                _LOGGER.info("Added platformio_options.upload_speed: %d to %s", speed, path)
+                return {"changed": True, "already_present": False, "path": str(path)}
+
+        return {"error": f"No top-level 'esphome:' block found in {path}"}
 
     # ── TCP ping ──────────────────────────────────────────────
 
