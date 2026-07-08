@@ -15,11 +15,14 @@ Leben bleiben bis der Code-Austausch passiert ist.
 
 WICHTIG 3: Die Ordner-Konfiguration laedt Ordner LAZY per Graph API - nur
 die aktuell sichtbare Ebene wird geladen, Unterordner erst beim Aufklappen
-per Klick (/api/folder_children). Das spart API-Calls bei grossen
-OneDrive-Strukturen. sync_manager.py nutzt die gespeicherte Konfiguration
-dann um beim naechsten Sync eine onedrive sync_list mit Grenzwert-
-Include/Exclude-Regeln zu schreiben (dort weiterhin vollstaendig rekursiv,
-da das ein Hintergrundprozess ist und nicht die UI blockiert).
+per Klick (/api/folder_children).
+
+WICHTIG 4: trigger_sync() startet sync_manager.py in einem Thread mit
+grossem Timeout (1800s) - sync_manager.py listet bei grossen OneDrive-
+Strukturen rekursiv ALLE Ordner (ein API-Call pro Ordner), das kann bei
+hunderten Ordnern mehrere Minuten dauern. Der aeussere Timeout hier MUSS
+grosszuegiger sein als jeder innere Timeout in sync_manager.py, sonst wird
+der Prozess mitten in der Ordnerermittlung abgewuergt.
 """
 
 import json
@@ -563,7 +566,7 @@ async function saveConfig() {
   else { showToast('Fehler beim Speichern', false); }
 }
 async function triggerSync() {
-  showToast('Sync gestartet...');
+  showToast('Sync gestartet - kann bei vielen Ordnern mehrere Minuten dauern...');
   await fetch(apiUrl('/api/sync'), {method: 'POST'});
   setTimeout(() => location.reload(), 3000);
 }
@@ -836,7 +839,14 @@ def get_status():
 @app.route('/api/sync', methods=['POST'])
 def trigger_sync():
     def run_sync():
-        subprocess.run(["python3", "/app/sync_manager.py"], timeout=300)
+        try:
+            # Grosszuegiger Timeout - MUSS ueber jedem inneren Timeout in
+            # sync_manager.py liegen, sonst wird bei grossen OneDrive-
+            # Strukturen (viele Ordner = viele API-Calls) mitten in der
+            # Ordnerermittlung abgewuergt.
+            subprocess.run(["python3", "/app/sync_manager.py"], timeout=1800)
+        except subprocess.TimeoutExpired:
+            auth_log("Sync-Wrapper Timeout nach 1800s - Sync abgebrochen")
     threading.Thread(target=run_sync, daemon=True).start()
     return jsonify({"success": True})
 
