@@ -3,17 +3,16 @@
 
 Fuehrt den eigentlichen Sync durch:
 0. Prueft eine Lock-Datei um zu verhindern dass zwei Sync-Laeufe
-   gleichzeitig laufen (z.B. manueller Klick waehrend der 5-Minuten-Timer
-   ausloest) - das kann sonst zu SQLite-Konflikten und haengenden Prozessen
-   fuehren.
+   gleichzeitig laufen.
 1. Ermittelt ALLE Ordner (rekursiv) via Graph API und schreibt eine
    sync_list Datei mit Include/Exclude-Zeilen an den "Grenzen" zwischen
    aktivierten und deaktivierten Aesten - so werden abgewaehlte Ordner
    (auch verschachtelt) GAR NICHT erst heruntergeladen.
+   Nutzt requests.Session() fuer Connection-Pooling/Keep-Alive - ohne das
+   baut jeder einzelne API-Call eine neue TLS-Verbindung auf, was bei
+   hunderten Ordnern mehrere Minuten zusaetzliche Zeit kostet.
    Wenn sich die sync_list gegenueber dem letzten Lauf geaendert hat,
-   verlangt onedrive einen --resync (Sicherheitsmechanismus gegen
-   ungewollten Datenverlust) - das wird automatisch erkannt und mit
-   --resync --resync-auth bestaetigt, aber NUR wenn wirklich noetig.
+   verlangt onedrive einen --resync - das wird automatisch erkannt.
 2. onedrive --synchronize (OneDrive ist Master, no-remote-delete fuer
    lokale Loeschungen)
 3. Filtert Dateien innerhalb synchronisierter Ordner nach Dateityp/Alter
@@ -24,12 +23,11 @@ import hashlib
 import json
 import os
 import subprocess
-import sys
 import time
-import urllib.request
 import urllib.parse
-import urllib.error
 from datetime import datetime
+
+import requests
 
 CONFIG_DIR = "/data"
 SYNC_CONFIG = f"{CONFIG_DIR}/sync_config.json"
@@ -45,11 +43,11 @@ TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 SCOPE = "Files.ReadWrite Files.ReadWrite.All Sites.ReadWrite.All offline_access"
 
-MAX_FOLDER_DEPTH = 10  # Sicherheitsgrenze gegen extrem tiefe Baeume
-LOCK_STALE_SECONDS = 900  # Lock aelter als 15min = vermutlich verwaister Prozess
+MAX_FOLDER_DEPTH = 10
+LOCK_STALE_SECONDS = 900
 
 FILTER_EXTENSIONS = {
-    "all": None,  # None = kein Filter
+    "all": None,
     "pdf": [".pdf"],
     "images": [".jpg", ".jpeg", ".png", ".tiff", ".tif", ".heic", ".webp"],
     "pdf_images": [".pdf", ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".heic", ".webp"],
@@ -67,8 +65,7 @@ DELETE_DAYS = {
 
 def log(msg):
     """print() mit sofortigem Flush - sonst puffert Python alle Ausgaben
-    komplett wenn stdout kein Terminal ist (z.B. docker logs), und man
-    sieht erst am Ende was passiert ist."""
+    komplett wenn stdout kein Terminal ist (z.B. docker logs)."""
     print(msg, flush=True)
 
 def load_config():
@@ -89,11 +86,6 @@ def load_status():
 
 
 def acquire_lock():
-    """
-    Verhindert zwei gleichzeitige Sync-Laeufe (z.B. manueller Klick
-    waehrend der periodische Timer in run.sh ausloest). Ein Lock aelter
-    als LOCK_STALE_SECONDS wird als verwaist betrachtet und ignoriert.
-    """
     if os.path.exists(LOCK_FILE):
         age = time.time() - os.path.getmtime(LOCK_FILE)
         if age < LOCK_STALE_SECONDS:
@@ -109,72 +101,67 @@ def release_lock():
         os.remove(LOCK_FILE)
 
 
-# --- Graph API Hilfsfunktionen (eigenstaendig, da separater Prozess) ---
+# --- Graph API Hilfsfunktionen (requests.Session fuer Connection-Reuse) ---
 
-def ms_post(url, data):
-    encoded = urllib.parse.urlencode(data).encode()
-    req = urllib.request.Request(url, data=encoded, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    try:
-        resp = urllib.request.urlopen(req, timeout=30)
-        return json.loads(resp.read()), None
-    except urllib.error.HTTPError as e:
-        body = json.loads(e.read())
-        return None, body
-
-def get_access_token():
+def get_access_token(session):
     rt_file = f"{ONEDRIVE_CONFIG_DIR}/refresh_token"
     if not os.path.exists(rt_file):
         raise Exception("Nicht authentifiziert")
     with open(rt_file) as f:
         refresh_token = f.read().strip()
-    result, err = ms_post(TOKEN_URL, {
+    resp = session.post(TOKEN_URL, data={
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": CLIENT_ID,
         "scope": SCOPE,
-    })
-    if err:
-        raise Exception(f"Token-Fehler: {err.get('error_description', err.get('error'))}")
+    }, timeout=30)
+    result = resp.json()
+    if resp.status_code != 200:
+        raise Exception(f"Token-Fehler: {result.get('error_description', result.get('error'))}")
     if "refresh_token" in result:
         with open(rt_file, 'w') as f:
             f.write(result["refresh_token"])
     return result["access_token"]
 
-def graph_get_children(token, item_id):
-    url = f"{GRAPH_BASE}/me/drive/items/{item_id}/children?$select=id,name,folder"
-    req = urllib.request.Request(url)
-    req.add_header("Authorization", f"Bearer {token}")
-    resp = urllib.request.urlopen(req, timeout=30)
-    return json.loads(resp.read())
-
 def list_all_folders():
     """
     Listet ALLE Ordner rekursiv per Graph API (Pfad-Format wie lokal:
-    'Top/Sub/Sub2'). Eigenstaendig implementiert (separater Prozess von
-    server.py).
+    'Top/Sub/Sub2'). Nutzt eine requests.Session fuer Connection-Pooling -
+    das haelt TLS-Verbindungen zwischen Aufrufen offen und beschleunigt
+    das Listing bei vielen Ordnern erheblich gegenueber Einzelverbindungen.
     """
-    token = get_access_token()
+    session = requests.Session()
+    token = get_access_token(session)
+    session.headers.update({"Authorization": f"Bearer {token}"})
+
     folders = []
+    counter = {"n": 0}
 
     def walk(item_id, path, depth):
         if depth > MAX_FOLDER_DEPTH:
             return
-        result = graph_get_children(token, item_id)
+        resp = session.get(
+            f"{GRAPH_BASE}/me/drive/items/{item_id}/children",
+            params={"$select": "id,name,folder"}, timeout=30
+        )
+        resp.raise_for_status()
+        result = resp.json()
         for item in result.get("value", []):
             if "folder" in item:
                 child_path = f"{path}/{item['name']}" if path else item['name']
                 folders.append(child_path)
+                counter["n"] += 1
+                if counter["n"] % 25 == 0:
+                    log(f"[folders] ... {counter['n']} Ordner bisher gefunden")
                 if item["folder"].get("childCount", 0) > 0:
                     walk(item["id"], child_path, depth + 1)
 
     walk("root", "", 0)
+    session.close()
     return sorted(folders)
 
 
 def resolve_enabled(path, config):
-    """Loest vererbte 'sync' Einstellung fuer einen Pfad auf (wie get_effective_config,
-    aber nur fuer das sync-Flag)."""
     parts = path.split("/")
     enabled = True
     for i in range(1, len(parts) + 1):
@@ -253,6 +240,7 @@ def run_onedrive_sync(need_resync):
     if need_resync:
         cmd += ["--resync", "--resync-auth"]
     log(f"[onedrive] Starte: {' '.join(cmd)}")
+    proc = None
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -269,13 +257,13 @@ def run_onedrive_sync(need_resync):
             return False, err_msg
         return True, None
     except subprocess.TimeoutExpired:
-        proc.kill()
+        if proc:
+            proc.kill()
         return False, "Sync timeout after 600s"
     except Exception as e:
         return False, str(e)
 
 def get_effective_config(folder_path, config):
-    """Resolves inherited config for a folder."""
     parts = folder_path.split('/')
     effective = {
         "sync": True,
@@ -294,7 +282,6 @@ def get_effective_config(folder_path, config):
     return effective
 
 def apply_filters_and_cleanup(config):
-    """After sync, delete files that don't match filter OR are older than delete_after."""
     files_processed = 0
     files_deleted = 0
 
@@ -348,8 +335,9 @@ def main():
         need_resync = False
         try:
             log("[folders] Ermittle Ordnerstruktur per Graph API...")
+            t0 = time.time()
             all_folders = list_all_folders()
-            log(f"[folders] {len(all_folders)} Ordner gefunden")
+            log(f"[folders] {len(all_folders)} Ordner gefunden in {time.time()-t0:.1f}s")
             need_resync = write_sync_list(config, all_folders)
         except Exception as e:
             log(f"[WARN] Konnte sync_list nicht aktualisieren: {e}")
