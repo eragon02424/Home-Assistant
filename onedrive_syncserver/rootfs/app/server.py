@@ -10,10 +10,15 @@ unabhaengig von der Eingabegeschwindigkeit.
 Deshalb nutzen wir stattdessen die interaktive Browser-URL-Methode
 (--auth-files des onedrive CLI-Clients), die fuer MSA-Konten funktioniert.
 
-WICHTIG 2: Der onedrive CLI Prozess nutzt PKCE (code_verifier nur im
-Prozess-Speicher). Der Prozess der die authUrl erzeugt hat MUSS am Leben
-bleiben bis der Code-Austausch passiert ist - sonst schlaegt der Austausch
-mit AADSTS70000 fehl, selbst bei gueltigem, frischem Code.
+WICHTIG 2: Der onedrive CLI Prozess der die authUrl erzeugt hat muss am
+Leben bleiben bis der Code-Austausch passiert ist.
+
+WICHTIG 3: Die Ordner-Konfiguration listet Top-Level-Ordner per Graph API
+(nicht per lokalem Dateisystem-Scan), damit man die Sync-Auswahl treffen
+kann BEVOR ueberhaupt synchronisiert wurde. sync_manager.py nutzt diese
+Konfiguration dann um eine onedrive sync_list zu schreiben, die abgewaehlte
+Ordner komplett vom Download ausschliesst statt sie zu laden und wieder
+lokal zu loeschen.
 """
 
 import json
@@ -135,15 +140,20 @@ def load_status():
 def is_authenticated():
     return os.path.exists(f"{ONEDRIVE_CONFIG_DIR}/refresh_token")
 
-def get_local_folders():
-    folders = []
-    if not os.path.exists(SHARE_DIR):
-        return folders
-    for root, dirs, files in os.walk(SHARE_DIR):
-        for d in sorted(dirs):
-            rel = os.path.relpath(os.path.join(root, d), SHARE_DIR)
-            folders.append(rel)
-    return sorted(folders)
+def get_onedrive_top_folders():
+    """
+    Listet Top-Level-Ordner DIREKT per Graph API. Funktioniert sofort nach
+    der Anmeldung, unabhaengig davon ob schon synchronisiert wurde - so
+    kann die Ordner-Auswahl VOR dem ersten (potenziell riesigen) Sync
+    getroffen werden.
+    """
+    try:
+        token = get_access_token()
+        result = graph_get(token, "/me/drive/root/children")
+        return sorted([item["name"] for item in result.get("value", []) if "folder" in item])
+    except Exception as e:
+        auth_log(f"Konnte Ordnerliste nicht laden: {e}")
+        return []
 
 def get_base():
     if IS_DIRECT_PORT:
@@ -189,6 +199,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
           padding: 20px; margin-bottom: 20px; }
   .card h2 { font-size: 1rem; font-weight: 600; color: #9ca3af;
              text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 16px; }
+  .card p.hint { color: #9ca3af; font-size: 0.85rem; margin-bottom: 16px; }
   .status-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
   .status-item { background: #111827; border-radius: 8px; padding: 12px; }
   .status-item .label { font-size: 0.75rem; color: #6b7280; margin-bottom: 4px; }
@@ -214,7 +225,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   .folder-item:last-child { border-bottom: none; }
   .folder-row { display: flex; align-items: center; gap: 8px; padding: 10px 8px; flex-wrap: wrap; }
   .folder-row:hover { background: #111827; border-radius: 6px; }
-  .folder-indent { width: 20px; flex-shrink: 0; }
   .folder-name { flex: 1; font-size: 0.9rem; color: #e5e7eb; min-width: 150px; }
   .folder-name.disabled { color: #6b7280; }
   .folder-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -299,19 +309,18 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   {% if authenticated %}
   <div class="card">
     <h2>Ordner Konfiguration</h2>
+    <p class="hint">Zeigt deine Top-Level OneDrive-Ordner direkt per API. Abgewaehlte Ordner werden beim Sync komplett uebersprungen (nicht erst geladen und wieder geloescht).</p>
     <div class="folder-tree">
       {% for folder in folders %}
       {% set cfg = config.get(folder, {}) %}
-      {% set depth = folder.count("/") %}
       {% set enabled = cfg.get("sync", True) %}
       <div class="folder-item">
         <div class="folder-row">
-          {% for i in range(depth) %}<div class="folder-indent"></div>{% endfor %}
           <label class="checkbox-label">
             <input type="checkbox" {% if enabled %}checked{% endif %}
                    onchange="toggleFolder('{{ folder }}', this.checked)">
           </label>
-          <div class="folder-name {% if not enabled %}disabled{% endif %}">&#128193; {{ folder.split('/')[-1] }}</div>
+          <div class="folder-name {% if not enabled %}disabled{% endif %}">&#128193; {{ folder }}</div>
           {% if enabled %}
           <div class="folder-controls">
             <select onchange="updateConfig('{{ folder }}', 'filter', this.value)">
@@ -320,21 +329,14 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <select onchange="updateConfig('{{ folder }}', 'delete_after', this.value)">
               {% for opt in delete_options %}<option value="{{ opt.value }}" {% if cfg.get('delete_after','never') == opt.value %}selected{% endif %}>{{ opt.label }}</option>{% endfor %}
             </select>
-            <label class="checkbox-label">
-              <input type="checkbox" {% if not cfg.get('custom_local_path') %}checked{% endif %}
-                     onchange="toggleCustomPath('{{ folder }}', this.checked)">
-              Standard-Pfad
-            </label>
-            {% if cfg.get("custom_local_path") %}
-            <input type="text" placeholder="/share/paperless/media"
-                   value="{{ cfg.get('custom_local_path','') }}"
-                   onchange="updateConfig('{{ folder }}', 'custom_local_path', this.value)">
-            {% endif %}
           </div>
           {% endif %}
         </div>
       </div>
       {% endfor %}
+      {% if not folders %}
+      <p style="color:#6b7280;font-size:0.85rem">Keine Ordner gefunden oder Liste konnte nicht geladen werden.</p>
+      {% endif %}
     </div>
   </div>
 
@@ -389,9 +391,6 @@ function updateConfig(path, key, value) {
   pendingChanges[path][key] = value;
 }
 function toggleFolder(path, enabled) { updateConfig(path, 'sync', enabled); }
-function toggleCustomPath(path, useStandard) {
-  updateConfig(path, 'custom_local_path', useStandard ? null : '/share/');
-}
 async function startAuth() {
   const btn = document.getElementById('auth-btn');
   if (btn) { btn.textContent = 'Wird generiert...'; btn.disabled = true; }
@@ -502,7 +501,7 @@ def index():
     config = load_sync_config()
     status = load_status()
     authenticated = is_authenticated()
-    folders = get_local_folders() if authenticated else []
+    folders = get_onedrive_top_folders() if authenticated else []
     base = get_base()
     auth_url = None
     debug_log = None
