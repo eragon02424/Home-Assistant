@@ -4,13 +4,18 @@
 Fuehrt den eigentlichen Sync durch:
 0. Prueft eine Lock-Datei um zu verhindern dass zwei Sync-Laeufe
    gleichzeitig laufen.
-1. Ermittelt ALLE Ordner (rekursiv) via Graph API und schreibt eine
-   sync_list Datei mit Include/Exclude-Zeilen an den "Grenzen" zwischen
-   aktivierten und deaktivierten Aesten - so werden abgewaehlte Ordner
-   (auch verschachtelt) GAR NICHT erst heruntergeladen.
-   Nutzt requests.Session() fuer Connection-Pooling/Keep-Alive - ohne das
-   baut jeder einzelne API-Call eine neue TLS-Verbindung auf, was bei
-   hunderten Ordnern mehrere Minuten zusaetzliche Zeit kostet.
+1. Ermittelt Ordner per Graph API und schreibt eine sync_list Datei mit
+   Include/Exclude-Zeilen an den "Grenzen" zwischen aktivierten und
+   deaktivierten Aesten - so werden abgewaehlte Ordner (auch verschachtelt)
+   GAR NICHT erst heruntergeladen.
+   OPTIMIERUNG: Wenn ein Ordner deaktiviert ist UND es keine expliziten
+   Konfigurations-Eintraege fuer irgendwelche seiner Unterordner gibt (d.h.
+   der Nutzer hat dort nie manuell etwas umgestellt), wird gar nicht erst
+   in diesen Ast hinabgestiegen - das spart bei grossen deaktivierten
+   Ordnern viele API-Calls, da deren komplette Unterstruktur fuer die
+   sync_list ohnehin irrelevant ist (der ganze Ast ist schon durch die
+   Abwahl des obersten Ordners ausgeschlossen).
+   Nutzt requests.Session() fuer Connection-Pooling/Keep-Alive.
    Wenn sich die sync_list gegenueber dem letzten Lauf geaendert hat,
    verlangt onedrive einen --resync - das wird automatisch erkannt.
 2. onedrive --synchronize (OneDrive ist Master, no-remote-delete fuer
@@ -123,18 +128,42 @@ def get_access_token(session):
             f.write(result["refresh_token"])
     return result["access_token"]
 
-def list_all_folders():
+
+def resolve_enabled(path, config):
+    parts = path.split("/")
+    enabled = True
+    for i in range(1, len(parts) + 1):
+        ancestor = "/".join(parts[:i])
+        if ancestor in config and "sync" in config[ancestor]:
+            enabled = config[ancestor]["sync"]
+    return enabled
+
+
+def has_descendant_overrides(path, config):
+    """Prueft ob IRGENDEIN Konfigurations-Eintrag fuer einen Unterordner
+    von 'path' existiert. Wenn nicht, kann die Rekursion in diesen Ast
+    sicher uebersprungen werden falls der Ast selbst deaktiviert ist -
+    es gibt dann garantiert keine 'versteckte' Wiedereinschaltung tiefer
+    im Baum, die wir sonst verpassen wuerden."""
+    prefix = path + "/"
+    return any(key.startswith(prefix) for key in config)
+
+
+def list_all_folders(config):
     """
-    Listet ALLE Ordner rekursiv per Graph API (Pfad-Format wie lokal:
-    'Top/Sub/Sub2'). Nutzt eine requests.Session fuer Connection-Pooling -
-    das haelt TLS-Verbindungen zwischen Aufrufen offen und beschleunigt
-    das Listing bei vielen Ordnern erheblich gegenueber Einzelverbindungen.
+    Listet Ordner per Graph API (Pfad-Format wie lokal: 'Top/Sub/Sub2').
+    Nutzt eine requests.Session fuer Connection-Pooling.
+    Steigt NICHT in Aeste hinab, die deaktiviert sind und keine
+    Unterordner-Overrides in der Konfiguration haben (siehe
+    has_descendant_overrides) - das spart bei grossen deaktivierten
+    Ordnern viele unnoetige API-Calls.
     """
     session = requests.Session()
     token = get_access_token(session)
     session.headers.update({"Authorization": f"Bearer {token}"})
 
     folders = []
+    skipped_branches = {"n": 0}
     counter = {"n": 0}
 
     def walk(item_id, path, depth):
@@ -153,22 +182,22 @@ def list_all_folders():
                 counter["n"] += 1
                 if counter["n"] % 25 == 0:
                     log(f"[folders] ... {counter['n']} Ordner bisher gefunden")
-                if item["folder"].get("childCount", 0) > 0:
-                    walk(item["id"], child_path, depth + 1)
+
+                if item["folder"].get("childCount", 0) == 0:
+                    continue
+
+                enabled = resolve_enabled(child_path, config)
+                if not enabled and not has_descendant_overrides(child_path, config):
+                    skipped_branches["n"] += 1
+                    continue
+
+                walk(item["id"], child_path, depth + 1)
 
     walk("root", "", 0)
     session.close()
+    if skipped_branches["n"]:
+        log(f"[folders] {skipped_branches['n']} deaktivierte Aeste ohne Overrides uebersprungen (nicht weiter erkundet)")
     return sorted(folders)
-
-
-def resolve_enabled(path, config):
-    parts = path.split("/")
-    enabled = True
-    for i in range(1, len(parts) + 1):
-        ancestor = "/".join(parts[:i])
-        if ancestor in config and "sync" in config[ancestor]:
-            enabled = config[ancestor]["sync"]
-    return enabled
 
 
 def write_sync_list(config, all_folders):
@@ -336,7 +365,7 @@ def main():
         try:
             log("[folders] Ermittle Ordnerstruktur per Graph API...")
             t0 = time.time()
-            all_folders = list_all_folders()
+            all_folders = list_all_folders(config)
             log(f"[folders] {len(all_folders)} Ordner gefunden in {time.time()-t0:.1f}s")
             need_resync = write_sync_list(config, all_folders)
         except Exception as e:
