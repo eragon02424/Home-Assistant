@@ -13,13 +13,13 @@ Deshalb nutzen wir stattdessen die interaktive Browser-URL-Methode
 WICHTIG 2: Der onedrive CLI Prozess der die authUrl erzeugt hat muss am
 Leben bleiben bis der Code-Austausch passiert ist.
 
-WICHTIG 3: Die Ordner-Konfiguration listet ALLE Ordner rekursiv per Graph
-API (nicht per lokalem Dateisystem-Scan), damit man die Sync-Auswahl auf
-jeder Ebene treffen kann BEVOR ueberhaupt synchronisiert wurde.
-sync_manager.py nutzt diese Konfiguration dann um eine onedrive sync_list
-mit Grenzwert-Include/Exclude-Regeln zu schreiben, die abgewaehlte Ordner
-(auch verschachtelt) komplett vom Download ausschliesst statt sie zu laden
-und wieder lokal zu loeschen.
+WICHTIG 3: Die Ordner-Konfiguration laedt Ordner LAZY per Graph API - nur
+die aktuell sichtbare Ebene wird geladen, Unterordner erst beim Aufklappen
+per Klick (/api/folder_children). Das spart API-Calls bei grossen
+OneDrive-Strukturen. sync_manager.py nutzt die gespeicherte Konfiguration
+dann um beim naechsten Sync eine onedrive sync_list mit Grenzwert-
+Include/Exclude-Regeln zu schreiben (dort weiterhin vollstaendig rekursiv,
+da das ein Hintergrundprozess ist und nicht die UI blockiert).
 """
 
 import json
@@ -55,8 +55,6 @@ CLIENT_ID = "d50ca740-c83f-4d1b-b616-12c519384f0c"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 SCOPE = "Files.ReadWrite Files.ReadWrite.All Sites.ReadWrite.All offline_access"
-
-MAX_FOLDER_DEPTH = 10  # Sicherheitsgrenze gegen extrem tiefe Baeume
 
 _auth_proc = None
 
@@ -143,33 +141,29 @@ def load_status():
 def is_authenticated():
     return os.path.exists(f"{ONEDRIVE_CONFIG_DIR}/refresh_token")
 
-def get_onedrive_all_folders():
+def get_onedrive_folder_children(path=""):
     """
-    Listet ALLE Ordner rekursiv per Graph API (Pfad-Format 'Top/Sub/Sub2').
-    Funktioniert sofort nach der Anmeldung, unabhaengig davon ob schon
-    synchronisiert wurde - so kann die Ordner-Auswahl auf jeder Ebene VOR
-    dem ersten (potenziell riesigen) Sync getroffen werden.
+    Listet NUR die direkten Unterordner eines Pfades per Graph API
+    (nicht rekursiv). path="" bedeutet Root. Gibt eine Liste von Dicts
+    zurueck: {name, path, has_children}.
     """
-    try:
-        token = get_access_token()
-        folders = []
-
-        def walk(item_id, path, depth):
-            if depth > MAX_FOLDER_DEPTH:
-                return
-            result = graph_get(token, f"/me/drive/items/{item_id}/children?$select=id,name,folder")
-            for item in result.get("value", []):
-                if "folder" in item:
-                    child_path = f"{path}/{item['name']}" if path else item['name']
-                    folders.append(child_path)
-                    if item["folder"].get("childCount", 0) > 0:
-                        walk(item["id"], child_path, depth + 1)
-
-        walk("root", "", 0)
-        return sorted(folders)
-    except Exception as e:
-        auth_log(f"Konnte Ordnerliste nicht laden: {e}")
-        return []
+    token = get_access_token()
+    if path:
+        encoded = urllib.parse.quote(path)
+        result = graph_get(token, f"/me/drive/root:/{encoded}:/children?$select=id,name,folder")
+    else:
+        result = graph_get(token, "/me/drive/root/children?$select=id,name,folder")
+    folders = []
+    for item in result.get("value", []):
+        if "folder" in item:
+            child_path = f"{path}/{item['name']}" if path else item["name"]
+            folders.append({
+                "name": item["name"],
+                "path": child_path,
+                "has_children": item["folder"].get("childCount", 0) > 0
+            })
+    folders.sort(key=lambda x: x["name"].lower())
+    return folders
 
 def get_base():
     if IS_DIRECT_PORT:
@@ -238,10 +232,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 color: #f9fafb; padding: 8px 12px; border-radius: 6px;
                 font-size: 0.9rem; margin: 8px 0; }
   .folder-item { border-bottom: 1px solid #374151; }
-  .folder-item:last-child { border-bottom: none; }
   .folder-row { display: flex; align-items: center; gap: 8px; padding: 10px 8px; flex-wrap: wrap; }
   .folder-row:hover { background: #111827; border-radius: 6px; }
   .folder-indent { width: 20px; flex-shrink: 0; }
+  .folder-expand { width: 20px; flex-shrink: 0; text-align: center; cursor: pointer;
+                    color: #6b7280; font-size: 0.75rem; user-select: none; }
+  .folder-expand.leaf { visibility: hidden; }
   .folder-name { flex: 1; font-size: 0.9rem; color: #e5e7eb; min-width: 150px; }
   .folder-name.disabled { color: #6b7280; }
   .folder-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -250,6 +246,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   input[type=text] { width: 200px; }
   .checkbox-label { display: flex; align-items: center; gap: 6px; cursor: pointer;
                     font-size: 0.85rem; color: #9ca3af; }
+  .folder-children { display: none; }
+  .folder-children.open { display: block; }
+  .folder-loading { color: #6b7280; font-size: 0.8rem; padding: 6px 8px; }
   .log-box { background: #111827; border-radius: 8px; padding: 12px;
              font-family: monospace; font-size: 0.78rem; color: #9ca3af;
              max-height: 200px; overflow-y: auto; white-space: pre-wrap; }
@@ -326,37 +325,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   {% if authenticated %}
   <div class="card">
     <h2>Ordner Konfiguration</h2>
-    <p class="hint">Alle OneDrive-Ordner (rekursiv) direkt per API geladen. Abgewaehlte Ordner werden beim Sync komplett uebersprungen (nicht erst geladen und wieder geloescht) - auch verschachtelt.</p>
-    <div class="folder-tree">
-      {% for folder in folders %}
-      {% set cfg = config.get(folder, {}) %}
-      {% set depth = folder.count("/") %}
-      {% set enabled = cfg.get("sync", True) %}
-      <div class="folder-item">
-        <div class="folder-row">
-          {% for i in range(depth) %}<div class="folder-indent"></div>{% endfor %}
-          <label class="checkbox-label">
-            <input type="checkbox" {% if enabled %}checked{% endif %}
-                   onchange="toggleFolder('{{ folder }}', this.checked)">
-          </label>
-          <div class="folder-name {% if not enabled %}disabled{% endif %}">&#128193; {{ folder.split('/')[-1] }}</div>
-          {% if enabled %}
-          <div class="folder-controls">
-            <select onchange="updateConfig('{{ folder }}', 'filter', this.value)">
-              {% for opt in filter_options %}<option value="{{ opt.value }}" {% if cfg.get('filter','all') == opt.value %}selected{% endif %}>{{ opt.label }}</option>{% endfor %}
-            </select>
-            <select onchange="updateConfig('{{ folder }}', 'delete_after', this.value)">
-              {% for opt in delete_options %}<option value="{{ opt.value }}" {% if cfg.get('delete_after','never') == opt.value %}selected{% endif %}>{{ opt.label }}</option>{% endfor %}
-            </select>
-          </div>
-          {% endif %}
-        </div>
-      </div>
-      {% endfor %}
-      {% if not folders %}
-      <p style="color:#6b7280;font-size:0.85rem">Keine Ordner gefunden oder Liste konnte nicht geladen werden.</p>
-      {% endif %}
-    </div>
+    <p class="hint">Unterordner werden erst beim Aufklappen (&#9656;) geladen. Abgewaehlte Ordner werden beim Sync komplett uebersprungen (nicht erst geladen und wieder geloescht) - auch verschachtelt.</p>
+    <div class="folder-tree" id="folder-root" data-path=""></div>
   </div>
 
   <div class="card">
@@ -396,6 +366,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <script>
 const BASE = "{{ base }}";
 function apiUrl(path) { return BASE + path; }
+const CONFIG = {{ config | tojson }};
+const FILTER_OPTIONS = {{ filter_options | tojson }};
+const DELETE_OPTIONS = {{ delete_options | tojson }};
 
 let pendingChanges = {};
 function showToast(msg, ok=true) {
@@ -410,6 +383,149 @@ function updateConfig(path, key, value) {
   pendingChanges[path][key] = value;
 }
 function toggleFolder(path, enabled) { updateConfig(path, 'sync', enabled); }
+
+function getCfg(path) {
+  return CONFIG[path] || {};
+}
+
+function buildFolderRow(folder, depth) {
+  const cfg = getCfg(folder.path);
+  const enabled = cfg.sync !== undefined ? cfg.sync : true;
+
+  const item = document.createElement('div');
+  item.className = 'folder-item';
+
+  const row = document.createElement('div');
+  row.className = 'folder-row';
+
+  for (let i = 0; i < depth; i++) {
+    const indent = document.createElement('div');
+    indent.className = 'folder-indent';
+    row.appendChild(indent);
+  }
+
+  const expand = document.createElement('div');
+  expand.className = 'folder-expand' + (folder.has_children ? '' : ' leaf');
+  expand.textContent = '\u25B6';
+  row.appendChild(expand);
+
+  const label = document.createElement('label');
+  label.className = 'checkbox-label';
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.checked = enabled;
+  checkbox.addEventListener('change', function() { toggleFolder(folder.path, this.checked); });
+  label.appendChild(checkbox);
+  row.appendChild(label);
+
+  const nameDiv = document.createElement('div');
+  nameDiv.className = 'folder-name' + (enabled ? '' : ' disabled');
+  nameDiv.textContent = '\u{1F4C1} ' + folder.name;
+  row.appendChild(nameDiv);
+
+  if (enabled) {
+    const controls = document.createElement('div');
+    controls.className = 'folder-controls';
+
+    const filterSel = document.createElement('select');
+    FILTER_OPTIONS.forEach(function(opt) {
+      const o = document.createElement('option');
+      o.value = opt.value; o.textContent = opt.label;
+      if ((cfg.filter || 'all') === opt.value) o.selected = true;
+      filterSel.appendChild(o);
+    });
+    filterSel.addEventListener('change', function() { updateConfig(folder.path, 'filter', this.value); });
+    controls.appendChild(filterSel);
+
+    const deleteSel = document.createElement('select');
+    DELETE_OPTIONS.forEach(function(opt) {
+      const o = document.createElement('option');
+      o.value = opt.value; o.textContent = opt.label;
+      if ((cfg.delete_after || 'never') === opt.value) o.selected = true;
+      deleteSel.appendChild(o);
+    });
+    deleteSel.addEventListener('change', function() { updateConfig(folder.path, 'delete_after', this.value); });
+    controls.appendChild(deleteSel);
+
+    row.appendChild(controls);
+  }
+
+  item.appendChild(row);
+
+  const childrenContainer = document.createElement('div');
+  childrenContainer.className = 'folder-children';
+  item.appendChild(childrenContainer);
+
+  let loaded = false;
+  if (folder.has_children) {
+    expand.addEventListener('click', async function() {
+      const isOpen = childrenContainer.classList.contains('open');
+      if (isOpen) {
+        childrenContainer.classList.remove('open');
+        expand.textContent = '\u25B6';
+        return;
+      }
+      childrenContainer.classList.add('open');
+      expand.textContent = '\u25BC';
+      if (!loaded) {
+        loaded = true;
+        childrenContainer.innerHTML = '<div class="folder-loading">Laedt...</div>';
+        try {
+          const res = await fetch(apiUrl('/api/folder_children'), {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({path: folder.path})
+          });
+          const d = await res.json();
+          childrenContainer.innerHTML = '';
+          if (d.success) {
+            d.folders.forEach(function(child) {
+              childrenContainer.appendChild(buildFolderRow(child, depth + 1));
+            });
+            if (d.folders.length === 0) {
+              childrenContainer.innerHTML = '<div class="folder-loading">Keine Unterordner</div>';
+            }
+          } else {
+            childrenContainer.innerHTML = '<div class="folder-loading">Fehler: ' + (d.error || 'unbekannt') + '</div>';
+          }
+        } catch (e) {
+          childrenContainer.innerHTML = '<div class="folder-loading">Fehler beim Laden</div>';
+        }
+      }
+    });
+  }
+
+  return item;
+}
+
+async function loadRootFolders() {
+  const container = document.getElementById('folder-root');
+  if (!container) return;
+  container.innerHTML = '<div class="folder-loading">Laedt Ordner...</div>';
+  try {
+    const res = await fetch(apiUrl('/api/folder_children'), {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path: ''})
+    });
+    const d = await res.json();
+    container.innerHTML = '';
+    if (d.success) {
+      if (d.folders.length === 0) {
+        container.innerHTML = '<p style="color:#6b7280;font-size:0.85rem">Keine Ordner gefunden.</p>';
+      }
+      d.folders.forEach(function(folder) {
+        container.appendChild(buildFolderRow(folder, 0));
+      });
+    } else {
+      container.innerHTML = '<p style="color:#ef4444;font-size:0.85rem">Fehler: ' + (d.error || 'unbekannt') + '</p>';
+    }
+  } catch (e) {
+    container.innerHTML = '<p style="color:#ef4444;font-size:0.85rem">Fehler beim Laden der Ordner</p>';
+  }
+}
+if (document.getElementById('folder-root')) {
+  loadRootFolders();
+}
+
 async function startAuth() {
   const btn = document.getElementById('auth-btn');
   if (btn) { btn.textContent = 'Wird generiert...'; btn.disabled = true; }
@@ -520,7 +636,6 @@ def index():
     config = load_sync_config()
     status = load_status()
     authenticated = is_authenticated()
-    folders = get_onedrive_all_folders() if authenticated else []
     base = get_base()
     auth_url = None
     debug_log = None
@@ -538,10 +653,21 @@ def index():
     return render_template_string(
         HTML_TEMPLATE,
         config=config, status=status, authenticated=authenticated,
-        folders=folders, filter_options=FILTER_OPTIONS,
+        filter_options=FILTER_OPTIONS,
         delete_options=DELETE_OPTIONS, auth_url=auth_url,
         debug_log=debug_log, log=log, base=base
     )
+
+
+@app.route('/api/folder_children', methods=['POST'])
+def folder_children():
+    data = request.json or {}
+    path = data.get('path', '').strip('/')
+    try:
+        folders = get_onedrive_folder_children(path)
+        return jsonify({"success": True, "folders": folders})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route('/auth/start', methods=['POST'])
