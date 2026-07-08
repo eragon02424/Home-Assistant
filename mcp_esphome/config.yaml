@@ -1,6 +1,6 @@
 name: "MCP ESPHome"
 description: "Vermittler-Service zwischen Claude und ESPHome-Geräten via native API."
-version: "0.17.2"
+version: "0.18.0"
 slug: "mcp_esphome"
 init: false
 arch:
@@ -10,6 +10,7 @@ startup: services
 boot: auto
 host_network: true
 hassio_api: true
+uart: true
 map:
   - config:rw
   - addon_config:rw
