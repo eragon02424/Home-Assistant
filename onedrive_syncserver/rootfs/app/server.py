@@ -14,8 +14,10 @@ import urllib.request
 import urllib.parse
 import urllib.error
 from flask import Flask, request, jsonify, render_template_string
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8772
 IS_DIRECT = PORT in (8771, 8772)
@@ -53,14 +55,12 @@ def load_device_state():
         return None
     with open(DEVICE_STATE_FILE) as f:
         state = json.load(f)
-    # Pruefen ob Code noch gueltig
     created_at = state.get("created_at", 0)
     expires_in = state.get("expires_in", 900)
     if time.time() > created_at + expires_in:
         os.remove(DEVICE_STATE_FILE)
         auth_log("Device Code abgelaufen - State-Datei geloescht")
         return None
-    # Verbleibende Zeit berechnen
     remaining = int((created_at + expires_in) - time.time())
     state["remaining_seconds"] = remaining
     return state
