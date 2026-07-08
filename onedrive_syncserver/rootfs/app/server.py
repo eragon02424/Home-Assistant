@@ -50,7 +50,6 @@ def save_device_state(state):
         json.dump(state, f)
 
 def load_device_state():
-    """Laedt State-Datei, loescht sie automatisch wenn Code abgelaufen."""
     if not os.path.exists(DEVICE_STATE_FILE):
         return None
     with open(DEVICE_STATE_FILE) as f:
@@ -521,11 +520,23 @@ async function searchFile() {
   if (!res.ok) { container.innerHTML = '<p style="color:#ef4444;font-size:0.85rem">Fehler: ' + (d.error||'unbekannt') + '</p>'; return; }
   if (d.found === 0) { container.innerHTML = '<p style="color:#f59e0b;font-size:0.85rem">Keine Treffer.</p>'; return; }
   let html = '<p style="color:#9ca3af;font-size:0.78rem;margin-bottom:8px">' + d.found + ' Treffer:</p>';
-  d.locations.forEach(loc => {
-    html += '<div class="search-result-item"><div><div>' + loc.name + '</div><div class="path">' + loc.path + '</div></div>' +
-      '<button class="dl-btn" onclick="downloadById(\'' + loc.item_id + '\', \'' + loc.name + '\')">&#8659; Download</button></div>';
+  d.locations.forEach(function(loc) {
+    var row = document.createElement('div');
+    row.className = 'search-result-item';
+    var info = document.createElement('div');
+    info.innerHTML = '<div>' + loc.name + '</div><div class="path">' + loc.path + '</div>';
+    var btn = document.createElement('button');
+    btn.className = 'dl-btn';
+    btn.textContent = String.fromCharCode(8659) + ' Download';
+    btn.addEventListener('click', function() { downloadById(loc.item_id, loc.name); });
+    row.appendChild(info);
+    row.appendChild(btn);
+    container.appendChild(row);
   });
   container.innerHTML = html;
+  d.locations.forEach(function(loc) {
+    var btn = document.createElement('button');
+  });
 }
 async function downloadById(itemId, filename) {
   showToast('Download gestartet...');
@@ -623,7 +634,6 @@ def device_auth_start():
 
 @app.route('/auth/device/reset', methods=['POST'])
 def device_auth_reset():
-    """Loescht alten Code und startet neuen Device Flow."""
     global _poll_stop
     _poll_stop.set()
     clear_device_state()
