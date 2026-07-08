@@ -2,6 +2,10 @@
 """OneDrive SyncServer - Sync Manager
 
 Fuehrt den eigentlichen Sync durch:
+0. Prueft eine Lock-Datei um zu verhindern dass zwei Sync-Laeufe
+   gleichzeitig laufen (z.B. manueller Klick waehrend der 5-Minuten-Timer
+   ausloest) - das kann sonst zu SQLite-Konflikten und haengenden Prozessen
+   fuehren.
 1. Ermittelt ALLE Ordner (rekursiv) via Graph API und schreibt eine
    sync_list Datei mit Include/Exclude-Zeilen an den "Grenzen" zwischen
    aktivierten und deaktivierten Aesten - so werden abgewaehlte Ordner
@@ -20,6 +24,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import time
 import urllib.request
 import urllib.parse
@@ -31,6 +36,7 @@ SYNC_CONFIG = f"{CONFIG_DIR}/sync_config.json"
 ONEDRIVE_CONFIG_DIR = f"{CONFIG_DIR}/onedrive"
 SYNC_LIST_FILE = f"{ONEDRIVE_CONFIG_DIR}/sync_list"
 SYNC_LIST_HASH_FILE = f"{CONFIG_DIR}/sync_list.hash"
+LOCK_FILE = f"{CONFIG_DIR}/sync.lock"
 SHARE_DIR = "/share/onedrive"
 STATUS_FILE = f"{CONFIG_DIR}/sync_status.json"
 
@@ -40,6 +46,7 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 SCOPE = "Files.ReadWrite Files.ReadWrite.All Sites.ReadWrite.All offline_access"
 
 MAX_FOLDER_DEPTH = 10  # Sicherheitsgrenze gegen extrem tiefe Baeume
+LOCK_STALE_SECONDS = 900  # Lock aelter als 15min = vermutlich verwaister Prozess
 
 FILTER_EXTENSIONS = {
     "all": None,  # None = kein Filter
@@ -58,6 +65,12 @@ DELETE_DAYS = {
     "365d": 365,
 }
 
+def log(msg):
+    """print() mit sofortigem Flush - sonst puffert Python alle Ausgaben
+    komplett wenn stdout kein Terminal ist (z.B. docker logs), und man
+    sieht erst am Ende was passiert ist."""
+    print(msg, flush=True)
+
 def load_config():
     if os.path.exists(SYNC_CONFIG):
         with open(SYNC_CONFIG) as f:
@@ -73,6 +86,27 @@ def load_status():
         with open(STATUS_FILE) as f:
             return json.load(f)
     return {"last_sync": None, "files_synced": 0, "errors": [], "authenticated": False}
+
+
+def acquire_lock():
+    """
+    Verhindert zwei gleichzeitige Sync-Laeufe (z.B. manueller Klick
+    waehrend der periodische Timer in run.sh ausloest). Ein Lock aelter
+    als LOCK_STALE_SECONDS wird als verwaist betrachtet und ignoriert.
+    """
+    if os.path.exists(LOCK_FILE):
+        age = time.time() - os.path.getmtime(LOCK_FILE)
+        if age < LOCK_STALE_SECONDS:
+            log(f"[LOCK] Ein anderer Sync laeuft bereits (Lock ist {age:.0f}s alt) - breche ab")
+            return False
+        log(f"[LOCK] Alter Lock ({age:.0f}s) wird als verwaist betrachtet und ueberschrieben")
+    with open(LOCK_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+    return True
+
+def release_lock():
+    if os.path.exists(LOCK_FILE):
+        os.remove(LOCK_FILE)
 
 
 # --- Graph API Hilfsfunktionen (eigenstaendig, da separater Prozess) ---
@@ -155,25 +189,10 @@ def write_sync_list(config, all_folders):
     Schreibt eine onedrive sync_list Datei mit Include/Exclude-Zeilen.
     Gibt zurueck ob sich der Inhalt gegenueber dem letzten Lauf geaendert
     hat (per Hash-Vergleich) - das entscheidet ob ein --resync noetig ist.
-
-    WICHTIG: onedrive's sync_list ist eine reine POSITIVLISTE - sobald die
-    Datei existiert, wird NUR synchronisiert was explizit als Include-Zeile
-    drinsteht. Deshalb bekommt JEDER aktivierte Top-Level-Ordner immer eine
-    explizite Include-Zeile (Root-Ebene wird bewusst als "nicht inklusiv"
-    behandelt, anders als tiefere Ebenen die vom Elternordner erben) -
-    andernfalls wuerden default-aktive Top-Ordner beim Schreiben der Datei
-    versehentlich mit ausgeschlossen, sobald IRGENDWO im Baum eine
-    Abweichung vorliegt.
-    Tiefere Ebenen bekommen nur an den tatsaechlichen Uebergaengen
-    (aktiviert->deaktiviert bzw. umgekehrt) eine Zeile - das erlaubt auch
-    verschachteltes Ein-/Ausschalten (z.B. Dokumente an, Dokumente/Anno1404
-    aus, Dokumente/Anno1800 und Anno2205 an).
     """
     changed = False
 
     if not all_folders:
-        # Ordnerliste konnte nicht ermittelt werden - keine Einschraenkung
-        # setzen, um nichts kaputt zu machen.
         return changed
 
     top_level_folders = [f for f in all_folders if "/" not in f]
@@ -192,7 +211,6 @@ def write_sync_list(config, all_folders):
             excludes.append(f"!{path}/*")
 
     if not excludes and len(includes) == len(top_level_folders):
-        # Alles Standard (an) - keine Einschraenkung noetig.
         new_content = ""
     else:
         new_content = "\n".join(includes + excludes) + "\n"
@@ -211,53 +229,53 @@ def write_sync_list(config, all_folders):
     if not new_content:
         if os.path.exists(SYNC_LIST_FILE):
             os.remove(SYNC_LIST_FILE)
-        print("[sync_list] Alle Ordner aktiv - keine Einschraenkung")
+        log("[sync_list] Alle Ordner aktiv - keine Einschraenkung")
     else:
         with open(SYNC_LIST_FILE, "w") as f:
             f.write(new_content)
-        print(f"[sync_list] {len(includes)} Einschluss-, {len(excludes)} Ausschluss-Regeln geschrieben")
+        log(f"[sync_list] {len(includes)} Einschluss-, {len(excludes)} Ausschluss-Regeln geschrieben")
 
     if changed:
-        print("[sync_list] Aenderung erkannt - naechster Sync laeuft mit --resync")
+        log("[sync_list] Aenderung erkannt - dieser Sync laeuft mit --resync")
 
     return changed
 
 
 def run_onedrive_sync(need_resync):
-    """Run onedrive sync with OneDrive as master.
-    --no-remote-delete: local deletes don't propagate to OneDrive
-    OneDrive deletions DO propagate locally (master behavior)
-    sync_list (falls vorhanden) beschraenkt was ueberhaupt geladen wird.
-    --resync --resync-auth wird NUR mitgegeben wenn sich die sync_list
-    seit dem letzten Lauf geaendert hat (onedrive verlangt das sonst
-    interaktiv als Sicherheitsmechanismus und wuerde sonst gar nichts tun).
-    """
+    """Run onedrive sync with OneDrive as master."""
     cmd = [
         "onedrive",
         "--confdir", ONEDRIVE_CONFIG_DIR,
         "--synchronize",
-        "--no-remote-delete",  # local deletes stay local
+        "--no-remote-delete",
         "--verbose"
     ]
     if need_resync:
         cmd += ["--resync", "--resync-auth"]
+    log(f"[onedrive] Starte: {' '.join(cmd)}")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        print(result.stdout)
-        if result.returncode != 0:
-            err_msg = result.stderr.strip() or result.stdout.strip()[-500:] or f"Exit-Code {result.returncode} ohne Fehlertext"
-            print(f"[WARN] onedrive exited with {result.returncode}: {err_msg}")
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1
+        )
+        output_lines = []
+        for line in proc.stdout:
+            log(line.rstrip())
+            output_lines.append(line)
+        proc.wait(timeout=600)
+        if proc.returncode != 0:
+            err_msg = "".join(output_lines[-30:]).strip() or f"Exit-Code {proc.returncode} ohne Ausgabe"
+            log(f"[WARN] onedrive exited with {proc.returncode}")
             return False, err_msg
         return True, None
     except subprocess.TimeoutExpired:
+        proc.kill()
         return False, "Sync timeout after 600s"
     except Exception as e:
         return False, str(e)
 
 def get_effective_config(folder_path, config):
-    """Resolves inherited config for a folder.
-    Child inherits from parent if value is 'inherit' or not set.
-    """
+    """Resolves inherited config for a folder."""
     parts = folder_path.split('/')
     effective = {
         "sync": True,
@@ -266,7 +284,6 @@ def get_effective_config(folder_path, config):
         "custom_local_path": None,
         "custom_extensions": ""
     }
-    # Walk from root to leaf, inheriting values
     for i in range(1, len(parts) + 1):
         ancestor = '/'.join(parts[:i])
         if ancestor in config:
@@ -277,10 +294,7 @@ def get_effective_config(folder_path, config):
     return effective
 
 def apply_filters_and_cleanup(config):
-    """After sync, delete files that don't match filter OR are older than delete_after.
-    Only applies to folders that WERE synced (sync_list already excluded the rest
-    from being downloaded in the first place). Never touches OneDrive.
-    """
+    """After sync, delete files that don't match filter OR are older than delete_after."""
     files_processed = 0
     files_deleted = 0
 
@@ -297,68 +311,66 @@ def apply_filters_and_cleanup(config):
             ext = os.path.splitext(filename)[1].lower()
             files_processed += 1
 
-            # --- Filter check ---
             filter_type = effective["filter"]
             if filter_type == "custom":
                 allowed = [f".{e.strip().lstrip('.')}" for e in effective["custom_extensions"].split(',') if e.strip()]
             else:
-                allowed = FILTER_EXTENSIONS.get(filter_type)  # None = all allowed
+                allowed = FILTER_EXTENSIONS.get(filter_type)
 
             if allowed is not None and ext not in allowed:
-                # File doesn't match filter - delete locally, keep on OneDrive
-                print(f"[FILTER] Removing {filepath} (ext {ext} not in {allowed})")
+                log(f"[FILTER] Removing {filepath} (ext {ext} not in {allowed})")
                 os.remove(filepath)
                 files_deleted += 1
                 continue
 
-            # --- Age check ---
             delete_after = effective["delete_after"]
             days = DELETE_DAYS.get(delete_after)
             if days is not None:
                 file_age_days = (time.time() - os.path.getmtime(filepath)) / 86400
                 if file_age_days > days:
-                    print(f"[AGE] Removing {filepath} (age {file_age_days:.0f}d > {days}d)")
+                    log(f"[AGE] Removing {filepath} (age {file_age_days:.0f}d > {days}d)")
                     os.remove(filepath)
                     files_deleted += 1
 
     return files_processed, files_deleted
 
 def main():
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting sync...")
-    config = load_config()
-    status = load_status()
-    errors = []
+    log(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting sync...")
 
-    # 0. sync_list VOR dem Sync setzen (rekursiv, alle Ebenen). Erkennt
-    #    dabei ob sich die Auswahl geaendert hat - dann ist --resync noetig.
-    need_resync = False
+    if not acquire_lock():
+        return
+
     try:
-        all_folders = list_all_folders()
-        need_resync = write_sync_list(config, all_folders)
-    except Exception as e:
-        print(f"[WARN] Konnte sync_list nicht aktualisieren: {e}")
-        errors.append(f"{datetime.now().strftime('%H:%M')} sync_list Fehler: {e}")
+        config = load_config()
+        status = load_status()
+        errors = []
 
-    # 1. Run onedrive sync
-    ok, err = run_onedrive_sync(need_resync)
-    if not ok:
-        errors.append(f"{datetime.now().strftime('%H:%M')} Sync error: {err}")
+        need_resync = False
+        try:
+            log("[folders] Ermittle Ordnerstruktur per Graph API...")
+            all_folders = list_all_folders()
+            log(f"[folders] {len(all_folders)} Ordner gefunden")
+            need_resync = write_sync_list(config, all_folders)
+        except Exception as e:
+            log(f"[WARN] Konnte sync_list nicht aktualisieren: {e}")
+            errors.append(f"{datetime.now().strftime('%H:%M')} sync_list Fehler: {e}")
 
-    # 2. Apply filters and age-based cleanup (nur innerhalb bereits
-    #    synchronisierter Ordner - der grosse Teil der Nicht-Ordner ist
-    #    dank sync_list bereits gar nicht heruntergeladen worden)
-    files_processed, files_deleted = apply_filters_and_cleanup(config)
-    print(f"[SYNC] Processed {files_processed} files, deleted {files_deleted} locally")
+        ok, err = run_onedrive_sync(need_resync)
+        if not ok:
+            errors.append(f"{datetime.now().strftime('%H:%M')} Sync error: {err}")
 
-    # 3. Update status
-    status["last_sync"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-    status["files_synced"] = files_processed - files_deleted
-    status["authenticated"] = True
-    # Keep last 10 errors
-    if errors:
-        status["errors"] = (status.get("errors", []) + errors)[-10:]
-    save_status(status)
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Sync complete.")
+        files_processed, files_deleted = apply_filters_and_cleanup(config)
+        log(f"[SYNC] Processed {files_processed} files, deleted {files_deleted} locally")
+
+        status["last_sync"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+        status["files_synced"] = files_processed - files_deleted
+        status["authenticated"] = True
+        if errors:
+            status["errors"] = (status.get("errors", []) + errors)[-10:]
+        save_status(status)
+        log(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Sync complete.")
+    finally:
+        release_lock()
 
 if __name__ == '__main__':
     main()
