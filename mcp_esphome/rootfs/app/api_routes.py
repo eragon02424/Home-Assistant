@@ -4,6 +4,7 @@ import logging
 from aiohttp import web
 
 import serial_flash
+import file_manager
 
 _LOGGER = logging.getLogger("mcp_esphome.api")
 
@@ -146,6 +147,45 @@ def setup_routes(app: web.Application):
             return web.json_response({"error": str(err)}, status=502)
         return web.json_response(result)
 
+    async def list_files(request):
+        path = request.query.get("path", "")
+        result = file_manager.list_files(path)
+        if "error" in result:
+            return web.json_response(result, status=404)
+        return web.json_response(result)
+
+    async def read_file(request):
+        path = request.query.get("path")
+        if not path:
+            return web.json_response(
+                {"error": "query param 'path' is required, e.g. path=stationbalkon.yaml "
+                          "or path=components/sensor_buffer/__init__.py"},
+                status=400,
+            )
+        result = file_manager.read_file(path)
+        if "error" in result:
+            return web.json_response(result, status=404)
+        return web.json_response(result)
+
+    async def write_file(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        path = body.get("path")
+        content = body.get("content")
+        create_dirs = bool(body.get("create_dirs", False))
+        if not path or content is None:
+            return web.json_response(
+                {"error": "JSON body must include 'path' and 'content' "
+                          "(optionally 'create_dirs': true)"},
+                status=400,
+            )
+        result = file_manager.write_file(path, content, create_dirs)
+        if "error" in result:
+            return web.json_response(result, status=409)
+        return web.json_response(result)
+
     async def health(request):
         return web.json_response({"status": "ok", "devices": len(device_manager.devices)})
 
@@ -165,3 +205,6 @@ def setup_routes(app: web.Application):
     app.router.add_get("/jobs/{job_id}/error_summary", get_error_summary)
     app.router.add_get("/jobs/{job_id}/full_log", get_full_log)
     app.router.add_get("/jobs/{job_id}/flash_log", get_flash_log)
+    app.router.add_get("/files/list", list_files)
+    app.router.add_get("/files/read", read_file)
+    app.router.add_post("/files/write", write_file)
