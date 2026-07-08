@@ -6,12 +6,14 @@ WICHTIG: Device Code Flow (/devicecode Endpoint) funktioniert NICHT fuer
 private Microsoft-Konten (MSA wie @live.com/@outlook.com/@hotmail.com) -
 Microsoft blockiert diesen Flow serverseitig fuer nicht explizit von MS
 freigeschaltete Apps. Der Fehler "Code abgelaufen" erscheint dabei SOFORT,
-unabhaengig von der Eingabegeschwindigkeit. Siehe:
-https://github.com/abraunegg/onedrive/blob/master/docs/usage.md
+unabhaengig von der Eingabegeschwindigkeit.
 Deshalb nutzen wir stattdessen die interaktive Browser-URL-Methode
 (--auth-files des onedrive CLI-Clients), die fuer MSA-Konten funktioniert.
-Der Device-Code-Teil ist unten auskommentiert falls spaeter doch mal ein
-Firmenkonto (Microsoft Entra ID) genutzt werden soll.
+
+WICHTIG 2: Der onedrive CLI Prozess nutzt PKCE (code_verifier nur im
+Prozess-Speicher). Der Prozess der die authUrl erzeugt hat MUSS am Leben
+bleiben bis der Code-Austausch passiert ist - sonst schlaegt der Austausch
+mit AADSTS70000 fehl, selbst bei gueltigem, frischem Code.
 """
 
 import json
@@ -48,80 +50,7 @@ TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 SCOPE = "Files.ReadWrite Files.ReadWrite.All Sites.ReadWrite.All offline_access"
 
-# ============================================================
-# AUSKOMMENTIERT: Device Code Flow (funktioniert nicht fuer MSA-Konten)
-# ============================================================
-# DEVICE_AUTH_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"
-# DEVICE_STATE_FILE = f"{CONFIG_DIR}/device_auth_state.json"
-# DEVICE_LOCK_FILE = f"{CONFIG_DIR}/device_auth_lock"
-# _poll_thread = None
-# _poll_stop = threading.Event()
-#
-# def save_device_state(state):
-#     with open(DEVICE_STATE_FILE, 'w') as f:
-#         json.dump(state, f)
-#
-# def load_device_state():
-#     if not os.path.exists(DEVICE_STATE_FILE):
-#         return None
-#     with open(DEVICE_STATE_FILE) as f:
-#         state = json.load(f)
-#     created_at = state.get("created_at", 0)
-#     expires_in = state.get("expires_in", 900)
-#     if time.time() > created_at + expires_in:
-#         os.remove(DEVICE_STATE_FILE)
-#         return None
-#     remaining = int((created_at + expires_in) - time.time())
-#     state["remaining_seconds"] = remaining
-#     return state
-#
-# def clear_device_state():
-#     if os.path.exists(DEVICE_STATE_FILE):
-#         os.remove(DEVICE_STATE_FILE)
-#
-# def recently_started():
-#     if not os.path.exists(DEVICE_LOCK_FILE):
-#         return False
-#     age = time.time() - os.path.getmtime(DEVICE_LOCK_FILE)
-#     return age < 4
-#
-# def touch_lock():
-#     with open(DEVICE_LOCK_FILE, 'w') as f:
-#         f.write(str(time.time()))
-#
-# def poll_for_token(device_code, interval, expires_at):
-#     global _poll_stop
-#     while not _poll_stop.is_set():
-#         time.sleep(interval)
-#         if time.time() > expires_at:
-#             clear_device_state()
-#             break
-#         result, err = ms_post(TOKEN_URL, {
-#             "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-#             "client_id": CLIENT_ID,
-#             "device_code": device_code,
-#         })
-#         if err:
-#             error = err.get("error", "")
-#             if error == "authorization_pending":
-#                 continue
-#             elif error == "slow_down":
-#                 interval += 5
-#                 continue
-#             else:
-#                 clear_device_state()
-#                 break
-#         if result and "refresh_token" in result:
-#             os.makedirs(ONEDRIVE_CONFIG_DIR, exist_ok=True)
-#             with open(f"{ONEDRIVE_CONFIG_DIR}/refresh_token", 'w') as f:
-#                 f.write(result["refresh_token"])
-#             clear_device_state()
-#             break
-#
-# @app.route('/auth/device/start', methods=['POST'])
-# def device_auth_start():
-#     ...  # siehe Git-Historie fuer vollstaendige Implementierung
-# ============================================================
+_auth_proc = None
 
 def auth_log(msg):
     with open(AUTH_DEBUG_LOG, 'a') as f:
@@ -477,6 +406,7 @@ async function startAuth() {
 async function submitAuth() {
   const code = document.getElementById('auth-code').value.trim();
   if (!code) return;
+  showToast('Wird verarbeitet...');
   const res = await fetch(apiUrl('/auth/complete'), {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -598,6 +528,7 @@ def index():
 
 @app.route('/auth/start', methods=['POST'])
 def auth_start():
+    global _auth_proc
     if os.path.exists(AUTH_DEBUG_LOG):
         os.remove(AUTH_DEBUG_LOG)
     auth_log("=== Neuer Auth-Versuch (URL-Methode) ===")
@@ -606,7 +537,12 @@ def auth_start():
         for f in [AUTH_URL_FILE, RESPONSE_URL_FILE]:
             if os.path.exists(f):
                 os.remove(f)
-        proc = subprocess.Popen(
+
+        if _auth_proc and _auth_proc.poll() is None:
+            _auth_proc.kill()
+            _auth_proc.wait()
+
+        _auth_proc = subprocess.Popen(
             ["onedrive", "--confdir", ONEDRIVE_CONFIG_DIR,
              "--auth-files", f"{AUTH_URL_FILE}:{RESPONSE_URL_FILE}"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -615,12 +551,10 @@ def auth_start():
             time.sleep(0.5)
             if os.path.exists(AUTH_URL_FILE):
                 break
-        proc.kill()
-        proc.wait()
         if os.path.exists(AUTH_URL_FILE):
             with open(AUTH_URL_FILE) as f:
                 url = f.read().strip()
-            auth_log(f"authUrl erstellt, Laenge: {len(url)}")
+            auth_log(f"authUrl erstellt, Laenge: {len(url)}, Prozess PID {_auth_proc.pid} bleibt aktiv")
             if url:
                 return jsonify({"success": True, "url": url})
         auth_log("FEHLER: authUrl nicht erstellt")
@@ -632,6 +566,7 @@ def auth_start():
 
 @app.route('/auth/complete', methods=['POST'])
 def auth_complete():
+    global _auth_proc
     data = request.json
     response_url = data.get('response_url', '').strip()
     auth_log("=== auth/complete ===")
@@ -639,25 +574,41 @@ def auth_complete():
     try:
         if not os.path.exists(AUTH_URL_FILE):
             return jsonify({"success": False, "error": "Session abgelaufen - Link neu generieren", "error_short": "Session abgelaufen"}), 400
+        if not _auth_proc or _auth_proc.poll() is not None:
+            auth_log("FEHLER: Auth-Prozess laeuft nicht mehr - Link neu generieren noetig")
+            return jsonify({"success": False, "error": "Auth-Session verloren - bitte neuen Link generieren", "error_short": "Session verloren, neu generieren"}), 400
+
         with open(RESPONSE_URL_FILE, 'w') as f:
             f.write(response_url)
-        result = subprocess.run(
-            ["onedrive", "--confdir", ONEDRIVE_CONFIG_DIR,
-             "--auth-files", f"{AUTH_URL_FILE}:{RESPONSE_URL_FILE}"],
-            capture_output=True, text=True, timeout=60
-        )
-        auth_log(f"exit: {result.returncode}, stdout: {result.stdout[:500]}, stderr: {result.stderr[:500]}")
+        auth_log("responseUrl geschrieben, warte auf laufenden Prozess...")
+
+        try:
+            stdout, stderr = _auth_proc.communicate(timeout=30)
+            stdout_s = stdout.decode(errors='replace')
+            stderr_s = stderr.decode(errors='replace')
+            auth_log(f"exit: {_auth_proc.returncode}, stdout: {stdout_s[:500]}, stderr: {stderr_s[:500]}")
+        except subprocess.TimeoutExpired:
+            auth_log("Timeout beim Warten auf Auth-Prozess")
+            _auth_proc.kill()
+            _auth_proc = None
+            return jsonify({"success": False, "error": "Zeitueberschreitung beim Austausch", "error_short": "Timeout"}), 400
+
         if os.path.exists(f"{ONEDRIVE_CONFIG_DIR}/refresh_token"):
             auth_log("SUCCESS")
+            _auth_proc = None
             return jsonify({"success": True})
+
         short_err = "Unbekannter Fehler"
-        for line in (result.stdout + result.stderr).splitlines():
+        combined = stdout_s + stderr_s
+        for line in combined.splitlines():
             if "AADSTS" in line or "Error Reason" in line:
                 short_err = line.strip()[:80]
                 break
-        return jsonify({"success": False, "error": result.stderr or result.stdout, "error_short": short_err}), 400
+        _auth_proc = None
+        return jsonify({"success": False, "error": combined, "error_short": short_err}), 400
     except Exception as e:
         auth_log(f"EXCEPTION: {e}")
+        _auth_proc = None
         return jsonify({"success": False, "error": str(e), "error_short": str(e)[:80]}), 500
 
 
