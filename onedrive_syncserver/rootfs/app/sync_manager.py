@@ -8,18 +8,15 @@ Fuehrt den eigentlichen Sync durch:
    Include/Exclude-Zeilen an den "Grenzen" zwischen aktivierten und
    deaktivierten Aesten - so werden abgewaehlte Ordner (auch verschachtelt)
    GAR NICHT erst heruntergeladen.
-   OPTIMIERUNG: Wenn ein Ordner deaktiviert ist UND es keine expliziten
-   Konfigurations-Eintraege fuer irgendwelche seiner Unterordner gibt (d.h.
-   der Nutzer hat dort nie manuell etwas umgestellt), wird gar nicht erst
-   in diesen Ast hinabgestiegen - das spart bei grossen deaktivierten
-   Ordnern viele API-Calls, da deren komplette Unterstruktur fuer die
-   sync_list ohnehin irrelevant ist (der ganze Ast ist schon durch die
-   Abwahl des obersten Ordners ausgeschlossen).
-   Nutzt requests.Session() fuer Connection-Pooling/Keep-Alive.
-   Wenn sich die sync_list gegenueber dem letzten Lauf geaendert hat,
-   verlangt onedrive einen --resync - das wird automatisch erkannt.
-2. onedrive --synchronize (OneDrive ist Master, no-remote-delete fuer
-   lokale Loeschungen)
+   Steigt NICHT in deaktivierte Aeste ohne Unterordner-Overrides hinab
+   (spart API-Calls). Nutzt requests.Session() fuer Connection-Pooling.
+   Wenn sich die sync_list geaendert hat, wird automatisch --resync
+   mitgegeben.
+2. onedrive --download-only --cleanup-local-files (OneDrive ist Master:
+   laedt nie lokal hoch, entfernt lokale Dateien die auf OneDrive geloescht
+   wurden). WICHTIG: das alte Flag --no-remote-delete funktioniert seit
+   onedrive v2.5.x nur noch zusammen mit --upload-only und wurde durch
+   diese Kombination ersetzt.
 3. Filtert Dateien innerhalb synchronisierter Ordner nach Dateityp/Alter
 4. Schreibt Status in sync_status.json
 """
@@ -142,9 +139,7 @@ def resolve_enabled(path, config):
 def has_descendant_overrides(path, config):
     """Prueft ob IRGENDEIN Konfigurations-Eintrag fuer einen Unterordner
     von 'path' existiert. Wenn nicht, kann die Rekursion in diesen Ast
-    sicher uebersprungen werden falls der Ast selbst deaktiviert ist -
-    es gibt dann garantiert keine 'versteckte' Wiedereinschaltung tiefer
-    im Baum, die wir sonst verpassen wuerden."""
+    sicher uebersprungen werden falls der Ast selbst deaktiviert ist."""
     prefix = path + "/"
     return any(key.startswith(prefix) for key in config)
 
@@ -152,11 +147,9 @@ def has_descendant_overrides(path, config):
 def list_all_folders(config):
     """
     Listet Ordner per Graph API (Pfad-Format wie lokal: 'Top/Sub/Sub2').
-    Nutzt eine requests.Session fuer Connection-Pooling.
-    Steigt NICHT in Aeste hinab, die deaktiviert sind und keine
-    Unterordner-Overrides in der Konfiguration haben (siehe
-    has_descendant_overrides) - das spart bei grossen deaktivierten
-    Ordnern viele unnoetige API-Calls.
+    Nutzt eine requests.Session fuer Connection-Pooling. Steigt NICHT in
+    Aeste hinab, die deaktiviert sind und keine Unterordner-Overrides in
+    der Konfiguration haben.
     """
     session = requests.Session()
     token = get_access_token(session)
@@ -258,12 +251,20 @@ def write_sync_list(config, all_folders):
 
 
 def run_onedrive_sync(need_resync):
-    """Run onedrive sync with OneDrive as master."""
+    """
+    Run onedrive sync with OneDrive as master (download-only).
+    --download-only: laedt nur von OneDrive runter, laedt NIE lokale
+    Aenderungen hoch (ersetzt die alte Kombination aus --synchronize +
+    --no-remote-delete, die seit onedrive v2.5.x nicht mehr gueltig ist).
+    --cleanup-local-files: entfernt lokale Dateien deren OneDrive-Pendant
+    geloescht wurde (das ist das gewuenschte "OneDrive ist Master"
+    Verhalten - Loeschungen auf OneDrive propagieren lokal).
+    """
     cmd = [
         "onedrive",
         "--confdir", ONEDRIVE_CONFIG_DIR,
-        "--synchronize",
-        "--no-remote-delete",
+        "--download-only",
+        "--cleanup-local-files",
         "--verbose"
     ]
     if need_resync:
