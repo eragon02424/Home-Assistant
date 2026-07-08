@@ -12,11 +12,11 @@ Fuehrt den eigentlichen Sync durch:
    (spart API-Calls). Nutzt requests.Session() fuer Connection-Pooling.
    Wenn sich die sync_list geaendert hat, wird automatisch --resync
    mitgegeben.
-2. onedrive --download-only --cleanup-local-files (OneDrive ist Master:
-   laedt nie lokal hoch, entfernt lokale Dateien die auf OneDrive geloescht
-   wurden). WICHTIG: das alte Flag --no-remote-delete funktioniert seit
-   onedrive v2.5.x nur noch zusammen mit --upload-only und wurde durch
-   diese Kombination ersetzt.
+2. onedrive --sync --download-only --cleanup-local-files (OneDrive ist
+   Master: laedt nie lokal hoch, entfernt lokale Dateien die auf OneDrive
+   geloescht wurden). WICHTIG: seit onedrive v2.5.x ist explizit --sync
+   (oder --monitor) zusaetzlich zu --download-only erforderlich - die alte
+   Kombination --synchronize + --no-remote-delete ist nicht mehr gueltig.
 3. Filtert Dateien innerhalb synchronisierter Ordner nach Dateityp/Alter
 4. Schreibt Status in sync_status.json
 """
@@ -253,9 +253,10 @@ def write_sync_list(config, all_folders):
 def run_onedrive_sync(need_resync):
     """
     Run onedrive sync with OneDrive as master (download-only).
+    --sync: fuehrt den eigentlichen Abgleich durch (Pflicht-Flag seit
+    v2.5.x, ersetzt --synchronize).
     --download-only: laedt nur von OneDrive runter, laedt NIE lokale
-    Aenderungen hoch (ersetzt die alte Kombination aus --synchronize +
-    --no-remote-delete, die seit onedrive v2.5.x nicht mehr gueltig ist).
+    Aenderungen hoch.
     --cleanup-local-files: entfernt lokale Dateien deren OneDrive-Pendant
     geloescht wurde (das ist das gewuenschte "OneDrive ist Master"
     Verhalten - Loeschungen auf OneDrive propagieren lokal).
@@ -263,6 +264,7 @@ def run_onedrive_sync(need_resync):
     cmd = [
         "onedrive",
         "--confdir", ONEDRIVE_CONFIG_DIR,
+        "--sync",
         "--download-only",
         "--cleanup-local-files",
         "--verbose"
