@@ -22,9 +22,6 @@ fi
 echo "[OneDrive SyncServer] Starting Ingress UI on port 8772..."
 python3 /app/server.py 8772 &
 
-echo "[OneDrive SyncServer] Starting direct auth UI on port 8771..."
-python3 /app/server.py 8771 &
-
 echo "[OneDrive SyncServer] Waiting for OneDrive authentication..."
 while [ ! -f "${ONEDRIVE_CONFIG_DIR}/refresh_token" ]; do
   sleep 5
