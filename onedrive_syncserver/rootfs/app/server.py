@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """OneDrive SyncServer - Web UI Backend
-Port 8772 = Ingress
-Port 8771 = Direktzugriff (Device Code Flow Auth)
+Port 8772 = Ingress (BASE aus X-Ingress-Path Header)
+Port 8771 = Direktzugriff (BASE immer leer)
 """
 
 import json
@@ -20,7 +20,7 @@ app = Flask(__name__)
 CORS(app)
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8772
-IS_DIRECT = PORT in (8771, 8772)
+IS_DIRECT_PORT = (PORT == 8771)
 
 CONFIG_DIR = "/data"
 SYNC_CONFIG = f"{CONFIG_DIR}/sync_config.json"
@@ -184,7 +184,13 @@ def get_local_folders():
     return sorted(folders)
 
 def get_base():
-    if IS_DIRECT:
+    """
+    Port 8771 (Direktzugriff): kein Ingress-Proxy davor -> BASE immer leer.
+    Port 8772 (Ingress): HA setzt X-Ingress-Path Header mit dem Proxy-Praefix
+    (z.B. /api/hassio_ingress/TOKEN). Fehlt der Header (z.B. bei direktem
+    curl-Test auf 8772), faellt BASE auf leer zurueck.
+    """
+    if IS_DIRECT_PORT:
         return ""
     return request.headers.get("X-Ingress-Path", "").rstrip("/")
 
@@ -292,7 +298,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <div class="header">
   <span style="font-size:1.5rem">&#9729;</span>
   <h1>OneDrive SyncServer</h1>
-  {% if is_direct %}<span class="direct-badge">Direktzugriff Port {{ port }}</span>{% endif %}
+  {% if is_direct_port %}<span class="direct-badge">Direktzugriff Port {{ port }}</span>{% else %}<span class="direct-badge" style="background:#3b82f6">Ingress Port {{ port }}</span>{% endif %}
 </div>
 <div class="container">
 
@@ -519,7 +525,7 @@ async function searchFile() {
   const d = await res.json();
   if (!res.ok) { container.innerHTML = '<p style="color:#ef4444;font-size:0.85rem">Fehler: ' + (d.error||'unbekannt') + '</p>'; return; }
   if (d.found === 0) { container.innerHTML = '<p style="color:#f59e0b;font-size:0.85rem">Keine Treffer.</p>'; return; }
-  let html = '<p style="color:#9ca3af;font-size:0.78rem;margin-bottom:8px">' + d.found + ' Treffer:</p>';
+  container.innerHTML = '<p style="color:#9ca3af;font-size:0.78rem;margin-bottom:8px">' + d.found + ' Treffer:</p>';
   d.locations.forEach(function(loc) {
     var row = document.createElement('div');
     row.className = 'search-result-item';
@@ -532,10 +538,6 @@ async function searchFile() {
     row.appendChild(info);
     row.appendChild(btn);
     container.appendChild(row);
-  });
-  container.innerHTML = html;
-  d.locations.forEach(function(loc) {
-    var btn = document.createElement('button');
   });
 }
 async function downloadById(itemId, filename) {
@@ -592,7 +594,7 @@ def index():
         config=config, status=status, authenticated=authenticated,
         folders=folders, filter_options=FILTER_OPTIONS,
         delete_options=DELETE_OPTIONS, device_state=device_state,
-        log=log, base=base, is_direct=IS_DIRECT, port=PORT
+        log=log, base=base, is_direct_port=IS_DIRECT_PORT, port=PORT
     )
 
 
