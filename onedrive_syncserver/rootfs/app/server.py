@@ -27,6 +27,7 @@ SYNC_CONFIG = f"{CONFIG_DIR}/sync_config.json"
 ONEDRIVE_CONFIG_DIR = f"{CONFIG_DIR}/onedrive"
 AUTH_DEBUG_LOG = f"{CONFIG_DIR}/auth_debug.log"
 DEVICE_STATE_FILE = f"{CONFIG_DIR}/device_auth_state.json"
+DEVICE_LOCK_FILE = f"{CONFIG_DIR}/device_auth_lock"
 SHARE_DIR = "/share/onedrive"
 DOWNLOAD_DIR = "/share/onedrive_downloads"
 LOG_FILE = f"{CONFIG_DIR}/sync.log"
@@ -68,6 +69,23 @@ def clear_device_state():
     if os.path.exists(DEVICE_STATE_FILE):
         os.remove(DEVICE_STATE_FILE)
 
+def recently_started():
+    """
+    Dateibasierte Sperre (funktioniert prozessuebergreifend zwischen
+    Port 8771 und 8772, die beide dasselbe /data Verzeichnis teilen aber
+    getrennte Python-Prozesse mit eigenem Speicher sind).
+    Verhindert dass zwei fast gleichzeitige Klicks (z.B. Doppelklick oder
+    zwei offene Tabs auf beiden Ports) sich gegenseitig den Code ueberschreiben.
+    """
+    if not os.path.exists(DEVICE_LOCK_FILE):
+        return False
+    age = time.time() - os.path.getmtime(DEVICE_LOCK_FILE)
+    return age < 4
+
+def touch_lock():
+    with open(DEVICE_LOCK_FILE, 'w') as f:
+        f.write(str(time.time()))
+
 def ms_post(url, data):
     encoded = urllib.parse.urlencode(data).encode()
     req = urllib.request.Request(url, data=encoded, method="POST")
@@ -85,7 +103,7 @@ def poll_for_token(device_code, interval, expires_at):
     while not _poll_stop.is_set():
         time.sleep(interval)
         if time.time() > expires_at:
-            auth_log("Device Code abgelaufen")
+            auth_log("Device Code abgelaufen - Polling beendet")
             clear_device_state()
             break
         result, err = ms_post(TOKEN_URL, {
@@ -100,6 +118,10 @@ def poll_for_token(device_code, interval, expires_at):
             elif error == "slow_down":
                 interval += 5
                 continue
+            elif error == "expired_token":
+                auth_log("Microsoft meldet: Token abgelaufen - Polling beendet")
+                clear_device_state()
+                break
             else:
                 auth_log(f"Polling Fehler: {err}")
                 clear_device_state()
@@ -184,12 +206,6 @@ def get_local_folders():
     return sorted(folders)
 
 def get_base():
-    """
-    Port 8771 (Direktzugriff): kein Ingress-Proxy davor -> BASE immer leer.
-    Port 8772 (Ingress): HA setzt X-Ingress-Path Header mit dem Proxy-Praefix
-    (z.B. /api/hassio_ingress/TOKEN). Fehlt der Header (z.B. bei direktem
-    curl-Test auf 8772), faellt BASE auf leer zurueck.
-    """
     if IS_DIRECT_PORT:
         return ""
     return request.headers.get("X-Ingress-Path", "").rstrip("/")
@@ -254,6 +270,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   .expires-fill { height: 100%; background: #3b82f6; border-radius: 2px; transition: width 1s linear; }
   .btn { padding: 8px 16px; border-radius: 6px; border: none; cursor: pointer;
          font-size: 0.9rem; font-weight: 500; margin-right: 4px; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn-primary { background: #3b82f6; color: white; }
   .btn-success { background: #10b981; color: white; }
   .btn-warn { background: #6b7280; color: white; font-size: 0.8rem; padding: 6px 12px; }
@@ -335,7 +352,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
           <a href="{{ device_state.verification_uri }}" target="_blank" class="auth-link">
             &#128279; microsoft.com/devicelogin oeffnen
           </a>
-          <button class="btn btn-warn" onclick="newCode()">&#8635; Neuen Code generieren</button>
+          <button class="btn btn-warn" id="newcode-btn" onclick="newCode()">&#8635; Neuen Code generieren</button>
         </div>
         <div class="device-code">{{ device_state.user_code }}</div>
         <div class="polling-indicator">
@@ -495,10 +512,15 @@ async function startDeviceAuth() {
   }
 }
 async function newCode() {
+  const btn = document.getElementById('newcode-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Wird generiert...'; }
   showToast('Generiere neuen Code...');
   const res = await fetch(apiUrl('/auth/device/reset'), {method: 'POST'});
   if (res.ok) { location.reload(); }
-  else { showToast('Fehler beim Zuruecksetzen', false); }
+  else {
+    showToast('Fehler beim Zuruecksetzen', false);
+    if (btn) { btn.disabled = false; btn.textContent = String.fromCharCode(8635) + ' Neuen Code generieren'; }
+  }
 }
 async function saveConfig() {
   const res = await fetch(apiUrl('/api/config'), {
@@ -602,6 +624,13 @@ def index():
 def device_auth_start():
     global _poll_thread, _poll_stop
     try:
+        if recently_started():
+            auth_log("Start ignoriert - Debounce (< 4s seit letztem Start)")
+            existing = load_device_state()
+            if existing:
+                return jsonify({"success": True, "debounced": True})
+        touch_lock()
+
         os.makedirs(ONEDRIVE_CONFIG_DIR, exist_ok=True)
         result, err = ms_post(DEVICE_AUTH_URL, {"client_id": CLIENT_ID, "scope": SCOPE})
         if err:
@@ -637,6 +666,9 @@ def device_auth_start():
 @app.route('/auth/device/reset', methods=['POST'])
 def device_auth_reset():
     global _poll_stop
+    if recently_started():
+        auth_log("Reset ignoriert - Debounce (< 4s seit letztem Start)")
+        return jsonify({"success": True, "debounced": True})
     _poll_stop.set()
     clear_device_state()
     return device_auth_start()
