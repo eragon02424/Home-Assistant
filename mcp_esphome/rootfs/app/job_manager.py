@@ -1,49 +1,49 @@
 """Job Manager - talks to the ESPHome Device Builder's WebSocket API.
 
-As of ESPHome 2026.6.0 the legacy REST dashboard API (POST /api/compile,
-POST /api/upload) no longer exists. The new "ESPHome Device Builder"
-backend is WS-first: everything goes through ws://<host>:6052/ws with a
-command/response protocol.
+As of ESPHome 2026.6.0 the legacy REST dashboard API no longer exists.
+The new "ESPHome Device Builder" backend is WS-first:
+ws://<host>:6052/ws with a command/response protocol PLUS a real-time
+event bus.
 
-  - Connect: ws://localhost:6052/ws
-  - First frame from server: {"server_version", "esphome_version", "port",
-    "ha_addon", "ha_ingress", "requires_auth"}. requires_auth is False in
-    this HA-addon setup, so commands can be sent immediately.
-  - devices/validate {configuration}: streams {"event":"output","data":line}
-    frames, terminated by {"event":"result","data":{"success","code"}}.
-    Only catches YAML/schema errors, NOT C++ build errors.
-  - firmware/compile {configuration}: returns immediately with
-    {"result": <FirmwareJob>}. Only one compile runs at a time; others queue.
-  - firmware/install {configuration, port}: same shape as compile, but
-    once the compile phase succeeds ESPHome AUTOMATICALLY chains a
-    SEPARATE upload job (its own new job_id, linked via depends_on back
-    to the compile job_id) that performs the actual flash. This chained
-    job_id is never returned to the caller directly, and there is no
-    documented WS command to list jobs for a device/configuration. The
-    only way found to discover it is to watch the ESPHome addon's OWN
-    service log for "Starting job <id>: upload <configuration>". This
-    requires hassio_api/manager permissions (see config.yaml).
-  - firmware/get_job {job_id}: returns the current FirmwareJob snapshot.
-    CONFIRMED: once a job reaches a terminal state, ESPHome clears
-    "output" back to [] and "error" stays null, even for real errors.
-  - firmware/follow_job {job_id}: streams the SAME output frames live,
-    terminated by a "result" event. This is the ONLY way to capture
-    build/upload output/errors -- must be attached while the job runs.
+  - Connect: first frame from server is {"server_version",
+    "esphome_version", "port", "ha_addon", "ha_ingress", "requires_auth"}.
+    requires_auth is False in this HA-addon setup.
+  - devices/validate {configuration}: streams output, terminated by a
+    result event. Only catches YAML/schema errors, not C++ build errors.
+  - firmware/compile {configuration}: returns immediately with a
+    FirmwareJob (job_id/status/...).
+  - firmware/install {configuration, port}: same shape, but once the
+    compile phase succeeds ESPHome AUTOMATICALLY chains a SEPARATE
+    upload job (its own new job_id) that performs the actual flash.
+  - firmware/get_job {job_id}: CONFIRMED that once a job reaches a
+    terminal state, ESPHome clears its own "output" back to [].
+  - firmware/follow_job {job_id}: streams one job's output live, but
+    you have to already know its job_id -- no use for discovering the
+    chained upload job.
 
-Because of this, jobs here are tracked with our OWN in-memory Job
-objects that accumulate output via firmware/follow_job as it streams.
-For install(), TWO phases (compile, then upload) are followed in
-sequence and concatenated into the same Job.output. Compile can already
-be inspected separately via start_compile(), so install() additionally
-tracks flash_output_start_index -- the position in job.output where the
-upload/flash phase's own output begins (right after our own marker
-line) -- letting callers fetch ONLY the flash-phase log via
-get_flash_log(), skipping the compile portion they may not care about
-here since it's redundant with the standalone compile endpoint.
+DISCOVERING THE CHAINED UPLOAD JOB -- v0.17.0 approach:
+  Earlier versions (0.16.x) discovered the chained job_id by polling the
+  ESPHome addon's own Supervisor service logs for a
+  "Starting job <id>: upload <configuration>" line. That required
+  hassio_api + hassio_role: manager permissions on THIS addon (to read
+  another addon's logs), which is more privilege than strictly needed.
+
+  The backend's own architecture doc (device-builder/CLAUDE.md) states:
+  "WS-first API. Real-time updates are the default -- clients
+  subscribe_events once and get pushes. Stateful lists ship through
+  subscribe_events, not a list_* WS command." Testing confirmed this
+  broadcasts job_queued / job_started / job_output / job_completed
+  events for EVERY job on the server over a single subscribed
+  connection -- including the auto-chained upload job, the moment it's
+  queued, complete with its own new job_id and the "configuration" and
+  "job_type" fields needed to match it to our pending install.
+
+  This removes the need for hassio_api/manager entirely: one persistent
+  subscribe_events connection, held for the JobManager's lifetime,
+  replaces the Supervisor-log-polling hack. See _run_event_listener().
 """
 import asyncio
 import logging
-import os
 import re
 import time
 import uuid
@@ -64,18 +64,18 @@ def _strip_ansi(line: str) -> str:
 @dataclass
 class Job:
     job_id: str
-    esphome_job_id: str
     device_name: str
-    job_type: str
+    job_type: str  # "compile" or "install"
+    configuration: str
     status: str = "running"
     exit_code: Optional[int] = None
     error: Optional[str] = None
     output: list = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     completed_at: Optional[float] = None
-    follow_task: Optional[asyncio.Task] = None
-    # For job_type "install" only: index into `output` where the
-    # upload/flash phase's own lines start (None until that phase begins).
+    # For install jobs: index into `output` where the upload/flash
+    # phase's own lines start. None until that phase's job_queued
+    # event arrives.
     flash_output_start_index: Optional[int] = None
 
 
@@ -89,24 +89,122 @@ class JobManager:
         else:
             self.ws_url = base + "/ws"
         self.jobs: dict[str, Job] = {}
-        self._esphome_addon_slug: Optional[str] = None
+        # Maps ESPHome's own job_id -> our Job object, for BOTH the
+        # compile job_id and (once discovered) the chained upload job_id.
+        self._esphome_job_map: dict[str, Job] = {}
+        # Installs whose compile phase is still running / whose chained
+        # upload job hasn't been seen yet, keyed by configuration
+        # filename (e.g. "heizreglerv1.yaml"), since that's what the
+        # chained job's job_queued event carries.
+        self._pending_installs: dict[str, Job] = {}
+        self._event_task: Optional[asyncio.Task] = None
+        self._event_session: Optional[aiohttp.ClientSession] = None
+        self._event_ws: Optional[object] = None
 
-    async def _connect(self):
-        session = aiohttp.ClientSession()
-        ws = await session.ws_connect(self.ws_url, timeout=15)
-        first = await ws.receive_json()
-        if first.get("requires_auth"):
-            _LOGGER.warning("ESPHome dashboard requires_auth=True — not supported")
-        return session, ws
+    async def start(self):
+        """Starts the persistent subscribe_events listener. Call once
+        at addon startup.
+        """
+        self._event_task = asyncio.create_task(self._run_event_listener())
+
+    async def _run_event_listener(self):
+        """Holds one persistent WS connection subscribed to all job
+        events for the addon's lifetime, reconnecting on drop.
+        """
+        while True:
+            try:
+                self._event_session = aiohttp.ClientSession()
+                self._event_ws = await self._event_session.ws_connect(self.ws_url, timeout=15)
+                await self._event_ws.receive_json()  # server info frame
+                await self._event_ws.send_json({
+                    "command": "subscribe_events", "message_id": "sub", "args": {}
+                })
+                first = await self._event_ws.receive_json()
+                if first.get("event") != "initial_state":
+                    _LOGGER.warning("Unexpected subscribe_events response: %s", first)
+                _LOGGER.info("Job event listener subscribed")
+
+                while True:
+                    msg = await self._event_ws.receive_json()
+                    self._handle_event(msg)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                _LOGGER.warning("Job event listener disconnected: %s — reconnecting in 5s", err)
+            finally:
+                try:
+                    if self._event_ws is not None:
+                        await self._event_ws.close()
+                    if self._event_session is not None:
+                        await self._event_session.close()
+                except Exception:
+                    pass
+            await asyncio.sleep(5)
+
+    def _handle_event(self, msg: dict):
+        event = msg.get("event")
+        data = msg.get("data", {})
+
+        if event == "job_output":
+            job_id = data.get("job_id")
+            job = self._esphome_job_map.get(job_id)
+            if job is not None:
+                job.output.append(_strip_ansi(data.get("line", "")))
+            return
+
+        if event == "job_queued":
+            job_info = data.get("job", {})
+            job_id = job_info.get("job_id")
+            job_type = job_info.get("job_type")
+            configuration = job_info.get("configuration")
+            if job_type == "upload" and configuration in self._pending_installs:
+                job = self._pending_installs.pop(configuration)
+                self._esphome_job_map[job_id] = job
+                job.flash_output_start_index = len(job.output)
+                _LOGGER.info("Discovered chained upload job for %s: %s",
+                             job.device_name, job_id)
+            return
+
+        if event in ("job_completed", "job_failed"):
+            job_info = data.get("job", {})
+            job_id = job_info.get("job_id")
+            job = self._esphome_job_map.get(job_id)
+            if job is None:
+                return
+            status = job_info.get("status", "failed")
+            job.status = status
+            job.exit_code = job_info.get("exit_code")
+            job.error = job_info.get("error")
+            # A completed COMPILE phase of an install that has no
+            # upload chained yet, but failed, means no upload is coming.
+            if job.job_type == "install" and status != "completed" \
+                    and job.configuration in self._pending_installs:
+                self._pending_installs.pop(job.configuration, None)
+                job.completed_at = time.time()
+            # Only mark the overall Job completed_at once we're on its
+            # LAST phase: for compile-only jobs immediately; for install
+            # jobs, only once the flash phase itself has a result (i.e.
+            # flash_output_start_index is set and this event's job_id is
+            # not the compile job_id anymore) OR the compile itself failed.
+            if job.job_type == "compile":
+                job.completed_at = time.time()
+            elif job.job_type == "install" and job.flash_output_start_index is not None:
+                job.completed_at = time.time()
+            _LOGGER.info("Job event %s for %s (job_id=%s): status=%s exit_code=%s",
+                         event, job.device_name, job_id, job.status, job.exit_code)
+            return
 
     async def validate_config(self, device_name: str) -> dict:
         """Runs devices/validate and waits for the terminal result.
-        Only catches YAML/schema errors, not C++ build errors.
+        Only catches YAML/schema errors, not C++ build errors. Uses its
+        own short-lived connection (independent of the event listener).
         """
         configuration = f"{device_name}.yaml"
-        session, ws = await self._connect()
+        session = aiohttp.ClientSession()
+        ws = await session.ws_connect(self.ws_url, timeout=15)
         output_lines: list[str] = []
         try:
+            await ws.receive_json()
             await ws.send_json({
                 "command": "devices/validate",
                 "message_id": "1",
@@ -135,206 +233,72 @@ class JobManager:
             await session.close()
 
     async def start_compile(self, device_name: str) -> str:
-        """Starts firmware/compile, then immediately attaches
-        firmware/follow_job in a background task to capture output live.
-        Returns OUR OWN job_id (not ESPHome's).
+        """Starts firmware/compile. Output/status are collected purely
+        via the persistent subscribe_events listener from here on.
+        Returns OUR OWN job_id.
         """
         configuration = f"{device_name}.yaml"
-        session, ws = await self._connect()
-        try:
-            await ws.send_json({
-                "command": "firmware/compile",
-                "message_id": "1",
-                "args": {"configuration": configuration},
-            })
-            msg = await asyncio.wait_for(ws.receive_json(), timeout=15)
-            if "error_code" in msg:
-                raise RuntimeError(f"{msg.get('error_code')}: {msg.get('details')}")
-            esphome_job = msg["result"]
-        finally:
-            await ws.close()
-            await session.close()
+        esphome_job_id = await self._send_job_command("firmware/compile", configuration)
 
         our_job_id = uuid.uuid4().hex[:12]
         job = Job(
             job_id=our_job_id,
-            esphome_job_id=esphome_job["job_id"],
             device_name=device_name,
             job_type="compile",
-            status=esphome_job["status"],
+            configuration=configuration,
         )
         self.jobs[our_job_id] = job
-        job.follow_task = asyncio.create_task(self._follow_one_phase(job, job.esphome_job_id, "compile"))
+        self._esphome_job_map[esphome_job_id] = job
         _LOGGER.info("Compile started for %s: our_job_id=%s esphome_job_id=%s",
-                     device_name, our_job_id, esphome_job["job_id"])
+                     device_name, our_job_id, esphome_job_id)
         return our_job_id
 
     async def start_install(self, device_name: str) -> str:
-        """Starts firmware/install with port=OTA (WiFi). ESPHome chains
-        a compile phase followed automatically by a separate upload
-        phase (own job_id). Both are followed live; job.output holds
-        the combined log, while job.flash_output_start_index marks where
-        the upload/flash portion begins, so callers who already know
-        compile succeeded (e.g. via a prior start_compile() call) can
-        fetch just the flash-phase log via get_flash_log().
+        """Starts firmware/install with port=OTA (WiFi). The chained
+        upload job is discovered automatically by the event listener
+        via _pending_installs. Returns OUR OWN job_id.
         """
         configuration = f"{device_name}.yaml"
-        session, ws = await self._connect()
-        try:
-            await ws.send_json({
-                "command": "firmware/install",
-                "message_id": "1",
-                "args": {"configuration": configuration, "port": "OTA"},
-            })
-            msg = await asyncio.wait_for(ws.receive_json(), timeout=15)
-            if "error_code" in msg:
-                raise RuntimeError(f"{msg.get('error_code')}: {msg.get('details')}")
-            esphome_job = msg["result"]
-        finally:
-            await ws.close()
-            await session.close()
+        esphome_job_id = await self._send_job_command(
+            "firmware/install", configuration, extra_args={"port": "OTA"}
+        )
 
         our_job_id = uuid.uuid4().hex[:12]
         job = Job(
             job_id=our_job_id,
-            esphome_job_id=esphome_job["job_id"],
             device_name=device_name,
             job_type="install",
-            status=esphome_job["status"],
+            configuration=configuration,
         )
         self.jobs[our_job_id] = job
-        job.follow_task = asyncio.create_task(self._run_install(job, configuration))
+        self._esphome_job_map[esphome_job_id] = job
+        self._pending_installs[configuration] = job
         _LOGGER.info("Install (OTA) started for %s: our_job_id=%s esphome_compile_job_id=%s",
-                     device_name, our_job_id, esphome_job["job_id"])
+                     device_name, our_job_id, esphome_job_id)
         return our_job_id
 
-    async def _run_install(self, job: Job, configuration: str):
-        compile_ok = await self._follow_one_phase(job, job.esphome_job_id, "compile")
-        if not compile_ok:
-            return  # compile itself failed; job.status/exit_code/error already set
-
-        upload_job_id = await self._find_chained_job_id(configuration, timeout=30)
-        if upload_job_id is None:
-            job.output.append(
-                "Kein Upload-Job innerhalb von 30s gefunden — "
-                "Installation eventuell nicht fortgesetzt oder Erkennung fehlgeschlagen.\n"
-            )
-            job.flash_output_start_index = len(job.output) - 1
-            job.status = "unknown"
-            job.completed_at = time.time()
-            _LOGGER.warning("Could not discover chained upload job for %s", job.device_name)
-            return
-
-        # Mark exactly where the flash-phase's own output will start.
-        job.flash_output_start_index = len(job.output)
-        await self._follow_one_phase(job, upload_job_id, "upload")
-
-    async def _follow_one_phase(self, job: Job, esphome_job_id: str, phase_label: str) -> bool:
-        """Follows one job phase via firmware/follow_job, appends its
-        output to job.output, and updates job.status/exit_code/error
-        from its terminal result. Returns True if it completed with
-        exit_code 0.
+    async def _send_job_command(self, command: str, configuration: str,
+                                  extra_args: Optional[dict] = None) -> str:
+        """Sends a one-shot firmware/compile or firmware/install command
+        on a short-lived connection and returns the resulting job_id.
+        The persistent event listener (already running) picks up all
+        further output/status for this job_id.
         """
-        session, ws = await self._connect()
+        args = {"configuration": configuration}
+        if extra_args:
+            args.update(extra_args)
+        session = aiohttp.ClientSession()
+        ws = await session.ws_connect(self.ws_url, timeout=15)
         try:
-            await ws.send_json({
-                "command": "firmware/follow_job",
-                "message_id": "1",
-                "args": {"job_id": esphome_job_id},
-            })
-            while True:
-                msg = await asyncio.wait_for(ws.receive_json(), timeout=600)
-                event = msg.get("event")
-                if event == "output":
-                    job.output.append(_strip_ansi(msg.get("data", "")))
-                elif event == "result":
-                    data = msg.get("data", {})
-                    job.status = data.get("status", "failed")
-                    job.exit_code = data.get("exit_code")
-                    job.error = data.get("error")
-                    job.completed_at = time.time()
-                    _LOGGER.info("%s phase finished for %s: status=%s exit_code=%s",
-                                 phase_label, job.device_name, job.status, job.exit_code)
-                    return job.exit_code == 0
-                elif "error_code" in msg:
-                    job.status = "failed"
-                    job.error = f"{msg.get('error_code')}: {msg.get('details')}"
-                    job.completed_at = time.time()
-                    return False
-        except Exception as err:
-            job.status = "failed"
-            job.error = f"follow_job connection error ({phase_label}): {err}"
-            job.completed_at = time.time()
-            _LOGGER.error("follow_job failed for %s (%s): %s", job.device_name, phase_label, err)
-            return False
+            await ws.receive_json()
+            await ws.send_json({"command": command, "message_id": "1", "args": args})
+            msg = await asyncio.wait_for(ws.receive_json(), timeout=15)
+            if "error_code" in msg:
+                raise RuntimeError(f"{msg.get('error_code')}: {msg.get('details')}")
+            return msg["result"]["job_id"]
         finally:
             await ws.close()
             await session.close()
-
-    async def _find_esphome_addon_slug(self) -> Optional[str]:
-        """Finds the ESPHome Device Builder addon's slug (NOT our own
-        mcp_esphome addon) via the Supervisor API. Cached after first
-        successful lookup. Requires hassio_api: true + hassio_role:
-        manager in config.yaml.
-        """
-        if self._esphome_addon_slug:
-            return self._esphome_addon_slug
-        token = os.environ.get("SUPERVISOR_TOKEN", "")
-        if not token:
-            _LOGGER.warning("No SUPERVISOR_TOKEN — cannot discover ESPHome addon slug "
-                            "(needs hassio_api permission)")
-            return None
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    "http://supervisor/addons",
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    if resp.status != 200:
-                        _LOGGER.warning("Supervisor /addons returned HTTP %s", resp.status)
-                        return None
-                    data = await resp.json()
-            for addon in data.get("data", {}).get("addons", []):
-                slug = addon.get("slug", "")
-                if slug.endswith("_esphome") and "mcp" not in slug.lower():
-                    self._esphome_addon_slug = slug
-                    _LOGGER.info("Discovered ESPHome addon slug: %s", slug)
-                    return slug
-        except Exception as err:
-            _LOGGER.warning("Could not discover ESPHome addon slug: %s", err)
-        return None
-
-    async def _find_chained_job_id(self, configuration: str, timeout: float = 30) -> Optional[str]:
-        """Polls the ESPHome addon's own Supervisor service log for a
-        'Starting job <id>: upload <configuration>' line. This is the
-        only way found to discover the auto-chained upload job_id,
-        since the WS API has no list-jobs-for-device command.
-        """
-        slug = await self._find_esphome_addon_slug()
-        if slug is None:
-            return None
-        token = os.environ.get("SUPERVISOR_TOKEN", "")
-        pattern = re.compile(r"Starting job (\w+): upload " + re.escape(configuration))
-        deadline = time.time() + timeout
-        async with aiohttp.ClientSession() as session:
-            while time.time() < deadline:
-                try:
-                    async with session.get(
-                        f"http://supervisor/addons/{slug}/logs",
-                        headers={"Authorization": f"Bearer {token}"},
-                        params={"lines": 50},
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as resp:
-                        if resp.status == 200:
-                            text = await resp.text()
-                            matches = pattern.findall(text)
-                            if matches:
-                                return matches[-1]
-                except Exception as err:
-                    _LOGGER.debug("Chained job discovery poll error: %s", err)
-                await asyncio.sleep(1)
-        return None
 
     def get_status(self, job_id: str) -> Optional[dict]:
         job = self.jobs.get(job_id)
@@ -360,10 +324,8 @@ class JobManager:
 
     def get_flash_log(self, job_id: str) -> Optional[dict]:
         """Only the flash/upload phase's own output, skipping the
-        compile portion. For job_type='compile' jobs (no flash phase
-        at all), or an 'install' job where the flash phase hasn't
-        started yet (still compiling, or compile failed), returns an
-        empty log with a note explaining why.
+        compile portion (which can already be inspected separately via
+        the standalone compile endpoint).
         """
         job = self.jobs.get(job_id)
         if job is None:
