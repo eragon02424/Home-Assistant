@@ -18,29 +18,28 @@ event bus.
   - firmware/get_job {job_id}: CONFIRMED that once a job reaches a
     terminal state, ESPHome clears its own "output" back to [].
   - firmware/follow_job {job_id}: streams one job's output live, but
-    you have to already know its job_id -- no use for discovering the
-    chained upload job.
+    you have to already know its job_id.
+  - subscribe_events {}: pushes real-time job_queued / job_started /
+    job_output / job_completed / job_failed events for EVERY job on the
+    server over one subscribed connection. The chained upload job's
+    job_queued event fires immediately when firmware/install is called,
+    with its own job_id and "depends_on"/"configuration" fields -- so
+    subscribing once (kept open for the addon's lifetime) reveals every
+    job's full lifecycle with no per-job connection or Supervisor-log
+    polling needed. Confirmed by direct testing.
 
-DISCOVERING THE CHAINED UPLOAD JOB -- v0.17.0 approach:
-  Earlier versions (0.16.x) discovered the chained job_id by polling the
-  ESPHome addon's own Supervisor service logs for a
-  "Starting job <id>: upload <configuration>" line. That required
-  hassio_api + hassio_role: manager permissions on THIS addon (to read
-  another addon's logs), which is more privilege than strictly needed.
-
-  The backend's own architecture doc (device-builder/CLAUDE.md) states:
-  "WS-first API. Real-time updates are the default -- clients
-  subscribe_events once and get pushes. Stateful lists ship through
-  subscribe_events, not a list_* WS command." Testing confirmed this
-  broadcasts job_queued / job_started / job_output / job_completed
-  events for EVERY job on the server over a single subscribed
-  connection -- including the auto-chained upload job, the moment it's
-  queued, complete with its own new job_id and the "configuration" and
-  "job_type" fields needed to match it to our pending install.
-
-  This removes the need for hassio_api/manager entirely: one persistent
-  subscribe_events connection, held for the JobManager's lifetime,
-  replaces the Supervisor-log-polling hack. See _run_event_listener().
+Because ONE of our own Job objects (job_type="install") is mapped in
+_esphome_job_map under BOTH the compile job_id and the (later
+discovered) upload job_id, job_completed/job_failed events fire twice
+for a single install -- once for each phase. Only the LAST phase's
+event is authoritative for the overall job.status/exit_code: the
+upload job_id if one was discovered, or the compile job_id itself if
+compile failed (since no upload follows a failed compile). See
+_handle_event()'s is_authoritative logic -- this was a real bug in an
+earlier version of this file (every completion event overwrote
+job.status unconditionally, making an "install" job appear "completed"
+the moment compile alone finished, before the flash phase had even
+started).
 """
 import asyncio
 import logging
@@ -73,6 +72,12 @@ class Job:
     output: list = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     completed_at: Optional[float] = None
+    # ESPHome's own job_id for the compile phase (set immediately) and,
+    # for install jobs, the chained upload phase (set once discovered
+    # via its job_queued event). Used to tell which completion event is
+    # the FINAL, authoritative one for this Job's overall status.
+    compile_job_id: Optional[str] = None
+    upload_job_id: Optional[str] = None
     # For install jobs: index into `output` where the upload/flash
     # phase's own lines start. None until that phase's job_queued
     # event arrives.
@@ -92,10 +97,9 @@ class JobManager:
         # Maps ESPHome's own job_id -> our Job object, for BOTH the
         # compile job_id and (once discovered) the chained upload job_id.
         self._esphome_job_map: dict[str, Job] = {}
-        # Installs whose compile phase is still running / whose chained
-        # upload job hasn't been seen yet, keyed by configuration
-        # filename (e.g. "heizreglerv1.yaml"), since that's what the
-        # chained job's job_queued event carries.
+        # Installs whose chained upload job hasn't been seen yet, keyed
+        # by configuration filename (e.g. "heizreglerv1.yaml"), since
+        # that's what the chained job's job_queued event carries.
         self._pending_installs: dict[str, Job] = {}
         self._event_task: Optional[asyncio.Task] = None
         self._event_session: Optional[aiohttp.ClientSession] = None
@@ -159,6 +163,7 @@ class JobManager:
             configuration = job_info.get("configuration")
             if job_type == "upload" and configuration in self._pending_installs:
                 job = self._pending_installs.pop(configuration)
+                job.upload_job_id = job_id
                 self._esphome_job_map[job_id] = job
                 job.flash_output_start_index = len(job.output)
                 _LOGGER.info("Discovered chained upload job for %s: %s",
@@ -171,27 +176,36 @@ class JobManager:
             job = self._esphome_job_map.get(job_id)
             if job is None:
                 return
+
             status = job_info.get("status", "failed")
-            job.status = status
-            job.exit_code = job_info.get("exit_code")
-            job.error = job_info.get("error")
-            # A completed COMPILE phase of an install that has no
-            # upload chained yet, but failed, means no upload is coming.
-            if job.job_type == "install" and status != "completed" \
-                    and job.configuration in self._pending_installs:
-                self._pending_installs.pop(job.configuration, None)
-                job.completed_at = time.time()
-            # Only mark the overall Job completed_at once we're on its
-            # LAST phase: for compile-only jobs immediately; for install
-            # jobs, only once the flash phase itself has a result (i.e.
-            # flash_output_start_index is set and this event's job_id is
-            # not the compile job_id anymore) OR the compile itself failed.
+            exit_code = job_info.get("exit_code")
+            error = job_info.get("error")
+
+            is_authoritative = False
             if job.job_type == "compile":
+                is_authoritative = True
+            elif job.job_type == "install":
+                if job_id == job.upload_job_id:
+                    is_authoritative = True
+                elif job_id == job.compile_job_id and status != "completed":
+                    # Compile itself failed/was cancelled — no upload
+                    # will ever be chained, so this IS the final word.
+                    is_authoritative = True
+                    self._pending_installs.pop(job.configuration, None)
+
+            if is_authoritative:
+                job.status = status
+                job.exit_code = exit_code
+                job.error = error
                 job.completed_at = time.time()
-            elif job.job_type == "install" and job.flash_output_start_index is not None:
-                job.completed_at = time.time()
-            _LOGGER.info("Job event %s for %s (job_id=%s): status=%s exit_code=%s",
-                         event, job.device_name, job_id, job.status, job.exit_code)
+                _LOGGER.info("Job %s FINAL for %s (job_id=%s): status=%s exit_code=%s",
+                             event, job.device_name, job_id, status, exit_code)
+            else:
+                _LOGGER.info(
+                    "Job %s for %s (job_id=%s): status=%s — compile phase only, "
+                    "awaiting upload phase before this counts as final",
+                    event, job.device_name, job_id, status,
+                )
             return
 
     async def validate_config(self, device_name: str) -> dict:
@@ -246,6 +260,7 @@ class JobManager:
             device_name=device_name,
             job_type="compile",
             configuration=configuration,
+            compile_job_id=esphome_job_id,
         )
         self.jobs[our_job_id] = job
         self._esphome_job_map[esphome_job_id] = job
@@ -269,6 +284,7 @@ class JobManager:
             device_name=device_name,
             job_type="install",
             configuration=configuration,
+            compile_job_id=esphome_job_id,
         )
         self.jobs[our_job_id] = job
         self._esphome_job_map[esphome_job_id] = job
