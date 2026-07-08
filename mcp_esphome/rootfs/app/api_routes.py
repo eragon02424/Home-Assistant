@@ -3,16 +3,13 @@ import logging
 
 from aiohttp import web
 
-from job_manager import JobManager
-
 _LOGGER = logging.getLogger("mcp_esphome.api")
 
 
 def setup_routes(app: web.Application):
     device_manager = app["device_manager"]
     log_manager = app["log_manager"]
-    job_manager = JobManager(device_manager.esphome_dashboard_url)
-    app["job_manager"] = job_manager
+    job_manager = app["job_manager"]
     bearer_token = app.get("bearer_token", "")
 
     @web.middleware
