@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """OneDrive SyncServer - Sync Manager
 
-Führt den eigentlichen Sync durch:
-1. onedrive --synchronize (OneDrive ist Master, no-remote-delete für lokale Löschungen)
-2. Filtert Dateien basierend auf Konfiguration
-3. Löscht lokale Dateien die älter als X Tage (ohne OneDrive zu berühren)
+Fuehrt den eigentlichen Sync durch:
+1. Ermittelt Top-Level-Ordner via Graph API und schreibt eine sync_list
+   Datei, damit onedrive abgewaehlte Ordner GAR NICHT erst herunterlaedt
+   (statt vorher alles zu laden und danach lokal wieder zu loeschen).
+2. onedrive --synchronize (OneDrive ist Master, no-remote-delete fuer lokale
+   Loeschungen)
+3. Filtert Dateien innerhalb synchronisierter Ordner nach Dateityp/Alter
 4. Schreibt Status in sync_status.json
 """
 
@@ -12,13 +15,22 @@ import json
 import os
 import subprocess
 import time
+import urllib.request
+import urllib.parse
+import urllib.error
 from datetime import datetime
 
 CONFIG_DIR = "/data"
 SYNC_CONFIG = f"{CONFIG_DIR}/sync_config.json"
 ONEDRIVE_CONFIG_DIR = f"{CONFIG_DIR}/onedrive"
+SYNC_LIST_FILE = f"{ONEDRIVE_CONFIG_DIR}/sync_list"
 SHARE_DIR = "/share/onedrive"
 STATUS_FILE = f"{CONFIG_DIR}/sync_status.json"
+
+CLIENT_ID = "d50ca740-c83f-4d1b-b616-12c519384f0c"
+TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+SCOPE = "Files.ReadWrite Files.ReadWrite.All Sites.ReadWrite.All offline_access"
 
 FILTER_EXTENSIONS = {
     "all": None,  # None = kein Filter
@@ -53,32 +65,80 @@ def load_status():
             return json.load(f)
     return {"last_sync": None, "files_synced": 0, "errors": [], "authenticated": False}
 
-def get_effective_config(folder_path, config):
-    """Resolves inherited config for a folder.
-    Child inherits from parent if value is 'inherit' or not set.
+
+# --- Graph API Hilfsfunktionen (eigenstaendig, da separater Prozess) ---
+
+def ms_post(url, data):
+    encoded = urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(url, data=encoded, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+        return json.loads(resp.read()), None
+    except urllib.error.HTTPError as e:
+        body = json.loads(e.read())
+        return None, body
+
+def get_access_token():
+    rt_file = f"{ONEDRIVE_CONFIG_DIR}/refresh_token"
+    if not os.path.exists(rt_file):
+        raise Exception("Nicht authentifiziert")
+    with open(rt_file) as f:
+        refresh_token = f.read().strip()
+    result, err = ms_post(TOKEN_URL, {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLIENT_ID,
+        "scope": SCOPE,
+    })
+    if err:
+        raise Exception(f"Token-Fehler: {err.get('error_description', err.get('error'))}")
+    if "refresh_token" in result:
+        with open(rt_file, 'w') as f:
+            f.write(result["refresh_token"])
+    return result["access_token"]
+
+def list_top_level_folders():
+    """Listet Top-Level-Ordner direkt per Graph API - kein lokaler Sync noetig."""
+    token = get_access_token()
+    url = f"{GRAPH_BASE}/me/drive/root/children"
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Bearer {token}")
+    resp = urllib.request.urlopen(req, timeout=30)
+    result = json.loads(resp.read())
+    return sorted([item["name"] for item in result.get("value", []) if "folder" in item])
+
+
+def write_sync_list(config, top_folders):
     """
-    parts = folder_path.split('/')
-    effective = {
-        "sync": True,
-        "filter": "all",
-        "delete_after": "never",
-        "custom_local_path": None,
-        "custom_extensions": ""
-    }
-    # Walk from root to leaf, inheriting values
-    for i in range(1, len(parts) + 1):
-        ancestor = '/'.join(parts[:i])
-        if ancestor in config:
-            c = config[ancestor]
-            for key in effective:
-                if key in c and c[key] is not None:
-                    effective[key] = c[key]
-    return effective
+    Schreibt eine onedrive sync_list Datei: nur Ordner mit sync=true werden
+    ueberhaupt heruntergeladen. onedrive ueberspringt alle anderen komplett
+    (statt sie zu laden und hinterher lokal zu loeschen).
+    Wenn ALLE Top-Ordner aktiv sind, wird keine Einschraenkung gesetzt
+    (sync_list Datei geloescht) - dann laeuft der volle Sync wie gewohnt.
+    """
+    if not top_folders:
+        # Konnte Ordnerliste nicht ermitteln (z.B. Token-Fehler) - keine
+        # Einschraenkung setzen, um nichts kaputt zu machen.
+        return
+    included = [f for f in top_folders if config.get(f, {}).get("sync", True)]
+    if len(included) == len(top_folders):
+        if os.path.exists(SYNC_LIST_FILE):
+            os.remove(SYNC_LIST_FILE)
+        print("[sync_list] Alle Ordner aktiv - keine Einschraenkung")
+        return
+    with open(SYNC_LIST_FILE, "w") as f:
+        for folder in included:
+            f.write(f"{folder}/*\n")
+    excluded = [f for f in top_folders if f not in included]
+    print(f"[sync_list] {len(included)} Ordner aktiv, {len(excluded)} uebersprungen: {excluded}")
+
 
 def run_onedrive_sync():
     """Run onedrive sync with OneDrive as master.
     --no-remote-delete: local deletes don't propagate to OneDrive
     OneDrive deletions DO propagate locally (master behavior)
+    sync_list (falls vorhanden) beschraenkt was ueberhaupt geladen wird.
     """
     try:
         result = subprocess.run(
@@ -101,9 +161,32 @@ def run_onedrive_sync():
     except Exception as e:
         return False, str(e)
 
+def get_effective_config(folder_path, config):
+    """Resolves inherited config for a folder.
+    Child inherits from parent if value is 'inherit' or not set.
+    """
+    parts = folder_path.split('/')
+    effective = {
+        "sync": True,
+        "filter": "all",
+        "delete_after": "never",
+        "custom_local_path": None,
+        "custom_extensions": ""
+    }
+    # Walk from root to leaf, inheriting values
+    for i in range(1, len(parts) + 1):
+        ancestor = '/'.join(parts[:i])
+        if ancestor in config:
+            c = config[ancestor]
+            for key in effective:
+                if key in c and c[key] is not None:
+                    effective[key] = c[key]
+    return effective
+
 def apply_filters_and_cleanup(config):
     """After sync, delete files that don't match filter OR are older than delete_after.
-    Never touches OneDrive - only local /share/onedrive.
+    Only applies to folders that WERE synced (sync_list already excluded the rest
+    from being downloaded in the first place). Never touches OneDrive.
     """
     files_processed = 0
     files_deleted = 0
@@ -153,12 +236,23 @@ def main():
     status = load_status()
     errors = []
 
+    # 0. sync_list VOR dem Sync setzen, damit abgewaehlte Ordner gar nicht
+    #    erst heruntergeladen werden.
+    try:
+        top_folders = list_top_level_folders()
+        write_sync_list(config, top_folders)
+    except Exception as e:
+        print(f"[WARN] Konnte sync_list nicht aktualisieren: {e}")
+        errors.append(f"{datetime.now().strftime('%H:%M')} sync_list Fehler: {e}")
+
     # 1. Run onedrive sync
     ok, err = run_onedrive_sync()
     if not ok:
         errors.append(f"{datetime.now().strftime('%H:%M')} Sync error: {err}")
 
-    # 2. Apply filters and age-based cleanup
+    # 2. Apply filters and age-based cleanup (nur innerhalb bereits
+    #    synchronisierter Ordner - der grosse Teil der Nicht-Ordner ist
+    #    dank sync_list bereits gar nicht heruntergeladen worden)
     files_processed, files_deleted = apply_filters_and_cleanup(config)
     print(f"[SYNC] Processed {files_processed} files, deleted {files_deleted} locally")
 
