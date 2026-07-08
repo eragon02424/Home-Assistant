@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """OneDrive SyncServer - Web UI Backend
 Port 8772 = Ingress (BASE aus X-Ingress-Path Header)
-Port 8771 = Direktzugriff (BASE immer leer)
 """
 
 import json
@@ -42,6 +41,18 @@ SCOPE = "Files.ReadWrite Files.ReadWrite.All Sites.ReadWrite.All offline_access"
 _poll_thread = None
 _poll_stop = threading.Event()
 
+@app.after_request
+def add_no_cache_headers(response):
+    """
+    Verhindert dass mobile Browser (v.a. in HA-Ingress-WebViews) die Seite
+    cachen und dadurch einen veralteten, bereits abgelaufenen Device-Code
+    anzeigen statt der aktuellen Version vom Server.
+    """
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
 def auth_log(msg):
     with open(AUTH_DEBUG_LOG, 'a') as f:
         f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
@@ -71,11 +82,9 @@ def clear_device_state():
 
 def recently_started():
     """
-    Dateibasierte Sperre (funktioniert prozessuebergreifend zwischen
-    Port 8771 und 8772, die beide dasselbe /data Verzeichnis teilen aber
-    getrennte Python-Prozesse mit eigenem Speicher sind).
-    Verhindert dass zwei fast gleichzeitige Klicks (z.B. Doppelklick oder
-    zwei offene Tabs auf beiden Ports) sich gegenseitig den Code ueberschreiben.
+    Dateibasierte Sperre. Verhindert dass zwei fast gleichzeitige Klicks
+    (z.B. Doppelklick oder zwei offene Tabs) sich gegenseitig den Code
+    ueberschreiben.
     """
     if not os.path.exists(DEVICE_LOCK_FILE):
         return False
@@ -233,6 +242,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>OneDrive SyncServer</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -315,7 +327,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <div class="header">
   <span style="font-size:1.5rem">&#9729;</span>
   <h1>OneDrive SyncServer</h1>
-  {% if is_direct_port %}<span class="direct-badge">Direktzugriff Port {{ port }}</span>{% else %}<span class="direct-badge" style="background:#3b82f6">Ingress Port {{ port }}</span>{% endif %}
 </div>
 <div class="container">
 
@@ -475,7 +486,7 @@ function updateCountdown() {
 setTimeout(updateCountdown, 1000);
 async function pollAuthStatus() {
   try {
-    const res = await fetch(apiUrl('/api/auth_status'));
+    const res = await fetch(apiUrl('/api/auth_status'), {cache: 'no-store'});
     const d = await res.json();
     if (d.authenticated) { location.reload(); return; }
   } catch(e) {}
@@ -503,7 +514,7 @@ function toggleCustomPath(path, useStandard) {
 async function startDeviceAuth() {
   const btn = document.getElementById('auth-btn');
   if (btn) { btn.textContent = 'Wird gestartet...'; btn.disabled = true; }
-  const res = await fetch(apiUrl('/auth/device/start'), {method: 'POST'});
+  const res = await fetch(apiUrl('/auth/device/start'), {method: 'POST', cache: 'no-store'});
   if (res.ok) { location.reload(); }
   else {
     const d = await res.json();
@@ -515,7 +526,7 @@ async function newCode() {
   const btn = document.getElementById('newcode-btn');
   if (btn) { btn.disabled = true; btn.textContent = 'Wird generiert...'; }
   showToast('Generiere neuen Code...');
-  const res = await fetch(apiUrl('/auth/device/reset'), {method: 'POST'});
+  const res = await fetch(apiUrl('/auth/device/reset'), {method: 'POST', cache: 'no-store'});
   if (res.ok) { location.reload(); }
   else {
     showToast('Fehler beim Zuruecksetzen', false);
@@ -588,7 +599,7 @@ async function downloadByPath() {
 }
 setInterval(async () => {
   try {
-    const res = await fetch(apiUrl('/api/status'));
+    const res = await fetch(apiUrl('/api/status'), {cache: 'no-store'});
     const data = await res.json();
     if (document.getElementById('last-sync')) document.getElementById('last-sync').textContent = data.last_sync || 'Noch kein Sync';
     if (document.getElementById('files-synced')) document.getElementById('files-synced').textContent = data.files_synced;
@@ -616,7 +627,7 @@ def index():
         config=config, status=status, authenticated=authenticated,
         folders=folders, filter_options=FILTER_OPTIONS,
         delete_options=DELETE_OPTIONS, device_state=device_state,
-        log=log, base=base, is_direct_port=IS_DIRECT_PORT, port=PORT
+        log=log, base=base
     )
 
 
