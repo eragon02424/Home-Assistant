@@ -11,6 +11,7 @@ from aiohttp import web
 
 from device_manager import DeviceManager
 from log_manager import LogManager
+from job_manager import JobManager
 from api_routes import setup_routes
 
 logging.basicConfig(
@@ -84,6 +85,8 @@ async def main():
         log_manager=log_manager,
     )
 
+    job_manager = JobManager(esphome_dashboard_url=esphome_dashboard_url)
+
     _LOGGER.info("=" * 60)
     _LOGGER.info("MCP ESPHome starting")
     _LOGGER.info("Dashboard URL: %s", esphome_dashboard_url)
@@ -105,6 +108,11 @@ async def main():
     # each spinning up (and tearing down) its own for .local resolution.
     log_manager.set_zeroconf_instance(device_manager.get_zeroconf_instance())
 
+    # Persistent subscribe_events listener for firmware job output/status
+    # (compile + install, including auto-discovering the chained upload
+    # job for install() -- see job_manager.py docstring).
+    await job_manager.start()
+
     _LOGGER.info("Running initial device discovery...")
     await device_manager.run_initial_discovery()
     _LOGGER.info("Initial discovery complete — %d device(s) with keepalive tasks",
@@ -116,6 +124,7 @@ async def main():
     app = web.Application()
     app["device_manager"] = device_manager
     app["log_manager"] = log_manager
+    app["job_manager"] = job_manager
     app["bearer_token"] = device_manager.bearer_token
     setup_routes(app)
 
