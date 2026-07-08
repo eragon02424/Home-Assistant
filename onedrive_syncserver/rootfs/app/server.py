@@ -406,7 +406,7 @@ function buildFolderRow(folder, depth) {
 
   const expand = document.createElement('div');
   expand.className = 'folder-expand' + (folder.has_children ? '' : ' leaf');
-  expand.textContent = '\u25B6';
+  expand.textContent = String.fromCharCode(9654);
   row.appendChild(expand);
 
   const label = document.createElement('label');
@@ -420,7 +420,7 @@ function buildFolderRow(folder, depth) {
 
   const nameDiv = document.createElement('div');
   nameDiv.className = 'folder-name' + (enabled ? '' : ' disabled');
-  nameDiv.textContent = '\u{1F4C1} ' + folder.name;
+  nameDiv.textContent = String.fromCodePoint(128193) + ' ' + folder.name;
   row.appendChild(nameDiv);
 
   if (enabled) {
@@ -462,11 +462,11 @@ function buildFolderRow(folder, depth) {
       const isOpen = childrenContainer.classList.contains('open');
       if (isOpen) {
         childrenContainer.classList.remove('open');
-        expand.textContent = '\u25B6';
+        expand.textContent = String.fromCharCode(9654);
         return;
       }
       childrenContainer.classList.add('open');
-      expand.textContent = '\u25BC';
+      expand.textContent = String.fromCharCode(9660);
       if (!loaded) {
         loaded = true;
         childrenContainer.innerHTML = '<div class="folder-loading">Laedt...</div>';
