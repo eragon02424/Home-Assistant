@@ -77,6 +77,15 @@ def setup_routes(app: web.Application):
             return web.json_response({"error": str(err)}, status=502)
         return web.json_response({"job_id": job_id})
 
+    async def start_install(request):
+        name = request.match_info["device_name"]
+        try:
+            job_id = await job_manager.start_install(name)
+        except Exception as err:
+            _LOGGER.error("Install (OTA) start failed for %s: %s", name, err)
+            return web.json_response({"error": str(err)}, status=502)
+        return web.json_response({"job_id": job_id})
+
     async def get_job_status(request):
         job_id = request.match_info["job_id"]
         status = job_manager.get_status(job_id)
@@ -109,6 +118,7 @@ def setup_routes(app: web.Application):
     app.router.add_get("/devices/{device_name}/logs/range", get_logs_range)
     app.router.add_post("/devices/{device_name}/validate", validate_config)
     app.router.add_post("/devices/{device_name}/compile", start_compile)
+    app.router.add_post("/devices/{device_name}/install", start_install)
     app.router.add_get("/jobs/{job_id}/status", get_job_status)
     app.router.add_get("/jobs/{job_id}/error_summary", get_error_summary)
     app.router.add_get("/jobs/{job_id}/full_log", get_full_log)
