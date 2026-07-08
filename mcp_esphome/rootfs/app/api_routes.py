@@ -107,6 +107,13 @@ def setup_routes(app: web.Application):
             return web.json_response({"error": "job not found"}, status=404)
         return web.json_response({"log": log})
 
+    async def get_flash_log(request):
+        job_id = request.match_info["job_id"]
+        result = job_manager.get_flash_log(job_id)
+        if result is None:
+            return web.json_response({"error": "job not found"}, status=404)
+        return web.json_response(result)
+
     async def health(request):
         return web.json_response({"status": "ok", "devices": len(device_manager.devices)})
 
@@ -122,3 +129,4 @@ def setup_routes(app: web.Application):
     app.router.add_get("/jobs/{job_id}/status", get_job_status)
     app.router.add_get("/jobs/{job_id}/error_summary", get_error_summary)
     app.router.add_get("/jobs/{job_id}/full_log", get_full_log)
+    app.router.add_get("/jobs/{job_id}/flash_log", get_flash_log)
