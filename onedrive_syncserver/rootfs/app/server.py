@@ -5,8 +5,7 @@ Port 8772 = Ingress (BASE aus X-Ingress-Path Header)
 WICHTIG: Device Code Flow (/devicecode Endpoint) funktioniert NICHT fuer
 private Microsoft-Konten (MSA wie @live.com/@outlook.com/@hotmail.com) -
 Microsoft blockiert diesen Flow serverseitig fuer nicht explizit von MS
-freigeschaltete Apps. Der Fehler "Code abgelaufen" erscheint dabei SOFORT,
-unabhaengig von der Eingabegeschwindigkeit.
+freigeschaltete Apps.
 Deshalb nutzen wir stattdessen die interaktive Browser-URL-Methode
 (--auth-files des onedrive CLI-Clients), die fuer MSA-Konten funktioniert.
 
@@ -17,13 +16,18 @@ WICHTIG 3: Die Ordner-Konfiguration laedt Ordner LAZY per Graph API - nur
 die aktuell sichtbare Ebene wird geladen, Unterordner erst beim Aufklappen
 per Klick (/api/folder_children).
 
-WICHTIG 4: trigger_sync() startet sync_manager.py in einem Thread mit
-grossem Timeout (1800s) - sync_manager.py listet bei grossen OneDrive-
-Strukturen rekursiv ALLE Ordner (ein API-Call pro Ordner), das kann bei
-hunderten Ordnern mehrere Minuten dauern.
+WICHTIG 4: trigger_sync() startet sync_manager.py in einem Thread OHNE
+festes Zeit-Limit mehr (sync_manager.py ueberwacht selbst Aktivitaet ueber
+STALL_TIMEOUT_SECONDS und darf bei grossen OneDrive-Strukturen mehrere
+Stunden laufen, solange er aktiv arbeitet). Ein sehr grosszuegiger
+Notfall-Deckel (12h) verhindert nur einen echten Endlos-Zombie-Prozess.
 
-WICHTIG 5: /api/search nutzt Teilstring-Suche (nicht exakten Vergleich) -
-so findet man Dateien auch ohne die Dateiendung mit anzugeben.
+WICHTIG 5: /api/search nutzt Teilstring-Suche (nicht exakten Vergleich).
+
+WICHTIG 6: /api/progress liefert den Live-Fortschritt des laufenden Syncs
+(letzte Log-Zeile + Zeitstempel) aus sync_progress.json, das
+sync_manager.py laufend aktualisiert - die UI pollt das waehrend eines
+aktiven Syncs haeufiger als den normalen Status.
 """
 
 import json
@@ -54,6 +58,7 @@ SHARE_DIR = "/share/onedrive"
 DOWNLOAD_DIR = "/share/onedrive_downloads"
 LOG_FILE = f"{CONFIG_DIR}/sync.log"
 STATUS_FILE = f"{CONFIG_DIR}/sync_status.json"
+PROGRESS_FILE = f"{CONFIG_DIR}/sync_progress.json"
 
 CLIENT_ID = "d50ca740-c83f-4d1b-b616-12c519384f0c"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
@@ -142,6 +147,12 @@ def load_status():
             return json.load(f)
     return {"last_sync": None, "files_synced": 0, "errors": []}
 
+def load_progress():
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE) as f:
+            return json.load(f)
+    return {"active": False, "phase": "idle", "detail": "", "updated_at": None}
+
 def is_authenticated():
     return os.path.exists(f"{ONEDRIVE_CONFIG_DIR}/refresh_token")
 
@@ -219,6 +230,17 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   .status-item .label { font-size: 0.75rem; color: #6b7280; margin-bottom: 4px; }
   .status-item .value { font-size: 1rem; font-weight: 600; }
   .ok { color: #10b981; } .error-c { color: #ef4444; }
+  .progress-box { background: #111827; border: 1px solid #3b82f6; border-radius: 8px;
+                  padding: 12px; margin-top: 12px; display: none; }
+  .progress-box.show { display: block; }
+  .progress-box .spinner { display: inline-block; width: 12px; height: 12px;
+                            border: 2px solid #3b82f6; border-top-color: transparent;
+                            border-radius: 50%; animation: spin 0.8s linear infinite;
+                            margin-right: 8px; vertical-align: middle; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .progress-box .label { font-size: 0.75rem; color: #6b7280; margin-bottom: 4px; }
+  .progress-box .detail { font-size: 0.82rem; color: #e5e7eb; font-family: monospace;
+                           word-break: break-all; }
   .auth-box { background: #111827; border: 1px solid #3b82f6; border-radius: 8px; padding: 16px; }
   .auth-box p { color: #9ca3af; margin-bottom: 12px; font-size: 0.9rem; }
   .auth-url-box { background: #1f2937; border: 1px solid #374151; border-radius: 6px;
@@ -303,6 +325,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       </div>
     </div>
     {% if status.errors %}{% for err in status.errors[-3:] %}<div class="error-item">&#9888; {{ err }}</div>{% endfor %}{% endif %}
+    <div class="progress-box" id="progress-box">
+      <div class="label"><span class="spinner"></span>Aktiv - zuletzt aktualisiert: <span id="progress-time"></span></div>
+      <div class="detail" id="progress-detail"></div>
+    </div>
   </div>
 
   {% if not authenticated %}
@@ -329,7 +355,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   {% if authenticated %}
   <div class="card">
     <h2>Ordner Konfiguration</h2>
-    <p class="hint">Unterordner werden erst beim Aufklappen (&#9656;) geladen. Abgewaehlte Ordner werden beim Sync komplett uebersprungen (nicht erst geladen und wieder geloescht) - auch verschachtelt.</p>
+    <p class="hint">Unterordner werden erst beim Aufklappen (&#9656;) geladen. Abgewaehlte Ordner werden beim Sync komplett uebersprungen - auch verschachtelt.</p>
     <div class="folder-tree" id="folder-root" data-path=""></div>
   </div>
 
@@ -567,9 +593,9 @@ async function saveConfig() {
   else { showToast('Fehler beim Speichern', false); }
 }
 async function triggerSync() {
-  showToast('Sync gestartet - kann bei vielen Ordnern mehrere Minuten dauern...');
+  showToast('Sync gestartet - laeuft im Hintergrund, Fortschritt siehe oben...');
   await fetch(apiUrl('/api/sync'), {method: 'POST'});
-  setTimeout(() => location.reload(), 3000);
+  pollProgress();
 }
 async function searchFile() {
   const name = document.getElementById('search-name').value.trim();
@@ -622,14 +648,39 @@ async function downloadByPath() {
   if (res.ok) { result.textContent = 'Gespeichert: ' + d.local_path; result.className = 'dl-result ok'; }
   else { result.textContent = 'Fehler: ' + (d.error||'unbekannt'); result.className = 'dl-result err'; }
 }
-setInterval(async () => {
+
+let progressPollTimer = null;
+async function pollProgress() {
+  if (progressPollTimer) clearTimeout(progressPollTimer);
+  try {
+    const res = await fetch(apiUrl('/api/progress'), {cache: 'no-store'});
+    const p = await res.json();
+    const box = document.getElementById('progress-box');
+    if (p.active) {
+      box.classList.add('show');
+      document.getElementById('progress-time').textContent = p.updated_at || '';
+      document.getElementById('progress-detail').textContent = p.detail || '';
+      progressPollTimer = setTimeout(pollProgress, 3000);
+    } else {
+      box.classList.remove('show');
+      // Sync gerade zu Ende gegangen - Status/Ordnerliste einmalig aktualisieren
+      refreshStatus();
+    }
+  } catch(e) {
+    progressPollTimer = setTimeout(pollProgress, 5000);
+  }
+}
+async function refreshStatus() {
   try {
     const res = await fetch(apiUrl('/api/status'), {cache: 'no-store'});
     const data = await res.json();
     if (document.getElementById('last-sync')) document.getElementById('last-sync').textContent = data.last_sync || 'Noch kein Sync';
     if (document.getElementById('files-synced')) document.getElementById('files-synced').textContent = data.files_synced;
   } catch(e) {}
-}, 30000);
+}
+// Beim Laden pruefen ob gerade schon ein Sync laeuft (z.B. periodischer Timer)
+pollProgress();
+setInterval(refreshStatus, 30000);
 </script>
 </body>
 </html>'''
@@ -771,8 +822,6 @@ def search_file():
         encoded = urllib.parse.quote(filename)
         results = graph_get(token, f"/me/drive/root/search(q='{encoded}')")
         items = results.get("value", [])
-        # Teilstring-Suche statt exaktem Abgleich - so findet man Dateien
-        # auch ohne die Endung mit anzugeben.
         needle = filename.lower()
         matches = [i for i in items if needle in i.get("name", "").lower() and "folder" not in i]
         locations = []
@@ -840,13 +889,21 @@ def get_status():
     return jsonify(load_status())
 
 
+@app.route('/api/progress')
+def get_progress():
+    return jsonify(load_progress())
+
+
 @app.route('/api/sync', methods=['POST'])
 def trigger_sync():
     def run_sync():
         try:
-            subprocess.run(["python3", "/app/sync_manager.py"], timeout=1800)
+            # Kein enges Zeit-Limit mehr - sync_manager.py ueberwacht selbst
+            # Aktivitaet (STALL_TIMEOUT_SECONDS). 12h nur als absoluter
+            # Notfall-Deckel gegen echte Zombie-Prozesse.
+            subprocess.run(["python3", "/app/sync_manager.py"], timeout=43200)
         except subprocess.TimeoutExpired:
-            auth_log("Sync-Wrapper Timeout nach 1800s - Sync abgebrochen")
+            auth_log("Sync-Wrapper Notfall-Timeout nach 12h - Sync abgebrochen")
     threading.Thread(target=run_sync, daemon=True).start()
     return jsonify({"success": True})
 
