@@ -11,26 +11,29 @@ Fuehrt den eigentlichen Sync durch:
    requests.Session() fuer Connection-Pooling. Wenn sich die sync_list
    geaendert hat, wird automatisch --resync mitgegeben.
 
-2. ZWEI GETRENNTE onedrive-Durchlaeufe (SICHERHEITSKRITISCH-Architektur):
+2. Ablauf pro Sync-Lauf (SICHERHEITSKRITISCH-Architektur):
 
-   a) --download-only: laedt NUR von OneDrive runter, laedt NIEMALS
-      lokale Aenderungen hoch.
-   b) --upload-only --no-remote-delete: laedt NUR neue/geaenderte lokale
-      Dateien HOCH, aber "--no-remote-delete" verhindert explizit dass
-      lokale LOESCHUNGEN als Loeschungen auf OneDrive ankommen (die
-      Dateien bleiben online erhalten, auch wenn sie lokal weg sind).
+   a) Download-Pass (--download-only): laedt NUR von OneDrive runter,
+      laedt NIEMALS lokale Aenderungen hoch.
+   b) Lokaler Cleanup (Dateityp-/Alters-Filter, deaktivierte Ordner
+      loeschen) - NUR lokal, NACH dem Download damit frisch geladene
+      Dateien korrekt gegen die Filter geprueft werden.
+   c) Upload-Pass (--upload-only --no-remote-delete): laedt NUR neue/
+      geaenderte lokale Dateien HOCH. "--no-remote-delete" verhindert
+      explizit dass lokale LOESCHUNGEN (z.B. aus Schritt b) als
+      Loeschungen auf OneDrive ankommen.
 
    *** NIEMALS auf einen einzelnen "--sync" Durchlauf ohne diese Trennung
    zurueckwechseln, ohne ausdrueckliche Bestaetigung des Nutzers! ***
    Am 09.07.2026 gab es einen ECHTEN DATENVERLUST-VORFALL: mit normalem
    bidirektionalem "--sync" (kein --download-only/--upload-only) wurde
-   unser eigener lokaler Cleanup-Schritt (loescht lokale Kopien
-   deaktivierter Ordner) von onedrive als "Nutzer hat online geloescht"
-   interpretiert und hochgeladen - 13 Ordner wurden dadurch tatsaechlich
-   von OneDrive geloescht (nur per OneDrive-Papierkorb gerettet). Die
-   Zwei-Pass-Architektur mit --no-remote-delete auf dem Upload-Pass
-   verhindert das strukturell: Upload-Pass kann NIEMALS remote loeschen,
-   unabhaengig davon was lokal geloescht wurde.
+   unser eigener lokaler Cleanup-Schritt von onedrive als "Nutzer hat
+   online geloescht" interpretiert und hochgeladen - 13 Ordner wurden
+   dadurch tatsaechlich von OneDrive geloescht (nur per OneDrive-
+   Papierkorb gerettet). Die Drei-Schritt-Architektur mit
+   --no-remote-delete auf dem Upload-Pass verhindert das strukturell:
+   der Upload-Pass kann NIEMALS remote loeschen, unabhaengig davon was
+   lokal geloescht wurde.
 
    AKTIVITAETS-UEBERWACHUNG statt festem Zeit-Limit: Jede neue Zeile
    Ausgabe zaehlt als Lebenszeichen. Nur wenn STALL_TIMEOUT_SECONDS lang
@@ -38,11 +41,7 @@ Fuehrt den eigentlichen Sync durch:
    betrachtet und abgebrochen. Der aktuelle Fortschritt wird laufend in
    PROGRESS_FILE geschrieben.
 
-3. Filtert Dateien innerhalb synchronisierter Ordner nach Dateityp/Alter,
-   und entfernt komplette lokale Kopien deaktivierter Ordner (Altlasten).
-   Alles NUR lokal - der Upload-Pass mit --no-remote-delete sorgt dafuer
-   dass das NIE nach OneDrive hochgeladen wird.
-4. Schreibt Status in sync_status.json
+3. Schreibt Status in sync_status.json
 """
 
 import hashlib
@@ -322,9 +321,7 @@ def _run_process_with_stall_detection(cmd):
     Fuehrt einen onedrive-Befehl aus und ueberwacht AKTIVITAET statt einem
     festen Zeit-Limit: jede neue Ausgabezeile zaehlt als Lebenszeichen.
     Nur wenn STALL_TIMEOUT_SECONDS lang GAR NICHTS mehr kommt, gilt der
-    Prozess als haengen geblieben und wird abgebrochen. Ansonsten darf er
-    beliebig lange laufen (auch mehrere Stunden bei sehr grossen
-    OneDrive-Strukturen).
+    Prozess als haengen geblieben und wird abgebrochen.
     """
     log(f"[onedrive] Starte: {' '.join(cmd)}")
     write_progress("sync", f"Starte: {' '.join(cmd[-3:])}")
@@ -379,22 +376,13 @@ def _run_process_with_stall_detection(cmd):
         return False, str(e), ""
 
 
-def run_onedrive_sync(need_resync):
-    """
-    Fuehrt den Sync in ZWEI GETRENNTEN Durchlaeufen durch - siehe
-    Modul-Docstring fuer die sicherheitskritische Begruendung dieser
-    Architektur (Vorfall vom 09.07.2026).
-
-    Pass 1 (Download): --download-only - laedt nur von OneDrive runter.
-    Pass 2 (Upload): --upload-only --no-remote-delete - laedt neue/
-    geaenderte lokale Dateien hoch, aber loescht NIEMALS etwas auf
-    OneDrive, egal was lokal geloescht wurde.
-    """
+def run_download_pass(need_resync):
+    """Pass 1: --download-only - laedt nur von OneDrive runter, laedt
+    NIEMALS lokale Aenderungen hoch."""
     base_cmd = ["onedrive", "--confdir", ONEDRIVE_CONFIG_DIR, "--syncdir", SHARE_DIR, "--verbose"]
-    resync_flags = ["--resync", "--resync-auth"] if need_resync else []
-
-    # --- Pass 1: Download ---
-    download_cmd = base_cmd + ["--sync", "--download-only"] + resync_flags
+    download_cmd = base_cmd + ["--sync", "--download-only"]
+    if need_resync:
+        download_cmd += ["--resync", "--resync-auth"]
     ok, err, output = _run_process_with_stall_detection(download_cmd)
     if not ok and not need_resync and ("resync is required" in output.lower() or "sync_dir" in output.lower()):
         log("[onedrive] Download-Pass: automatischer Nachversuch mit --resync...")
@@ -402,14 +390,22 @@ def run_onedrive_sync(need_resync):
     if not ok:
         log(f"[WARN] Download-Pass fehlgeschlagen: {err}")
         return False, f"Download-Pass: {err}"
+    return True, None
 
-    # --- Pass 2: Upload (nur neue/geaenderte Dateien, NIE Loeschungen) ---
+
+def run_upload_pass():
+    """
+    Pass 2: --upload-only --no-remote-delete - laedt neue/geaenderte
+    lokale Dateien hoch, loescht NIEMALS etwas auf OneDrive, egal was
+    lokal geloescht wurde.
+    *** SICHERHEITSKRITISCH - siehe Modul-Docstring (Vorfall 09.07.2026) ***
+    """
+    base_cmd = ["onedrive", "--confdir", ONEDRIVE_CONFIG_DIR, "--syncdir", SHARE_DIR, "--verbose"]
     upload_cmd = base_cmd + ["--sync", "--upload-only", "--no-remote-delete"]
     ok, err, output = _run_process_with_stall_detection(upload_cmd)
     if not ok:
         log(f"[WARN] Upload-Pass fehlgeschlagen: {err}")
         return False, f"Upload-Pass: {err}"
-
     return True, None
 
 
@@ -433,11 +429,10 @@ def get_effective_config(folder_path, config):
 
 def apply_filters_and_cleanup(config):
     """
-    Loescht NUR lokale Kopien (NIEMALS online - der Upload-Pass laeuft
-    mit --no-remote-delete, diese Loeschungen werden garantiert nicht
-    hochgeladen):
-    - Ordner die per Konfiguration DEAKTIVIERT sind: KOMPLETT loeschen
-      (Altlasten von frueheren, ungefilterten Sync-Laeufen).
+    Loescht NUR lokale Kopien (NIEMALS online - der nachfolgende Upload-
+    Pass laeuft mit --no-remote-delete, diese Loeschungen werden
+    garantiert nicht hochgeladen):
+    - Ordner die per Konfiguration DEAKTIVIERT sind: KOMPLETT loeschen.
     - Dateien die nicht zum Filter passen oder zu alt sind: einzeln
       loeschen.
     """
@@ -519,18 +514,23 @@ def main():
             log(f"[WARN] Konnte sync_list nicht aktualisieren: {e}")
             errors.append(f"{datetime.now().strftime('%H:%M')} sync_list Fehler: {e}")
 
-        # WICHTIG: Cleanup (lokale Loeschungen) laeuft VOR dem Sync, damit
-        # der nachfolgende Upload-Pass (--no-remote-delete) gar nicht erst
-        # versucht irgendetwas als "geloescht" zu registrieren - die
-        # Dateien sind zu dem Zeitpunkt schon weg bzw. gefiltert, und
-        # --no-remote-delete verhindert ohnehin jede Remote-Loeschung.
+        # 1) Download-Pass: OneDrive -> lokal
+        ok, err = run_download_pass(need_resync)
+        if not ok:
+            errors.append(f"{datetime.now().strftime('%H:%M')} {err}")
+
+        # 2) Lokaler Cleanup - NACH dem Download (frische Dateien korrekt
+        #    pruefen), VOR dem Upload (--no-remote-delete verhindert
+        #    ohnehin jede Remote-Loeschung, aber so ist die Reihenfolge
+        #    auch inhaltlich stimmig).
         write_progress("cleanup", "Filtere und raeume lokale Dateien auf...")
         files_processed, files_deleted = apply_filters_and_cleanup(config)
         log(f"[SYNC] Processed {files_processed} files, deleted {files_deleted} locally")
 
-        ok, err = run_onedrive_sync(need_resync)
+        # 3) Upload-Pass: lokal -> OneDrive, NIE Remote-Loeschungen
+        ok, err = run_upload_pass()
         if not ok:
-            errors.append(f"{datetime.now().strftime('%H:%M')} Sync error: {err}")
+            errors.append(f"{datetime.now().strftime('%H:%M')} {err}")
 
         status["last_sync"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
         status["files_synced"] = files_processed - files_deleted
