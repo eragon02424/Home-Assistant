@@ -25,9 +25,16 @@ Notfall-Deckel (12h) verhindert nur einen echten Endlos-Zombie-Prozess.
 WICHTIG 5: /api/search nutzt Teilstring-Suche (nicht exakten Vergleich).
 
 WICHTIG 6: /api/progress liefert den Live-Fortschritt des laufenden Syncs
-(letzte Log-Zeile + Zeitstempel) aus sync_progress.json, das
-sync_manager.py laufend aktualisiert - die UI pollt das waehrend eines
-aktiven Syncs haeufiger als den normalen Status.
+(letzte Log-Zeile + Zeitstempel) aus sync_progress.json.
+
+WICHTIG 7 (Download-Fix): graph_download() nutzt jetzt die von Microsoft
+Graph mitgelieferte vorautorisierte "@microsoft.graph.downloadUrl" statt
+direkt den /content Endpunkt mit unserem Access Token anzusprechen. Bei
+frisch hochgeladenen Dateien (Item-IDs mit "!s"-Praefix statt normalem
+"!zahl"-Format) lieferte der direkte /content Aufruf einen 401 Fehler,
+obwohl der Access Token gueltig war und die Metadaten-Abfrage klappte.
+Die downloadUrl ist der von Microsoft empfohlene, robustere Weg und
+funktioniert fuer alle Item-ID-Formate zuverlaessig.
 """
 
 import json
@@ -120,16 +127,21 @@ def graph_get(access_token, path):
         raise Exception(f"Graph {e.code}: {body.get('error', {}).get('message', str(e))}")
 
 def graph_download(access_token, item_id, dest_path):
-    url = f"{GRAPH_BASE}/me/drive/items/{item_id}/content"
-    req = urllib.request.Request(url)
-    req.add_header("Authorization", f"Bearer {access_token}")
+    """
+    Laedt eine Datei ueber die vorautorisierte '@microsoft.graph.downloadUrl'
+    herunter (nicht direkt ueber /content mit unserem Access Token) - siehe
+    WICHTIG 7 im Modul-Docstring fuer die Begruendung.
+    """
+    meta = graph_get(access_token, f"/me/drive/items/{item_id}?$select=id,name,@microsoft.graph.downloadUrl")
+    download_url = meta.get("@microsoft.graph.downloadUrl")
+    if not download_url:
+        raise Exception("Keine downloadUrl von Microsoft Graph erhalten (Datei evtl. noch nicht vollstaendig indexiert)")
     try:
-        resp = urllib.request.urlopen(req, timeout=60)
+        resp = urllib.request.urlopen(download_url, timeout=60)
         with open(dest_path, "wb") as f:
             f.write(resp.read())
     except urllib.error.HTTPError as e:
-        body = json.loads(e.read())
-        raise Exception(f"Download {e.code}: {body.get('error', {}).get('message', str(e))}")
+        raise Exception(f"Download {e.code}: {e.reason}")
 
 def load_sync_config():
     if os.path.exists(SYNC_CONFIG):
@@ -663,7 +675,6 @@ async function pollProgress() {
       progressPollTimer = setTimeout(pollProgress, 3000);
     } else {
       box.classList.remove('show');
-      // Sync gerade zu Ende gegangen - Status/Ordnerliste einmalig aktualisieren
       refreshStatus();
     }
   } catch(e) {
@@ -678,7 +689,6 @@ async function refreshStatus() {
     if (document.getElementById('files-synced')) document.getElementById('files-synced').textContent = data.files_synced;
   } catch(e) {}
 }
-// Beim Laden pruefen ob gerade schon ein Sync laeuft (z.B. periodischer Timer)
 pollProgress();
 setInterval(refreshStatus, 30000);
 </script>
@@ -898,9 +908,6 @@ def get_progress():
 def trigger_sync():
     def run_sync():
         try:
-            # Kein enges Zeit-Limit mehr - sync_manager.py ueberwacht selbst
-            # Aktivitaet (STALL_TIMEOUT_SECONDS). 12h nur als absoluter
-            # Notfall-Deckel gegen echte Zombie-Prozesse.
             subprocess.run(["python3", "/app/sync_manager.py"], timeout=43200)
         except subprocess.TimeoutExpired:
             auth_log("Sync-Wrapper Notfall-Timeout nach 12h - Sync abgebrochen")
