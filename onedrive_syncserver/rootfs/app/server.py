@@ -35,6 +35,13 @@ hochgeladenen Dateien (Item-IDs mit "!s"-Praefix statt normalem
 WICHTIG: Die Metadaten-Abfrage fuer die downloadUrl darf KEIN "$select"
 verwenden - damit fehlt die downloadUrl bei manchen Item-ID-Formaten in
 der Antwort, obwohl sie bei einer unbeschraenkten Abfrage vorhanden ist.
+
+WICHTIG 8: /api/photo ist ein Bequemlichkeits-Endpunkt mit FESTEM Pfad
+("Bilder/Eigene Aufnahmen") speziell fuer Handy-Fotos/Screenshots - man
+uebergibt NUR den Dateinamen (den man z.B. vom Handy-Dateinamen kennt)
+und bekommt die Datei direkt heruntergeladen, OHNE dass eine Microsoft
+Suchindex-Abfrage noetig ist (die bei frischen Dateien stunden dauern
+kann, siehe /api/search).
 """
 
 import json
@@ -66,6 +73,9 @@ DOWNLOAD_DIR = "/share/onedrive_downloads"
 LOG_FILE = f"{CONFIG_DIR}/sync.log"
 STATUS_FILE = f"{CONFIG_DIR}/sync_status.json"
 PROGRESS_FILE = f"{CONFIG_DIR}/sync_progress.json"
+
+# Fester Pfad fuer den /api/photo Bequemlichkeits-Endpunkt (Handy-Fotos).
+PHOTO_FOLDER_PATH = "Bilder/Eigene Aufnahmen"
 
 CLIENT_ID = "d50ca740-c83f-4d1b-b616-12c519384f0c"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
@@ -147,6 +157,16 @@ def graph_download(access_token, item_id, dest_path):
             f.write(resp.read())
     except urllib.error.HTTPError as e:
         raise Exception(f"Download {e.code}: {e.reason}")
+
+def download_file_by_path(onedrive_path, filename):
+    """Gemeinsame Kernlogik: Item per Pfad+Name auflösen und herunterladen."""
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    token = get_access_token()
+    encoded_path = urllib.parse.quote(f"{onedrive_path}/{filename}")
+    item = graph_get(token, f"/me/drive/root:/{encoded_path}")
+    dest = os.path.join(DOWNLOAD_DIR, filename)
+    graph_download(token, item["id"], dest)
+    return dest
 
 def load_sync_config():
     if os.path.exists(SYNC_CONFIG):
@@ -876,12 +896,27 @@ def download_by_path():
     if not onedrive_path or not filename:
         return jsonify({"success": False, "error": "path und filename benoetigt"}), 400
     try:
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        token = get_access_token()
-        encoded_path = urllib.parse.quote(f"{onedrive_path}/{filename}")
-        item = graph_get(token, f"/me/drive/root:/{encoded_path}")
-        dest = os.path.join(DOWNLOAD_DIR, filename)
-        graph_download(token, item["id"], dest)
+        dest = download_file_by_path(onedrive_path, filename)
+        return jsonify({"success": True, "local_path": dest})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/photo', methods=['POST'])
+def download_photo():
+    """
+    Bequemlichkeits-Endpunkt mit FESTEM Pfad (PHOTO_FOLDER_PATH =
+    'Bilder/Eigene Aufnahmen'). Man uebergibt NUR den Dateinamen (z.B.
+    vom Handy bekannt) und bekommt die Datei direkt heruntergeladen -
+    ohne Suchindex-Abfrage, daher auch fuer brandneue Fotos sofort
+    nutzbar.
+    """
+    data = request.json
+    filename = data.get('filename', '').strip()
+    if not filename:
+        return jsonify({"success": False, "error": "filename benoetigt"}), 400
+    try:
+        dest = download_file_by_path(PHOTO_FOLDER_PATH, filename)
         return jsonify({"success": True, "local_path": dest})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
