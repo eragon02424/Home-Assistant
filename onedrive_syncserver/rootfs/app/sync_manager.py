@@ -10,35 +10,38 @@ Fuehrt den eigentlichen Sync durch:
    deaktivierte Aeste ohne Unterordner-Overrides hinab. Nutzt
    requests.Session() fuer Connection-Pooling. Wenn sich die sync_list
    geaendert hat, wird automatisch --resync mitgegeben.
-2. onedrive --sync --download-only --syncdir /share/onedrive.
 
-   *** SICHERHEITSKRITISCH - NIEMALS AENDERN OHNE AUSDRUECKLICHE
-   BESTAETIGUNG DES NUTZERS ***
-   Zwischenzeitlich lief dieses Add-on OHNE --download-only (echter
-   bidirektionaler Sync). Das fuehrte zu einem ECHTEN DATENVERLUST-
-   VORFALL am 09.07.2026: unser eigener lokaler Cleanup-Schritt (Schritt
-   3, loescht lokale Kopien deaktivierter Ordner) wurde von onedrive als
-   "Nutzer hat das online geloescht" interpretiert und die Loeschung
-   NACH OneDrive hochgeladen - 13 Scan-Ordner wurden dadurch tatsaechlich
-   von OneDrive selbst geloescht (nur durch den OneDrive-Papierkorb
-   rettbar gewesen). --download-only verhindert das strukturell: es
-   werden NIEMALS lokale Aenderungen (auch keine Loeschungen) nach
-   OneDrive hochgeladen, unabhaengig davon was unser eigener Cleanup-
-   Code lokal tut. Echter Upload-Support (neue lokale Dateien zu OneDrive
-   hochladen) ist ein separates, bewusst zu entwerfendes Feature fuer
-   die Zukunft - NICHT einfach durch Entfernen von --download-only
-   nachruestbar, da genau das den Vorfall verursacht hat.
+2. ZWEI GETRENNTE onedrive-Durchlaeufe (SICHERHEITSKRITISCH-Architektur):
+
+   a) --download-only: laedt NUR von OneDrive runter, laedt NIEMALS
+      lokale Aenderungen hoch.
+   b) --upload-only --no-remote-delete: laedt NUR neue/geaenderte lokale
+      Dateien HOCH, aber "--no-remote-delete" verhindert explizit dass
+      lokale LOESCHUNGEN als Loeschungen auf OneDrive ankommen (die
+      Dateien bleiben online erhalten, auch wenn sie lokal weg sind).
+
+   *** NIEMALS auf einen einzelnen "--sync" Durchlauf ohne diese Trennung
+   zurueckwechseln, ohne ausdrueckliche Bestaetigung des Nutzers! ***
+   Am 09.07.2026 gab es einen ECHTEN DATENVERLUST-VORFALL: mit normalem
+   bidirektionalem "--sync" (kein --download-only/--upload-only) wurde
+   unser eigener lokaler Cleanup-Schritt (loescht lokale Kopien
+   deaktivierter Ordner) von onedrive als "Nutzer hat online geloescht"
+   interpretiert und hochgeladen - 13 Ordner wurden dadurch tatsaechlich
+   von OneDrive geloescht (nur per OneDrive-Papierkorb gerettet). Die
+   Zwei-Pass-Architektur mit --no-remote-delete auf dem Upload-Pass
+   verhindert das strukturell: Upload-Pass kann NIEMALS remote loeschen,
+   unabhaengig davon was lokal geloescht wurde.
 
    AKTIVITAETS-UEBERWACHUNG statt festem Zeit-Limit: Jede neue Zeile
    Ausgabe zaehlt als Lebenszeichen. Nur wenn STALL_TIMEOUT_SECONDS lang
    GAR NICHTS mehr kommt, wird der Prozess als haengen geblieben
-   betrachtet und abgebrochen. Ansonsten darf der Sync beliebig lange
-   laufen (auch mehrere Stunden bei sehr grossen Strukturen).
-   Der aktuelle Fortschritt wird laufend in PROGRESS_FILE geschrieben.
+   betrachtet und abgebrochen. Der aktuelle Fortschritt wird laufend in
+   PROGRESS_FILE geschrieben.
+
 3. Filtert Dateien innerhalb synchronisierter Ordner nach Dateityp/Alter,
    und entfernt komplette lokale Kopien deaktivierter Ordner (Altlasten).
-   Alles NUR lokal - onedrive laeuft im --download-only Modus und laedt
-   diese Loeschungen NIE nach OneDrive hoch.
+   Alles NUR lokal - der Upload-Pass mit --no-remote-delete sorgt dafuer
+   dass das NIE nach OneDrive hochgeladen wird.
 4. Schreibt Status in sync_status.json
 """
 
@@ -314,94 +317,99 @@ def write_sync_list(config, all_folders):
     return changed
 
 
+def _run_process_with_stall_detection(cmd):
+    """
+    Fuehrt einen onedrive-Befehl aus und ueberwacht AKTIVITAET statt einem
+    festen Zeit-Limit: jede neue Ausgabezeile zaehlt als Lebenszeichen.
+    Nur wenn STALL_TIMEOUT_SECONDS lang GAR NICHTS mehr kommt, gilt der
+    Prozess als haengen geblieben und wird abgebrochen. Ansonsten darf er
+    beliebig lange laufen (auch mehrere Stunden bei sehr grossen
+    OneDrive-Strukturen).
+    """
+    log(f"[onedrive] Starte: {' '.join(cmd)}")
+    write_progress("sync", f"Starte: {' '.join(cmd[-3:])}")
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1
+        )
+        output_lines = []
+        last_activity = time.time()
+
+        while True:
+            if proc.poll() is not None:
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        log(line)
+                        output_lines.append(line)
+                        write_progress("sync", line)
+                break
+
+            ready, _, _ = select.select([proc.stdout], [], [], 5.0)
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    line_s = line.rstrip()
+                    log(line_s)
+                    output_lines.append(line_s)
+                    write_progress("sync", line_s)
+                    last_activity = time.time()
+            else:
+                stalled_for = time.time() - last_activity
+                if stalled_for > STALL_TIMEOUT_SECONDS:
+                    log(f"[WARN] Keine Aktivitaet seit {stalled_for:.0f}s - breche ab (echter Haenger)")
+                    proc.kill()
+                    proc.wait(timeout=10)
+                    return False, f"Stalled - {STALL_TIMEOUT_SECONDS}s keine Aktivitaet", "\n".join(output_lines)
+
+        proc.wait()
+        full_output = "\n".join(output_lines)
+        if proc.returncode != 0:
+            err_msg = "\n".join(output_lines[-30:]).strip() or f"Exit-Code {proc.returncode} ohne Ausgabe"
+            return False, err_msg, full_output
+        return True, None, full_output
+    except Exception as e:
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return False, str(e), ""
+
+
 def run_onedrive_sync(need_resync):
     """
-    Fuehrt den eigentlichen onedrive Sync durch.
+    Fuehrt den Sync in ZWEI GETRENNTEN Durchlaeufen durch - siehe
+    Modul-Docstring fuer die sicherheitskritische Begruendung dieser
+    Architektur (Vorfall vom 09.07.2026).
 
-    *** --download-only ist SICHERHEITSKRITISCH, siehe Modul-Docstring. ***
-    Laedt NUR von OneDrive runter. Lokale Aenderungen (inkl. Loeschungen
-    durch unseren eigenen Cleanup-Schritt) werden NIEMALS nach OneDrive
-    hochgeladen.
-
-    AKTIVITAETS-UEBERWACHUNG statt festem Zeit-Limit: Jede neue Zeile
-    Ausgabe zaehlt als Lebenszeichen. Nur wenn STALL_TIMEOUT_SECONDS lang
-    GAR NICHTS mehr kommt, wird der Prozess als haengen geblieben
-    betrachtet und abgebrochen.
+    Pass 1 (Download): --download-only - laedt nur von OneDrive runter.
+    Pass 2 (Upload): --upload-only --no-remote-delete - laedt neue/
+    geaenderte lokale Dateien hoch, aber loescht NIEMALS etwas auf
+    OneDrive, egal was lokal geloescht wurde.
     """
-    def build_cmd(with_resync):
-        cmd = [
-            "onedrive",
-            "--confdir", ONEDRIVE_CONFIG_DIR,
-            "--syncdir", SHARE_DIR,
-            "--sync",
-            "--download-only",
-            "--verbose"
-        ]
-        if with_resync:
-            cmd += ["--resync", "--resync-auth"]
-        return cmd
+    base_cmd = ["onedrive", "--confdir", ONEDRIVE_CONFIG_DIR, "--syncdir", SHARE_DIR, "--verbose"]
+    resync_flags = ["--resync", "--resync-auth"] if need_resync else []
 
-    def run_once(with_resync):
-        cmd = build_cmd(with_resync)
-        log(f"[onedrive] Starte: {' '.join(cmd)}")
-        write_progress("sync", "onedrive Prozess gestartet...")
-        proc = None
-        try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1
-            )
-            output_lines = []
-            last_activity = time.time()
-
-            while True:
-                if proc.poll() is not None:
-                    for line in proc.stdout:
-                        line = line.rstrip()
-                        if line:
-                            log(line)
-                            output_lines.append(line)
-                            write_progress("sync", line)
-                    break
-
-                ready, _, _ = select.select([proc.stdout], [], [], 5.0)
-                if ready:
-                    line = proc.stdout.readline()
-                    if line:
-                        line_s = line.rstrip()
-                        log(line_s)
-                        output_lines.append(line_s)
-                        write_progress("sync", line_s)
-                        last_activity = time.time()
-                else:
-                    stalled_for = time.time() - last_activity
-                    if stalled_for > STALL_TIMEOUT_SECONDS:
-                        log(f"[WARN] Keine Aktivitaet seit {stalled_for:.0f}s - breche ab (echter Haenger)")
-                        proc.kill()
-                        proc.wait(timeout=10)
-                        return False, f"Stalled - {STALL_TIMEOUT_SECONDS}s keine Aktivitaet", "\n".join(output_lines)
-
-            proc.wait()
-            full_output = "\n".join(output_lines)
-            if proc.returncode != 0:
-                err_msg = "\n".join(output_lines[-30:]).strip() or f"Exit-Code {proc.returncode} ohne Ausgabe"
-                return False, err_msg, full_output
-            return True, None, full_output
-        except Exception as e:
-            if proc:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-            return False, str(e), ""
-
-    ok, err, output = run_once(need_resync)
+    # --- Pass 1: Download ---
+    download_cmd = base_cmd + ["--sync", "--download-only"] + resync_flags
+    ok, err, output = _run_process_with_stall_detection(download_cmd)
     if not ok and not need_resync and ("resync is required" in output.lower() or "sync_dir" in output.lower()):
-        log("[onedrive] Automatischer Nachversuch mit --resync (onedrive verlangte es zur Laufzeit)...")
-        ok, err, output = run_once(True)
+        log("[onedrive] Download-Pass: automatischer Nachversuch mit --resync...")
+        ok, err, output = _run_process_with_stall_detection(download_cmd + ["--resync", "--resync-auth"])
     if not ok:
-        log(f"[WARN] onedrive Sync fehlgeschlagen: {err}")
-        return False, err
+        log(f"[WARN] Download-Pass fehlgeschlagen: {err}")
+        return False, f"Download-Pass: {err}"
+
+    # --- Pass 2: Upload (nur neue/geaenderte Dateien, NIE Loeschungen) ---
+    upload_cmd = base_cmd + ["--sync", "--upload-only", "--no-remote-delete"]
+    ok, err, output = _run_process_with_stall_detection(upload_cmd)
+    if not ok:
+        log(f"[WARN] Upload-Pass fehlgeschlagen: {err}")
+        return False, f"Upload-Pass: {err}"
+
     return True, None
 
 
@@ -425,8 +433,9 @@ def get_effective_config(folder_path, config):
 
 def apply_filters_and_cleanup(config):
     """
-    Loescht NUR lokale Kopien (NIEMALS online - onedrive laeuft im
-    --download-only Modus, die Loeschungen hier werden nicht hochgeladen):
+    Loescht NUR lokale Kopien (NIEMALS online - der Upload-Pass laeuft
+    mit --no-remote-delete, diese Loeschungen werden garantiert nicht
+    hochgeladen):
     - Ordner die per Konfiguration DEAKTIVIERT sind: KOMPLETT loeschen
       (Altlasten von frueheren, ungefilterten Sync-Laeufen).
     - Dateien die nicht zum Filter passen oder zu alt sind: einzeln
@@ -510,13 +519,18 @@ def main():
             log(f"[WARN] Konnte sync_list nicht aktualisieren: {e}")
             errors.append(f"{datetime.now().strftime('%H:%M')} sync_list Fehler: {e}")
 
-        ok, err = run_onedrive_sync(need_resync)
-        if not ok:
-            errors.append(f"{datetime.now().strftime('%H:%M')} Sync error: {err}")
-
+        # WICHTIG: Cleanup (lokale Loeschungen) laeuft VOR dem Sync, damit
+        # der nachfolgende Upload-Pass (--no-remote-delete) gar nicht erst
+        # versucht irgendetwas als "geloescht" zu registrieren - die
+        # Dateien sind zu dem Zeitpunkt schon weg bzw. gefiltert, und
+        # --no-remote-delete verhindert ohnehin jede Remote-Loeschung.
         write_progress("cleanup", "Filtere und raeume lokale Dateien auf...")
         files_processed, files_deleted = apply_filters_and_cleanup(config)
         log(f"[SYNC] Processed {files_processed} files, deleted {files_deleted} locally")
+
+        ok, err = run_onedrive_sync(need_resync)
+        if not ok:
+            errors.append(f"{datetime.now().strftime('%H:%M')} Sync error: {err}")
 
         status["last_sync"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
         status["files_synced"] = files_processed - files_deleted
