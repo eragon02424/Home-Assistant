@@ -14,6 +14,19 @@ already-constructed manager instances, since FastMCP tools are plain
 module-level functions and have no natural way to receive per-request
 dependencies otherwise.
 
+DNS-rebinding protection (transport_security): the MCP SDK rejects any
+request whose Host header isn't on an allowlist by default, returning
+421 Misdirected Request -- confirmed by direct testing (a real MCP
+client got 421 connecting via the Supervisor gateway IP,
+172.30.32.1, since that's neither "localhost" nor 127.0.0.1). This
+addon is only reachable on the internal HA/Supervisor network in the
+first place (host_network: true, no public exposure), and real auth is
+already enforced by our own Bearer-token check below, so disabling
+this specific protection here is safe -- it isn't a substitute for
+auth, it's a same-origin check that doesn't apply to our deployment
+shape (matches the SDK's own documented guidance: disable it when
+security is "managed at a different layer of your infrastructure").
+
 Auth: Bearer token, same one as the REST API, checked via a small ASGI
 middleware wrapped around the FastMCP Streamable HTTP app (see
 get_asgi_app()).
@@ -22,10 +35,14 @@ import logging
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 _LOGGER = logging.getLogger("mcp_esphome.mcp_tools")
 
-mcp = FastMCP("ESPHome MCP Server")
+mcp = FastMCP(
+    "ESPHome MCP Server",
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 _device_manager = None
 _log_manager = None
