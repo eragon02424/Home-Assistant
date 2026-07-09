@@ -20,9 +20,10 @@ per Klick (/api/folder_children).
 WICHTIG 4: trigger_sync() startet sync_manager.py in einem Thread mit
 grossem Timeout (1800s) - sync_manager.py listet bei grossen OneDrive-
 Strukturen rekursiv ALLE Ordner (ein API-Call pro Ordner), das kann bei
-hunderten Ordnern mehrere Minuten dauern. Der aeussere Timeout hier MUSS
-grosszuegiger sein als jeder innere Timeout in sync_manager.py, sonst wird
-der Prozess mitten in der Ordnerermittlung abgewuergt.
+hunderten Ordnern mehrere Minuten dauern.
+
+WICHTIG 5: /api/search nutzt Teilstring-Suche (nicht exakten Vergleich) -
+so findet man Dateien auch ohne die Dateiendung mit anzugeben.
 """
 
 import json
@@ -770,9 +771,12 @@ def search_file():
         encoded = urllib.parse.quote(filename)
         results = graph_get(token, f"/me/drive/root/search(q='{encoded}')")
         items = results.get("value", [])
-        exact = [i for i in items if i.get("name", "").lower() == filename.lower() and "folder" not in i]
+        # Teilstring-Suche statt exaktem Abgleich - so findet man Dateien
+        # auch ohne die Endung mit anzugeben.
+        needle = filename.lower()
+        matches = [i for i in items if needle in i.get("name", "").lower() and "folder" not in i]
         locations = []
-        for item in exact:
+        for item in matches:
             parent = item.get("parentReference", {})
             parent_path = parent.get("path", "")
             clean_path = parent_path.split("root:", 1)[1].strip("/") if "root:" in parent_path else parent_path
@@ -840,10 +844,6 @@ def get_status():
 def trigger_sync():
     def run_sync():
         try:
-            # Grosszuegiger Timeout - MUSS ueber jedem inneren Timeout in
-            # sync_manager.py liegen, sonst wird bei grossen OneDrive-
-            # Strukturen (viele Ordner = viele API-Calls) mitten in der
-            # Ordnerermittlung abgewuergt.
             subprocess.run(["python3", "/app/sync_manager.py"], timeout=1800)
         except subprocess.TimeoutExpired:
             auth_log("Sync-Wrapper Timeout nach 1800s - Sync abgebrochen")
