@@ -11,6 +11,12 @@ Fuehrt den eigentlichen Sync durch:
    WICHTIG (v2.5.x): "Exclusions come first. Inclusions follow." - die
    Reihenfolge in der Datei ist entscheidend, sonst werden Ausschluesse
    ignoriert.
+   WICHTIG 2: Fuer jeden eingeschlossenen Ordner werden ZWEI Zeilen
+   geschrieben - der reine Ordnername (damit der Ordner-EINTRAG selbst
+   erstellt wird) UND "Ordnername/*" (damit der INHALT mit uebernommen
+   wird). Nur die Wildcard-Zeile allein reicht nicht - der Ordner selbst
+   wurde sonst komplett uebersprungen ("Skipping path - excluded by
+   sync_list config").
    Steigt NICHT in deaktivierte Aeste ohne Unterordner-Overrides hinab
    (spart API-Calls). Nutzt requests.Session() fuer Connection-Pooling.
    Wenn sich die sync_list geaendert hat, wird automatisch --resync
@@ -204,8 +210,11 @@ def write_sync_list(config, all_folders):
     hat (per Hash-Vergleich) - das entscheidet ob ein --resync noetig ist.
 
     WICHTIG (v2.5.x Dokumentation): "Exclusions come first. Inclusions
-    follow." Die Reihenfolge in der Datei ist entscheidend - Ausschluesse
-    MUESSEN vor Einschluessen stehen, sonst werden sie ignoriert.
+    follow." Die Reihenfolge in der Datei ist entscheidend.
+    WICHTIG 2: Pro eingeschlossenem Ordner werden ZWEI Zeilen geschrieben:
+    der reine Ordnername (erstellt den Ordner-EINTRAG selbst) und
+    "Ordnername/*" (uebernimmt den Inhalt). Nur die Wildcard-Zeile allein
+    fuehrt dazu dass der Ordner selbst uebersprungen wird.
     """
     changed = False
 
@@ -223,14 +232,15 @@ def write_sync_list(config, all_folders):
         else:
             parent_enabled = resolve_enabled("/".join(parts[:-1]), config)
         if cur_enabled and not parent_enabled:
+            includes.append(path)
             includes.append(f"{path}/*")
         elif not cur_enabled and parent_enabled:
             excludes.append(f"!{path}/*")
 
-    if not excludes and len(includes) == len(top_level_folders):
+    if not excludes and len(includes) == len(top_level_folders) * 2:
         new_content = ""
     else:
-        # WICHTIG: Excludes zuerst, dann Includes - siehe Docstring oben.
+        # WICHTIG: Excludes zuerst, dann Includes.
         new_content = "\n".join(excludes + includes) + "\n"
 
     new_hash = hashlib.sha256(new_content.encode()).hexdigest()
@@ -251,7 +261,7 @@ def write_sync_list(config, all_folders):
     else:
         with open(SYNC_LIST_FILE, "w") as f:
             f.write(new_content)
-        log(f"[sync_list] {len(excludes)} Ausschluss-, {len(includes)} Einschluss-Regeln geschrieben (Excludes zuerst)")
+        log(f"[sync_list] {len(excludes)} Ausschluss-, {len(includes)} Einschluss-Zeilen geschrieben (Excludes zuerst)")
 
     if changed:
         log("[sync_list] Aenderung erkannt - dieser Sync laeuft mit --resync")
