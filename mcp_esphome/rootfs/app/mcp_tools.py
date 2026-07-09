@@ -6,8 +6,8 @@ connector, not just called via manual HTTP requests.
 Uses the official Python MCP SDK's FastMCP (mcp.server.fastmcp),
 transport="streamable-http". Every tool here is a thin wrapper around
 the SAME device_manager / log_manager / job_manager / file_manager /
-serial_flash functions the REST API uses -- no logic is duplicated,
-this is purely a second interface onto the same backend.
+serial_flash / serial_info functions the REST API uses -- no logic is
+duplicated, this is purely a second interface onto the same backend.
 
 init() must be called once at startup (from server.py) to hand in the
 already-constructed manager instances, since FastMCP tools are plain
@@ -214,6 +214,37 @@ async def flash_serial(device_name: str, port: str) -> dict:
         return await serial_flash.flash_factory_bin(bin_path, port)
     except FileNotFoundError as err:
         return {"error": str(err)}
+
+
+# ── Serial device discovery / chip info (read-only) ─────────────
+
+@mcp.tool()
+def list_serial_ports() -> list[dict]:
+    """Lists serial devices currently connected to the Home Assistant
+    host (port path, description, USB VID/PID) -- includes non-ESP
+    devices too (e.g. Zigbee dongles), so you can tell them apart before
+    picking a port for get_serial_chip_info() or flash_serial().
+    """
+    import serial_info
+    return serial_info.list_serial_ports()
+
+
+@mcp.tool()
+async def get_serial_chip_info(port: str) -> dict:
+    """Queries a USB-connected ESP's technical details directly via
+    esptool: chip type/revision, feature list, embedded flash size,
+    embedded PSRAM size (None if the chip has none), crystal frequency,
+    USB mode, and MAC address. Read-only (never writes flash).
+
+    WARNING: esptool's own chip-detection handshake ends by resetting
+    the target. On ESP32-S2/S3 native-USB boards (no external
+    USB-serial chip) this can knock the device out of flashing mode for
+    an unpredictable time (confirmed: minutes to hours in testing) --
+    only call this when you actually need the chip info, not as a
+    routine check before flash_serial().
+    """
+    import serial_info
+    return await serial_info.get_chip_info(port)
 
 
 # ── File access (device YAMLs, templates, custom components) ────
