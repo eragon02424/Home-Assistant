@@ -459,6 +459,56 @@ def _health_check(target_url: str) -> bool:
         return False
 
 
+def _identify_server(target_url: str, token: str = "") -> str | None:
+    """Speak a real MCP 'initialize' handshake to the target and return
+    'name version' from its serverInfo, or None if it doesn't answer like
+    an MCP server (e.g. a plain REST API listening on the same port)."""
+    payload = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "mcp-proxy", "version": "3.3.0"},
+        },
+    }).encode("utf-8")
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    req = urllib.request.Request(target_url, data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return None
+
+    # Some MCP servers (streamable-http) wrap the JSON in an SSE frame
+    # ("event: message\ndata: {...}"), so pull out the data line.
+    json_line = body
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            json_line = line[len("data:"):].strip()
+
+    try:
+        data = json.loads(json_line)
+    except json.JSONDecodeError:
+        return None
+
+    server_info = (data.get("result") or {}).get("serverInfo") or {}
+    name = server_info.get("name")
+    version = server_info.get("version")
+    if not name:
+        return None
+    return f"{name} {version}" if version else name
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Addon auto-discovery via Supervisor API
 # ─────────────────────────────────────────────────────────────────────────────
@@ -613,7 +663,11 @@ def main() -> int:
         if not _health_check(url):
             log_error(f"Slot {slot}: Cannot reach MCP Server at {url}. Continuing anyway.")
         else:
-            log_info(f"Slot {slot}: MCP Server is reachable")
+            identity = _identify_server(url, token)
+            if identity:
+                log_info(f"Slot {slot}: MCP Server is reachable ({identity})")
+            else:
+                log_info(f"Slot {slot}: MCP Server is reachable (port open, but no valid MCP handshake - is this really an MCP endpoint?)")
 
         webhook_id = _get_or_create_webhook_id_for_slot(data_dir, slot)
         client_id, client_secret = _resolve_oauth_creds_for_slot(data_dir, slot)
@@ -720,7 +774,9 @@ def main() -> int:
     for s in proxy_servers:
         webhook_path = f"/api/webhook/{s['webhook_id']}"
         remote_url_full = f"{resolved_remote}{webhook_path}" if resolved_remote else f"https://<your-external-url>{webhook_path}"
-        log_info(f"  Slot {s['slot']}: {s['url']}")
+        identity = _identify_server(s["url"], s["token"])
+        identity_suffix = f"  [{identity}]" if identity else "  [no MCP handshake - check target]"
+        log_info(f"  Slot {s['slot']}: {s['url']}{identity_suffix}")
         log_info(f"    Remote URL:          {remote_url_full}")
         log_info(f"    OAuth Client ID:     {s['client_id']}")
         log_info(f"    OAuth Client Secret: {s['client_secret']}")
@@ -743,7 +799,9 @@ def main() -> int:
             slot = s["slot"]
             if _health_check(s["url"]):
                 if consecutive_failures[slot] > 0:
-                    log_info(f"Slot {slot}: MCP Server reachable again (was down for {consecutive_failures[slot]} checks)")
+                    identity = _identify_server(s["url"], s["token"])
+                    suffix = f" ({identity})" if identity else " (port open, but no valid MCP handshake)"
+                    log_info(f"Slot {slot}: MCP Server reachable again (was down for {consecutive_failures[slot]} checks){suffix}")
                 consecutive_failures[slot] = 0
             else:
                 consecutive_failures[slot] += 1

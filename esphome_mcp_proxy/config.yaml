@@ -1,22 +1,20 @@
 name: MCP Proxy
-version: "3.2.5"
+version: "3.3.0"
 slug: mcp_proxy_esphome
 description: Proxies MCP requests to up to 10 MCP Server addons via OAuth-protected webhooks (Nabu Casa / reverse proxy compatible).
-url: https://github.com/eragon02424/Home-Assistant
 arch:
   - aarch64
   - amd64
 startup: application
 boot: auto
-init: false
+host_network: false
+homeassistant_api: true
 hassio_api: true
 hassio_role: manager
-homeassistant_api: true
-map:
-  - config:rw
+auto_update: true
 options:
   remote_url: ""
-  server_1_enabled: true
+  server_1_enabled: false
   server_1_url: ""
   server_1_token: ""
   server_2_enabled: false
@@ -47,34 +45,34 @@ options:
   server_10_url: ""
   server_10_token: ""
 schema:
-  remote_url: str
-  server_1_enabled: bool
-  server_1_url: str
-  server_1_token: str
-  server_2_enabled: bool
-  server_2_url: str
-  server_2_token: str
-  server_3_enabled: bool
-  server_3_url: str
-  server_3_token: str
-  server_4_enabled: bool
-  server_4_url: str
-  server_4_token: str
-  server_5_enabled: bool
-  server_5_url: str
-  server_5_token: str
-  server_6_enabled: bool
-  server_6_url: str
-  server_6_token: str
-  server_7_enabled: bool
-  server_7_url: str
-  server_7_token: str
-  server_8_enabled: bool
-  server_8_url: str
-  server_8_token: str
-  server_9_enabled: bool
-  server_9_url: str
-  server_9_token: str
-  server_10_enabled: bool
-  server_10_url: str
-  server_10_token: str
+  remote_url: "str?"
+  server_1_enabled: "bool"
+  server_1_url: "str?"
+  server_1_token: "str?"
+  server_2_enabled: "bool"
+  server_2_url: "str?"
+  server_2_token: "str?"
+  server_3_enabled: "bool"
+  server_3_url: "str?"
+  server_3_token: "str?"
+  server_4_enabled: "bool"
+  server_4_url: "str?"
+  server_4_token: "str?"
+  server_5_enabled: "bool"
+  server_5_url: "str?"
+  server_5_token: "str?"
+  server_6_enabled: "bool"
+  server_6_url: "str?"
+  server_6_token: "str?"
+  server_7_enabled: "bool"
+  server_7_url: "str?"
+  server_7_token: "str?"
+  server_8_enabled: "bool"
+  server_8_url: "str?"
+  server_8_token: "str?"
+  server_9_enabled: "bool"
+  server_9_url: "str?"
+  server_9_token: "str?"
+  server_10_enabled: "bool"
+  server_10_url: "str?"
+  server_10_token: "str?"
