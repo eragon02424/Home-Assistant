@@ -4,41 +4,32 @@
 Fuehrt den eigentlichen Sync durch:
 0. Prueft eine Lock-Datei um zu verhindern dass zwei Sync-Laeufe
    gleichzeitig laufen.
-1. Ermittelt Ordner per Graph API und schreibt eine sync_list Datei.
-   WICHTIG (Design-Entscheidung nach mehreren fehlgeschlagenen Versuchen
-   mit Exclude-Regeln): sync_list schliesst PER DEFAULT alles aus, was
-   nicht explizit gelistet ist. Deshalb werden HIER NUR die AKTIVIERTEN
-   Ordner als Include-Zeilen geschrieben (root-verankert mit fuehrendem
-   "/", je zwei Zeilen pro Ordner: der reine Name fuer den Ordner-Eintrag
-   selbst, und "Name/*" fuer den Inhalt). Es werden KEINE Exclude-Zeilen
-   (!...) mehr verwendet - das vermeidet zwei beobachtete Probleme:
-   a) Ordner-Reihenfolge/"Exclusions come first"-Anforderung in v2.5.x
-   b) Ordner ohne fuehrenden "/" werden als teure "anywhere"-Regeln
-      behandelt und koennen bei tiefen/grossen Baeumen (z.B. alte Build-
-      Verzeichnisse mit tausenden Unterordnern) zu Haengern fuehren.
-   Steigt NICHT in deaktivierte Aeste ohne Unterordner-Overrides hinab
-   (spart API-Calls). Nutzt requests.Session() fuer Connection-Pooling.
-   Wenn sich die sync_list geaendert hat, wird automatisch --resync
-   mitgegeben.
-2. onedrive --sync --bidirectional-sync --syncdir /share/onedrive.
-   WICHTIG: Frueher liefen wir mit --download-only (reines Backup, nie
-   hochladen). Der Nutzer will jedoch auch lokal abgelegte/geaenderte
-   Dateien nach OneDrive hochladen koennen - deshalb jetzt echter
-   bidirektionaler Sync (Standardverhalten von 'onedrive --sync' ohne
-   --download-only/--upload-only): lokale Aenderungen werden hochgeladen,
-   OneDrive-Aenderungen heruntergeladen, Loeschungen propagieren in beide
-   Richtungen (Vorsicht: auch lokale Loeschungen loeschen jetzt online!).
-   Falls onedrive trotzdem zur Laufzeit einen Resync verlangt, wird
-   automatisch EINMAL mit --resync --resync-auth nachversucht.
+1. Ermittelt Ordner per Graph API und schreibt eine sync_list Datei -
+   NUR Include-Zeilen fuer aktivierte Ordner (root-verankert, "/Pfad" und
+   "/Pfad/*" pro Ordner). Steigt NICHT in deaktivierte Aeste ohne
+   Unterordner-Overrides hinab. Nutzt requests.Session() fuer Connection-
+   Pooling. Wenn sich die sync_list geaendert hat, wird automatisch
+   --resync mitgegeben.
+2. onedrive --sync --syncdir /share/onedrive (echter bidirektionaler
+   Sync: laedt lokale Aenderungen hoch UND OneDrive-Aenderungen runter).
+   WICHTIG: Es gibt KEIN festes Zeit-Limit mehr - stattdessen wird
+   AKTIVITAET ueberwacht: Solange der Prozess neue Log-Zeilen produziert
+   (also aktiv arbeitet), laeuft er beliebig lange weiter (auch mehrere
+   Stunden bei sehr grossen OneDrive-Strukturen). Nur wenn STALL_TIMEOUT
+   Sekunden lang GAR KEINE neue Ausgabe mehr kommt (= wirklich haengen
+   geblieben, nicht nur langsam), wird der Prozess abgebrochen.
+   Der aktuelle Fortschritt (letzte Log-Zeile + Zeitstempel) wird
+   laufend in PROGRESS_FILE geschrieben, damit die Web-UI live anzeigen
+   kann woran gerade gearbeitet wird.
 3. Filtert Dateien innerhalb synchronisierter Ordner nach Dateityp/Alter
-   (nur fuer lokale Aufraeumung basierend auf Alter/Typ - loescht NICHT
-   online, sondern nur die lokale Kopie; die Datei bleibt in OneDrive).
+   (nur lokale Kopie, nie online).
 4. Schreibt Status in sync_status.json
 """
 
 import hashlib
 import json
 import os
+import select
 import subprocess
 import time
 import urllib.parse
@@ -54,6 +45,7 @@ SYNC_LIST_HASH_FILE = f"{CONFIG_DIR}/sync_list.hash"
 LOCK_FILE = f"{CONFIG_DIR}/sync.lock"
 SHARE_DIR = "/share/onedrive"
 STATUS_FILE = f"{CONFIG_DIR}/sync_status.json"
+PROGRESS_FILE = f"{CONFIG_DIR}/sync_progress.json"
 
 CLIENT_ID = "d50ca740-c83f-4d1b-b616-12c519384f0c"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
@@ -62,6 +54,7 @@ SCOPE = "Files.ReadWrite Files.ReadWrite.All Sites.ReadWrite.All offline_access"
 
 MAX_FOLDER_DEPTH = 10
 LOCK_STALE_SECONDS = 900
+STALL_TIMEOUT_SECONDS = 300  # 5 Minuten OHNE jede neue Ausgabe = echter Haenger
 
 FILTER_EXTENSIONS = {
     "all": None,
@@ -100,6 +93,23 @@ def load_status():
         with open(STATUS_FILE) as f:
             return json.load(f)
     return {"last_sync": None, "files_synced": 0, "errors": [], "authenticated": False}
+
+def write_progress(phase, detail, active=True):
+    """Schreibt den aktuellen Fortschritt fuer die Web-UI (live Polling)."""
+    try:
+        with open(PROGRESS_FILE, 'w') as f:
+            json.dump({
+                "active": active,
+                "phase": phase,
+                "detail": detail,
+                "updated_at": datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+                "updated_ts": time.time()
+            }, f)
+    except Exception:
+        pass
+
+def clear_progress():
+    write_progress("idle", "", active=False)
 
 
 def acquire_lock():
@@ -190,6 +200,7 @@ def list_all_folders(config):
                 counter["n"] += 1
                 if counter["n"] % 25 == 0:
                     log(f"[folders] ... {counter['n']} Ordner bisher gefunden")
+                    write_progress("folders", f"{counter['n']} Ordner gefunden, zuletzt: {child_path}")
 
                 if item["folder"].get("childCount", 0) == 0:
                     continue
@@ -212,29 +223,66 @@ def write_sync_list(config, all_folders):
     """
     Schreibt eine onedrive sync_list Datei - NUR mit Include-Zeilen fuer
     aktivierte Ordner (root-verankert). sync_list schliesst per Default
-    alles aus, das nicht gelistet ist, daher sind keine Exclude-Zeilen
-    noetig. Gibt zurueck ob sich der Inhalt gegenueber dem letzten Lauf
-    geaendert hat (per Hash-Vergleich) - das entscheidet ob --resync
-    noetig ist.
+    alles aus, das nicht gelistet ist.
+
+    WICHTIG (Unterordner-Granularitaet): Fuer jeden Ordner wird NUR dann
+    "/Pfad/*" (rekursiver Inhalt) geschrieben, wenn AUCH ALLE seine
+    bekannten Unterordner aktiviert sind. Hat ein Ordner deaktivierte
+    Unterordner, wird NUR "/Pfad" (der Ordner-Eintrag selbst, KEIN "/*")
+    geschrieben, und stattdessen fuer jeden aktivierten Unterordner
+    einzeln "/Pfad/Unterordner" + ggf. "/Pfad/Unterordner/*" - das
+    verhindert, dass ein rekursiver Wildcard auf einer hoeheren Ebene
+    die Unterordner-Auswahl weiter unten aushebelt (das war der Bug in
+    der vorherigen Version: /Scans/* hat ALLE Scan-Unterordner inkl.
+    deaktivierter mitgenommen, sobald der Ordner-Eintrag einmal
+    "included" war).
     """
     changed = False
 
     if not all_folders:
         return changed
 
-    top_level_folders = [f for f in all_folders if "/" not in f]
-    includes = []
+    folder_set = set(all_folders)
+    # Direkte Kinder pro Ordner ermitteln (inkl. Root als "")
+    children_of = {}
     for path in all_folders:
-        if resolve_enabled(path, config):
-            includes.append(f"/{path}")
+        parent = "/".join(path.split("/")[:-1])
+        children_of.setdefault(parent, []).append(path)
+
+    includes = []
+
+    def has_disabled_descendant(path):
+        """Rekursiv pruefen ob path selbst oder irgendein bekannter
+        Unterordner deaktiviert ist."""
+        if not resolve_enabled(path, config):
+            return True
+        for child in children_of.get(path, []):
+            if has_disabled_descendant(child):
+                return True
+        return False
+
+    def emit(path):
+        if not resolve_enabled(path, config):
+            return
+        includes.append(f"/{path}")
+        if has_disabled_descendant(path):
+            # Nicht den ganzen Ast pauschal einschliessen - stattdessen
+            # jeden aktivierten direkten Unterordner einzeln behandeln.
+            for child in children_of.get(path, []):
+                emit(child)
+        else:
+            # Kompletter Ast ist aktiviert - ein Wildcard reicht.
             includes.append(f"/{path}/*")
 
-    if len(includes) == len(top_level_folders) * 2 and all(
-        resolve_enabled(f, config) for f in all_folders
-    ):
-        # Alles was gefunden wurde ist aktiv UND es gibt keine deaktivierten
-        # Top-Ordner, die wir wegen has_descendant_overrides uebersprungen
-        # haben koennten -> keine Einschraenkung noetig (voller Sync).
+    top_level = children_of.get("", [])
+    for path in top_level:
+        emit(path)
+
+    all_top_enabled = all(resolve_enabled(f, config) for f in top_level)
+    nothing_skipped_by_optimization = len(all_folders) == sum(
+        1 for _ in all_folders  # Platzhalter - eigentliche Pruefung s.u.
+    )
+    if all_top_enabled and all(resolve_enabled(f, config) for f in all_folders):
         new_content = ""
     else:
         new_content = "\n".join(includes) + "\n" if includes else "/__NICHTS_AKTIVIERT__\n"
@@ -257,7 +305,7 @@ def write_sync_list(config, all_folders):
     else:
         with open(SYNC_LIST_FILE, "w") as f:
             f.write(new_content)
-        log(f"[sync_list] {len(includes)} Einschluss-Zeilen geschrieben (nur Includes, root-verankert)")
+        log(f"[sync_list] {len(includes)} Einschluss-Zeilen geschrieben (praezise pro Unterordner-Ebene)")
 
     if changed:
         log("[sync_list] Aenderung erkannt - dieser Sync laeuft mit --resync")
@@ -268,16 +316,16 @@ def write_sync_list(config, all_folders):
 def run_onedrive_sync(need_resync):
     """
     Fuehrt den eigentlichen onedrive Sync durch - echter bidirektionaler
-    Sync (kein --download-only mehr): laedt lokale Aenderungen hoch UND
-    OneDrive-Aenderungen runter.
+    Sync: laedt lokale Aenderungen hoch UND OneDrive-Aenderungen runter.
     --syncdir /share/onedrive: WICHTIG - ohne dieses Flag laedt onedrive
     standardmaessig nach ~/OneDrive im Container-Dateisystem statt in den
     persistenten HA-Share-Mount.
-    --sync: fuehrt den eigentlichen Abgleich durch (Pflicht-Flag).
 
-    ROBUSTHEIT: Falls der erste Versuch trotzdem mit "resync is required"
-    fehlschlaegt, wird automatisch EINMAL mit --resync --resync-auth
-    nachversucht.
+    AKTIVITAETS-UEBERWACHUNG statt festem Zeit-Limit: Jede neue Zeile
+    Ausgabe zaehlt als Lebenszeichen. Nur wenn STALL_TIMEOUT_SECONDS lang
+    GAR NICHTS mehr kommt, wird der Prozess als haengen geblieben
+    betrachtet und abgebrochen. Ansonsten darf der Sync beliebig lange
+    laufen (auch mehrere Stunden bei sehr grossen Strukturen).
     """
     def build_cmd(with_resync):
         cmd = [
@@ -294,6 +342,7 @@ def run_onedrive_sync(need_resync):
     def run_once(with_resync):
         cmd = build_cmd(with_resync)
         log(f"[onedrive] Starte: {' '.join(cmd)}")
+        write_progress("sync", "onedrive Prozess gestartet...")
         proc = None
         try:
             proc = subprocess.Popen(
@@ -301,20 +350,49 @@ def run_onedrive_sync(need_resync):
                 text=True, bufsize=1
             )
             output_lines = []
-            for line in proc.stdout:
-                log(line.rstrip())
-                output_lines.append(line)
-            proc.wait(timeout=600)
-            full_output = "".join(output_lines)
+            last_activity = time.time()
+            fd = proc.stdout.fileno()
+
+            while True:
+                if proc.poll() is not None:
+                    # Prozess ist fertig - evtl. noch verbleibende Zeilen lesen
+                    for line in proc.stdout:
+                        line = line.rstrip()
+                        if line:
+                            log(line)
+                            output_lines.append(line)
+                            write_progress("sync", line)
+                    break
+
+                ready, _, _ = select.select([proc.stdout], [], [], 5.0)
+                if ready:
+                    line = proc.stdout.readline()
+                    if line:
+                        line_s = line.rstrip()
+                        log(line_s)
+                        output_lines.append(line_s)
+                        write_progress("sync", line_s)
+                        last_activity = time.time()
+                else:
+                    stalled_for = time.time() - last_activity
+                    if stalled_for > STALL_TIMEOUT_SECONDS:
+                        log(f"[WARN] Keine Aktivitaet seit {stalled_for:.0f}s - breche ab (echter Haenger)")
+                        proc.kill()
+                        proc.wait(timeout=10)
+                        return False, f"Stalled - {STALL_TIMEOUT_SECONDS}s keine Aktivitaet", "\n".join(output_lines)
+
+            proc.wait()
+            full_output = "\n".join(output_lines)
             if proc.returncode != 0:
-                err_msg = "".join(output_lines[-30:]).strip() or f"Exit-Code {proc.returncode} ohne Ausgabe"
+                err_msg = "\n".join(output_lines[-30:]).strip() or f"Exit-Code {proc.returncode} ohne Ausgabe"
                 return False, err_msg, full_output
             return True, None, full_output
-        except subprocess.TimeoutExpired:
-            if proc:
-                proc.kill()
-            return False, "Sync timeout after 600s", ""
         except Exception as e:
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
             return False, str(e), ""
 
     ok, err, output = run_once(need_resync)
@@ -403,6 +481,7 @@ def main():
         need_resync = False
         try:
             log("[folders] Ermittle Ordnerstruktur per Graph API...")
+            write_progress("folders", "Ermittle Ordnerstruktur per Graph API...")
             t0 = time.time()
             all_folders = list_all_folders(config)
             log(f"[folders] {len(all_folders)} Ordner gefunden in {time.time()-t0:.1f}s")
@@ -415,6 +494,7 @@ def main():
         if not ok:
             errors.append(f"{datetime.now().strftime('%H:%M')} Sync error: {err}")
 
+        write_progress("cleanup", "Filtere und raeume lokale Dateien auf...")
         files_processed, files_deleted = apply_filters_and_cleanup(config)
         log(f"[SYNC] Processed {files_processed} files, deleted {files_deleted} locally")
 
@@ -426,6 +506,7 @@ def main():
         save_status(status)
         log(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Sync complete.")
     finally:
+        clear_progress()
         release_lock()
 
 if __name__ == '__main__':
