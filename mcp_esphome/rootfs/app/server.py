@@ -1,4 +1,16 @@
-"""MCP ESPHome - Main server entry point."""
+"""MCP ESPHome - Main server entry point.
+
+Runs TWO servers concurrently in the same process:
+  - The existing REST API (aiohttp) on `port` (default 8090) -- kept
+    for manual/curl-style access and internal testing.
+  - A real MCP server (Streamable HTTP, via the official Python MCP
+    SDK's FastMCP) on `mcp_port` (default 8091) -- this is what should
+    be added as an actual MCP connector, exposing every capability as
+    a proper tool with a JSON schema, not just an HTTP endpoint someone
+    has to know how to call.
+Both wrap the exact same device_manager/log_manager/job_manager/
+file_manager/serial_flash logic; nothing is duplicated between them.
+"""
 import asyncio
 import json
 import logging
@@ -7,12 +19,14 @@ import sys
 from pathlib import Path
 
 import aiohttp
+import uvicorn
 from aiohttp import web
 
 from device_manager import DeviceManager
 from log_manager import LogManager
 from job_manager import JobManager
 from api_routes import setup_routes
+import mcp_tools
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,6 +76,7 @@ async def main():
     esphome_dashboard_url = opts.get("esphome_dashboard_url", "http://localhost:6052")
     bearer_token = opts.get("bearer_token", "")
     port = opts.get("port", 8090)
+    mcp_port = opts.get("mcp_port", 8091)
     heartbeat_retention_days = opts.get("heartbeat_retention_days", 30)
     keepalive_interval = opts.get("keepalive_interval", 10)
     keepalive_retries = opts.get("keepalive_retries", 5)
@@ -90,7 +105,8 @@ async def main():
     _LOGGER.info("=" * 60)
     _LOGGER.info("MCP ESPHome starting")
     _LOGGER.info("Dashboard URL: %s", esphome_dashboard_url)
-    _LOGGER.info("Port: %s", port)
+    _LOGGER.info("REST API port: %s", port)
+    _LOGGER.info("MCP (Streamable HTTP) port: %s", mcp_port)
     _LOGGER.info("Keepalive: interval=%ds retries=%d timeout=%dms max_backoff=%ds",
                  keepalive_interval, keepalive_retries, keepalive_ping_timeout_ms,
                  keepalive_max_backoff_seconds)
@@ -121,6 +137,7 @@ async def main():
     asyncio.create_task(device_manager.run_discovery_loop())
     asyncio.create_task(log_manager.run_prune_loop())
 
+    # ── REST API (existing) ──────────────────────────────────
     app = web.Application()
     app["device_manager"] = device_manager
     app["log_manager"] = log_manager
@@ -132,8 +149,19 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    _LOGGER.info("REST API listening on 0.0.0.0:%s", port)
 
-    _LOGGER.info("MCP ESPHome API listening on 0.0.0.0:%s", port)
+    # ── Real MCP server (Streamable HTTP) ────────────────────
+    mcp_tools.init(device_manager, log_manager, job_manager, device_manager.bearer_token)
+    uv_config = uvicorn.Config(
+        mcp_tools.get_asgi_app(),
+        host="0.0.0.0",
+        port=mcp_port,
+        log_level="info",
+    )
+    uv_server = uvicorn.Server(uv_config)
+    asyncio.create_task(uv_server.serve())
+    _LOGGER.info("MCP server (Streamable HTTP) listening on 0.0.0.0:%s/mcp", mcp_port)
 
     while True:
         await asyncio.sleep(3600)
