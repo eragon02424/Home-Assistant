@@ -22,7 +22,14 @@ Fuehrt den eigentlichen Sync durch:
    laufend in PROGRESS_FILE geschrieben, damit die Web-UI live anzeigen
    kann woran gerade gearbeitet wird.
 3. Filtert Dateien innerhalb synchronisierter Ordner nach Dateityp/Alter
-   (nur lokale Kopie, nie online).
+   (nur lokale Kopie, nie online). WICHTIG (Bugfix): Ordner die per
+   Konfiguration DEAKTIVIERT sind, werden jetzt tatsaechlich lokal
+   BEREINIGT (Dateien geloescht) statt nur uebersprungen zu werden - das
+   war der eigentliche Grund warum abgewaehlte Scan-Unterordner trotz
+   korrekt funktionierender sync_list weiterhin Dateien lokal vorhielten:
+   es waren Altlasten von einem frueheren, ungefilterten Sync-Lauf, die
+   nie bereinigt wurden weil die alte Logik deaktivierte Ordner einfach
+   ignoriert hat statt sie aufzuraeumen.
 4. Schreibt Status in sync_status.json
 """
 
@@ -30,6 +37,7 @@ import hashlib
 import json
 import os
 import select
+import shutil
 import subprocess
 import time
 import urllib.parse
@@ -230,20 +238,13 @@ def write_sync_list(config, all_folders):
     bekannten Unterordner aktiviert sind. Hat ein Ordner deaktivierte
     Unterordner, wird NUR "/Pfad" (der Ordner-Eintrag selbst, KEIN "/*")
     geschrieben, und stattdessen fuer jeden aktivierten Unterordner
-    einzeln "/Pfad/Unterordner" + ggf. "/Pfad/Unterordner/*" - das
-    verhindert, dass ein rekursiver Wildcard auf einer hoeheren Ebene
-    die Unterordner-Auswahl weiter unten aushebelt (das war der Bug in
-    der vorherigen Version: /Scans/* hat ALLE Scan-Unterordner inkl.
-    deaktivierter mitgenommen, sobald der Ordner-Eintrag einmal
-    "included" war).
+    einzeln "/Pfad/Unterordner" + ggf. "/Pfad/Unterordner/*".
     """
     changed = False
 
     if not all_folders:
         return changed
 
-    folder_set = set(all_folders)
-    # Direkte Kinder pro Ordner ermitteln (inkl. Root als "")
     children_of = {}
     for path in all_folders:
         parent = "/".join(path.split("/")[:-1])
@@ -252,8 +253,6 @@ def write_sync_list(config, all_folders):
     includes = []
 
     def has_disabled_descendant(path):
-        """Rekursiv pruefen ob path selbst oder irgendein bekannter
-        Unterordner deaktiviert ist."""
         if not resolve_enabled(path, config):
             return True
         for child in children_of.get(path, []):
@@ -266,23 +265,16 @@ def write_sync_list(config, all_folders):
             return
         includes.append(f"/{path}")
         if has_disabled_descendant(path):
-            # Nicht den ganzen Ast pauschal einschliessen - stattdessen
-            # jeden aktivierten direkten Unterordner einzeln behandeln.
             for child in children_of.get(path, []):
                 emit(child)
         else:
-            # Kompletter Ast ist aktiviert - ein Wildcard reicht.
             includes.append(f"/{path}/*")
 
     top_level = children_of.get("", [])
     for path in top_level:
         emit(path)
 
-    all_top_enabled = all(resolve_enabled(f, config) for f in top_level)
-    nothing_skipped_by_optimization = len(all_folders) == sum(
-        1 for _ in all_folders  # Platzhalter - eigentliche Pruefung s.u.
-    )
-    if all_top_enabled and all(resolve_enabled(f, config) for f in all_folders):
+    if all(resolve_enabled(f, config) for f in all_folders):
         new_content = ""
     else:
         new_content = "\n".join(includes) + "\n" if includes else "/__NICHTS_AKTIVIERT__\n"
@@ -324,8 +316,7 @@ def run_onedrive_sync(need_resync):
     AKTIVITAETS-UEBERWACHUNG statt festem Zeit-Limit: Jede neue Zeile
     Ausgabe zaehlt als Lebenszeichen. Nur wenn STALL_TIMEOUT_SECONDS lang
     GAR NICHTS mehr kommt, wird der Prozess als haengen geblieben
-    betrachtet und abgebrochen. Ansonsten darf der Sync beliebig lange
-    laufen (auch mehrere Stunden bei sehr grossen Strukturen).
+    betrachtet und abgebrochen.
     """
     def build_cmd(with_resync):
         cmd = [
@@ -351,11 +342,9 @@ def run_onedrive_sync(need_resync):
             )
             output_lines = []
             last_activity = time.time()
-            fd = proc.stdout.fileno()
 
             while True:
                 if proc.poll() is not None:
-                    # Prozess ist fertig - evtl. noch verbleibende Zeilen lesen
                     for line in proc.stdout:
                         line = line.rstrip()
                         if line:
@@ -425,21 +414,44 @@ def get_effective_config(folder_path, config):
 
 def apply_filters_and_cleanup(config):
     """
-    Loescht NUR lokale Kopien (nie online) von Dateien die nicht zum
-    Filter passen oder zu alt sind.
+    Loescht NUR lokale Kopien (nie online):
+    - Ordner die per Konfiguration DEAKTIVIERT sind: KOMPLETT loeschen
+      (das sind i.d.R. Altlasten von frueheren, ungefilterten Sync-
+      Laeufen oder Reste falls der Ordner erst spaeter deaktiviert
+      wurde - onedrive selbst laedt sie nicht erneut herunter, aber
+      raeumt bereits vorhandene lokale Dateien in ausgeschlossenen
+      Pfaden nicht automatisch auf).
+    - Dateien die nicht zum Filter passen oder zu alt sind: einzeln
+      loeschen.
     """
     files_processed = 0
     files_deleted = 0
 
+    # Schritt 1: komplette deaktivierte Ordner loeschen
+    for root, dirs, files in list(os.walk(SHARE_DIR)):
+        rel_folder = os.path.relpath(root, SHARE_DIR)
+        if rel_folder == ".":
+            continue
+        effective = get_effective_config(rel_folder, config)
+        if not effective["sync"]:
+            try:
+                file_count = sum(len(fs) for _, _, fs in os.walk(root))
+                log(f"[CLEANUP] Entferne deaktivierten Ordner komplett: {root} ({file_count} Dateien)")
+                shutil.rmtree(root)
+                files_deleted += file_count
+            except FileNotFoundError:
+                pass  # Bereits durch eine uebergeordnete Loeschung entfernt
+            dirs[:] = []  # Nicht weiter in bereits geloeschten Ordner absteigen
+
+    # Schritt 2: Dateityp-/Alters-Filter innerhalb aktivierter Ordner
     for root, dirs, files in os.walk(SHARE_DIR):
         for filename in files:
             filepath = os.path.join(root, filename)
             rel_folder = os.path.relpath(root, SHARE_DIR)
 
             effective = get_effective_config(rel_folder, config)
-
             if not effective["sync"]:
-                continue
+                continue  # Sollte durch Schritt 1 bereits entfernt sein
 
             ext = os.path.splitext(filename)[1].lower()
             files_processed += 1
