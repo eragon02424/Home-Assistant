@@ -27,14 +27,14 @@ WICHTIG 5: /api/search nutzt Teilstring-Suche (nicht exakten Vergleich).
 WICHTIG 6: /api/progress liefert den Live-Fortschritt des laufenden Syncs
 (letzte Log-Zeile + Zeitstempel) aus sync_progress.json.
 
-WICHTIG 7 (Download-Fix): graph_download() nutzt jetzt die von Microsoft
-Graph mitgelieferte vorautorisierte "@microsoft.graph.downloadUrl" statt
-direkt den /content Endpunkt mit unserem Access Token anzusprechen. Bei
-frisch hochgeladenen Dateien (Item-IDs mit "!s"-Praefix statt normalem
-"!zahl"-Format) lieferte der direkte /content Aufruf einen 401 Fehler,
-obwohl der Access Token gueltig war und die Metadaten-Abfrage klappte.
-Die downloadUrl ist der von Microsoft empfohlene, robustere Weg und
-funktioniert fuer alle Item-ID-Formate zuverlaessig.
+WICHTIG 7 (Download-Fix): graph_download() nutzt die von Microsoft Graph
+mitgelieferte vorautorisierte "@microsoft.graph.downloadUrl" statt direkt
+den /content Endpunkt mit unserem Access Token anzusprechen. Bei frisch
+hochgeladenen Dateien (Item-IDs mit "!s"-Praefix statt normalem
+"!zahl"-Format) lieferte der direkte /content Aufruf einen 401 Fehler.
+WICHTIG: Die Metadaten-Abfrage fuer die downloadUrl darf KEIN "$select"
+verwenden - damit fehlt die downloadUrl bei manchen Item-ID-Formaten in
+der Antwort, obwohl sie bei einer unbeschraenkten Abfrage vorhanden ist.
 """
 
 import json
@@ -129,10 +129,15 @@ def graph_get(access_token, path):
 def graph_download(access_token, item_id, dest_path):
     """
     Laedt eine Datei ueber die vorautorisierte '@microsoft.graph.downloadUrl'
-    herunter (nicht direkt ueber /content mit unserem Access Token) - siehe
-    WICHTIG 7 im Modul-Docstring fuer die Begruendung.
+    herunter (nicht direkt ueber /content mit unserem Access Token).
+
+    WICHTIG: OHNE $select abfragen! Mit "?$select=...@microsoft.graph.downloadUrl"
+    liefert Graph bei manchen Item-ID-Formaten (z.B. frisch hochgeladene
+    Dateien mit "!s..."-Praefix) die downloadUrl NICHT mit zurueck, obwohl
+    sie bei einer unbeschraenkten Abfrage (kompletter Datensatz) vorhanden
+    ist. Deshalb hier bewusst OHNE Query-Parameter abfragen.
     """
-    meta = graph_get(access_token, f"/me/drive/items/{item_id}?$select=id,name,@microsoft.graph.downloadUrl")
+    meta = graph_get(access_token, f"/me/drive/items/{item_id}")
     download_url = meta.get("@microsoft.graph.downloadUrl")
     if not download_url:
         raise Exception("Keine downloadUrl von Microsoft Graph erhalten (Datei evtl. noch nicht vollstaendig indexiert)")
