@@ -4,6 +4,7 @@ import logging
 from aiohttp import web
 
 import serial_flash
+import serial_info
 import file_manager
 
 _LOGGER = logging.getLogger("mcp_esphome.api")
@@ -147,6 +148,19 @@ def setup_routes(app: web.Application):
             return web.json_response({"error": str(err)}, status=502)
         return web.json_response(result)
 
+    async def list_serial_ports(request):
+        return web.json_response(serial_info.list_serial_ports())
+
+    async def get_serial_chip_info(request):
+        port = request.query.get("port")
+        if not port:
+            return web.json_response(
+                {"error": "query param 'port' is required, e.g. port=/dev/ttyACM0"},
+                status=400,
+            )
+        result = await serial_info.get_chip_info(port)
+        return web.json_response(result)
+
     async def list_files(request):
         path = request.query.get("path", "")
         result = file_manager.list_files(path)
@@ -205,6 +219,8 @@ def setup_routes(app: web.Application):
     app.router.add_get("/jobs/{job_id}/error_summary", get_error_summary)
     app.router.add_get("/jobs/{job_id}/full_log", get_full_log)
     app.router.add_get("/jobs/{job_id}/flash_log", get_flash_log)
+    app.router.add_get("/serial/ports", list_serial_ports)
+    app.router.add_get("/serial/chip_info", get_serial_chip_info)
     app.router.add_get("/files/list", list_files)
     app.router.add_get("/files/read", read_file)
     app.router.add_post("/files/write", write_file)
