@@ -9,14 +9,15 @@ Fuehrt den eigentlichen Sync durch:
    deaktivierten Aesten - so werden abgewaehlte Ordner (auch verschachtelt)
    GAR NICHT erst heruntergeladen.
    WICHTIG (v2.5.x): "Exclusions come first. Inclusions follow." - die
-   Reihenfolge in der Datei ist entscheidend, sonst werden Ausschluesse
-   ignoriert.
-   WICHTIG 2: Fuer jeden eingeschlossenen Ordner werden ZWEI Zeilen
-   geschrieben - der reine Ordnername (damit der Ordner-EINTRAG selbst
-   erstellt wird) UND "Ordnername/*" (damit der INHALT mit uebernommen
-   wird). Nur die Wildcard-Zeile allein reicht nicht - der Ordner selbst
-   wurde sonst komplett uebersprungen ("Skipping path - excluded by
-   sync_list config").
+   Reihenfolge in der Datei ist entscheidend.
+   WICHTIG 2: Alle Pfade bekommen einen fuehrenden "/" (root-verankert).
+   Ohne fuehrenden "/" behandelt onedrive Eintraege als "anywhere"-Regeln
+   (matcht den Namen ueberall im Baum, nicht nur an dieser Stelle) - das
+   fuehrte dazu, dass der Top-Ordner selbst trotz Include-Zeile
+   uebersprungen wurde.
+   WICHTIG 3: Pro eingeschlossenem Ordner werden ZWEI Zeilen geschrieben:
+   der reine Ordnername (erstellt den Ordner-EINTRAG selbst) und
+   "Ordnername/*" (uebernimmt den Inhalt).
    Steigt NICHT in deaktivierte Aeste ohne Unterordner-Overrides hinab
    (spart API-Calls). Nutzt requests.Session() fuer Connection-Pooling.
    Wenn sich die sync_list geaendert hat, wird automatisch --resync
@@ -209,12 +210,9 @@ def write_sync_list(config, all_folders):
     Gibt zurueck ob sich der Inhalt gegenueber dem letzten Lauf geaendert
     hat (per Hash-Vergleich) - das entscheidet ob ein --resync noetig ist.
 
-    WICHTIG (v2.5.x Dokumentation): "Exclusions come first. Inclusions
-    follow." Die Reihenfolge in der Datei ist entscheidend.
-    WICHTIG 2: Pro eingeschlossenem Ordner werden ZWEI Zeilen geschrieben:
-    der reine Ordnername (erstellt den Ordner-EINTRAG selbst) und
-    "Ordnername/*" (uebernimmt den Inhalt). Nur die Wildcard-Zeile allein
-    fuehrt dazu dass der Ordner selbst uebersprungen wird.
+    WICHTIG: Alle Pfade werden mit fuehrendem "/" geschrieben (root-
+    verankert), sonst behandelt onedrive sie als "anywhere"-Regeln.
+    Excludes kommen vor Includes. Pro Include-Ordner: bare Name + Name/*.
     """
     changed = False
 
@@ -232,10 +230,10 @@ def write_sync_list(config, all_folders):
         else:
             parent_enabled = resolve_enabled("/".join(parts[:-1]), config)
         if cur_enabled and not parent_enabled:
-            includes.append(path)
-            includes.append(f"{path}/*")
+            includes.append(f"/{path}")
+            includes.append(f"/{path}/*")
         elif not cur_enabled and parent_enabled:
-            excludes.append(f"!{path}/*")
+            excludes.append(f"!/{path}/*")
 
     if not excludes and len(includes) == len(top_level_folders) * 2:
         new_content = ""
@@ -261,7 +259,7 @@ def write_sync_list(config, all_folders):
     else:
         with open(SYNC_LIST_FILE, "w") as f:
             f.write(new_content)
-        log(f"[sync_list] {len(excludes)} Ausschluss-, {len(includes)} Einschluss-Zeilen geschrieben (Excludes zuerst)")
+        log(f"[sync_list] {len(excludes)} Ausschluss-, {len(includes)} Einschluss-Zeilen geschrieben (root-verankert, Excludes zuerst)")
 
     if changed:
         log("[sync_list] Aenderung erkannt - dieser Sync laeuft mit --resync")
