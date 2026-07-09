@@ -1,6 +1,6 @@
 name: "OneDrive SyncServer"
-description: "Synchronisiert Ordner zwischen Home Assistant und Microsoft OneDrive. OneDrive ist immer Master. Pro-Ordner Filter, Vererbung und automatisches lokales Loeschen nach Zeit."
-version: "1.21.0"
+description: "Synchronisiert Ordner zwischen Home Assistant und Microsoft OneDrive. Pro-Ordner Filter, Vererbung und automatisches lokales Loeschen nach Zeit. Bidirektionaler Sync (Upload und Download)."
+version: "1.23.0"
 slug: "onedrive_syncserver"
 init: false
 arch:
