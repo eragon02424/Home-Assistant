@@ -2,3 +2,5 @@ aiohttp
 zeroconf
 aioesphomeapi
 esptool
+mcp
+uvicorn
