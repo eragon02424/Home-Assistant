@@ -4,31 +4,35 @@
 Fuehrt den eigentlichen Sync durch:
 0. Prueft eine Lock-Datei um zu verhindern dass zwei Sync-Laeufe
    gleichzeitig laufen.
-1. Ermittelt Ordner per Graph API und schreibt eine sync_list Datei mit
-   Include/Exclude-Zeilen an den "Grenzen" zwischen aktivierten und
-   deaktivierten Aesten - so werden abgewaehlte Ordner (auch verschachtelt)
-   GAR NICHT erst heruntergeladen.
-   WICHTIG (v2.5.x): "Exclusions come first. Inclusions follow." - die
-   Reihenfolge in der Datei ist entscheidend.
-   WICHTIG 2: Alle Pfade bekommen einen fuehrenden "/" (root-verankert).
-   Ohne fuehrenden "/" behandelt onedrive Eintraege als "anywhere"-Regeln
-   (matcht den Namen ueberall im Baum, nicht nur an dieser Stelle) - das
-   fuehrte dazu, dass der Top-Ordner selbst trotz Include-Zeile
-   uebersprungen wurde.
-   WICHTIG 3: Pro eingeschlossenem Ordner werden ZWEI Zeilen geschrieben:
-   der reine Ordnername (erstellt den Ordner-EINTRAG selbst) und
-   "Ordnername/*" (uebernimmt den Inhalt).
+1. Ermittelt Ordner per Graph API und schreibt eine sync_list Datei.
+   WICHTIG (Design-Entscheidung nach mehreren fehlgeschlagenen Versuchen
+   mit Exclude-Regeln): sync_list schliesst PER DEFAULT alles aus, was
+   nicht explizit gelistet ist. Deshalb werden HIER NUR die AKTIVIERTEN
+   Ordner als Include-Zeilen geschrieben (root-verankert mit fuehrendem
+   "/", je zwei Zeilen pro Ordner: der reine Name fuer den Ordner-Eintrag
+   selbst, und "Name/*" fuer den Inhalt). Es werden KEINE Exclude-Zeilen
+   (!...) mehr verwendet - das vermeidet zwei beobachtete Probleme:
+   a) Ordner-Reihenfolge/"Exclusions come first"-Anforderung in v2.5.x
+   b) Ordner ohne fuehrenden "/" werden als teure "anywhere"-Regeln
+      behandelt und koennen bei tiefen/grossen Baeumen (z.B. alte Build-
+      Verzeichnisse mit tausenden Unterordnern) zu Haengern fuehren.
    Steigt NICHT in deaktivierte Aeste ohne Unterordner-Overrides hinab
    (spart API-Calls). Nutzt requests.Session() fuer Connection-Pooling.
    Wenn sich die sync_list geaendert hat, wird automatisch --resync
    mitgegeben.
-2. onedrive --sync --download-only --cleanup-local-files --syncdir
-   /share/onedrive (OneDrive ist Master). WICHTIG: Ohne explizites
-   --syncdir laedt onedrive standardmaessig nach ~/OneDrive (im
-   Container-Dateisystem, NICHT im persistenten /share-Mount).
+2. onedrive --sync --bidirectional-sync --syncdir /share/onedrive.
+   WICHTIG: Frueher liefen wir mit --download-only (reines Backup, nie
+   hochladen). Der Nutzer will jedoch auch lokal abgelegte/geaenderte
+   Dateien nach OneDrive hochladen koennen - deshalb jetzt echter
+   bidirektionaler Sync (Standardverhalten von 'onedrive --sync' ohne
+   --download-only/--upload-only): lokale Aenderungen werden hochgeladen,
+   OneDrive-Aenderungen heruntergeladen, Loeschungen propagieren in beide
+   Richtungen (Vorsicht: auch lokale Loeschungen loeschen jetzt online!).
    Falls onedrive trotzdem zur Laufzeit einen Resync verlangt, wird
    automatisch EINMAL mit --resync --resync-auth nachversucht.
 3. Filtert Dateien innerhalb synchronisierter Ordner nach Dateityp/Alter
+   (nur fuer lokale Aufraeumung basierend auf Alter/Typ - loescht NICHT
+   online, sondern nur die lokale Kopie; die Datei bleibt in OneDrive).
 4. Schreibt Status in sync_status.json
 """
 
@@ -206,13 +210,12 @@ def list_all_folders(config):
 
 def write_sync_list(config, all_folders):
     """
-    Schreibt eine onedrive sync_list Datei mit Include/Exclude-Zeilen.
-    Gibt zurueck ob sich der Inhalt gegenueber dem letzten Lauf geaendert
-    hat (per Hash-Vergleich) - das entscheidet ob ein --resync noetig ist.
-
-    WICHTIG: Alle Pfade werden mit fuehrendem "/" geschrieben (root-
-    verankert), sonst behandelt onedrive sie als "anywhere"-Regeln.
-    Excludes kommen vor Includes. Pro Include-Ordner: bare Name + Name/*.
+    Schreibt eine onedrive sync_list Datei - NUR mit Include-Zeilen fuer
+    aktivierte Ordner (root-verankert). sync_list schliesst per Default
+    alles aus, das nicht gelistet ist, daher sind keine Exclude-Zeilen
+    noetig. Gibt zurueck ob sich der Inhalt gegenueber dem letzten Lauf
+    geaendert hat (per Hash-Vergleich) - das entscheidet ob --resync
+    noetig ist.
     """
     changed = False
 
@@ -221,25 +224,20 @@ def write_sync_list(config, all_folders):
 
     top_level_folders = [f for f in all_folders if "/" not in f]
     includes = []
-    excludes = []
     for path in all_folders:
-        cur_enabled = resolve_enabled(path, config)
-        parts = path.split("/")
-        if len(parts) == 1:
-            parent_enabled = False
-        else:
-            parent_enabled = resolve_enabled("/".join(parts[:-1]), config)
-        if cur_enabled and not parent_enabled:
+        if resolve_enabled(path, config):
             includes.append(f"/{path}")
             includes.append(f"/{path}/*")
-        elif not cur_enabled and parent_enabled:
-            excludes.append(f"!/{path}/*")
 
-    if not excludes and len(includes) == len(top_level_folders) * 2:
+    if len(includes) == len(top_level_folders) * 2 and all(
+        resolve_enabled(f, config) for f in all_folders
+    ):
+        # Alles was gefunden wurde ist aktiv UND es gibt keine deaktivierten
+        # Top-Ordner, die wir wegen has_descendant_overrides uebersprungen
+        # haben koennten -> keine Einschraenkung noetig (voller Sync).
         new_content = ""
     else:
-        # WICHTIG: Excludes zuerst, dann Includes.
-        new_content = "\n".join(excludes + includes) + "\n"
+        new_content = "\n".join(includes) + "\n" if includes else "/__NICHTS_AKTIVIERT__\n"
 
     new_hash = hashlib.sha256(new_content.encode()).hexdigest()
     old_hash = None
@@ -259,7 +257,7 @@ def write_sync_list(config, all_folders):
     else:
         with open(SYNC_LIST_FILE, "w") as f:
             f.write(new_content)
-        log(f"[sync_list] {len(excludes)} Ausschluss-, {len(includes)} Einschluss-Zeilen geschrieben (root-verankert, Excludes zuerst)")
+        log(f"[sync_list] {len(includes)} Einschluss-Zeilen geschrieben (nur Includes, root-verankert)")
 
     if changed:
         log("[sync_list] Aenderung erkannt - dieser Sync laeuft mit --resync")
@@ -269,15 +267,13 @@ def write_sync_list(config, all_folders):
 
 def run_onedrive_sync(need_resync):
     """
-    Run onedrive sync with OneDrive as master (download-only).
+    Fuehrt den eigentlichen onedrive Sync durch - echter bidirektionaler
+    Sync (kein --download-only mehr): laedt lokale Aenderungen hoch UND
+    OneDrive-Aenderungen runter.
     --syncdir /share/onedrive: WICHTIG - ohne dieses Flag laedt onedrive
     standardmaessig nach ~/OneDrive im Container-Dateisystem statt in den
     persistenten HA-Share-Mount.
-    --sync: fuehrt den eigentlichen Abgleich durch.
-    --download-only: laedt nur von OneDrive runter, laedt NIE lokale
-    Aenderungen hoch.
-    --cleanup-local-files: entfernt lokale Dateien deren OneDrive-Pendant
-    geloescht wurde.
+    --sync: fuehrt den eigentlichen Abgleich durch (Pflicht-Flag).
 
     ROBUSTHEIT: Falls der erste Versuch trotzdem mit "resync is required"
     fehlschlaegt, wird automatisch EINMAL mit --resync --resync-auth
@@ -289,8 +285,6 @@ def run_onedrive_sync(need_resync):
             "--confdir", ONEDRIVE_CONFIG_DIR,
             "--syncdir", SHARE_DIR,
             "--sync",
-            "--download-only",
-            "--cleanup-local-files",
             "--verbose"
         ]
         if with_resync:
@@ -352,6 +346,10 @@ def get_effective_config(folder_path, config):
     return effective
 
 def apply_filters_and_cleanup(config):
+    """
+    Loescht NUR lokale Kopien (nie online) von Dateien die nicht zum
+    Filter passen oder zu alt sind.
+    """
     files_processed = 0
     files_deleted = 0
 
