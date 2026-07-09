@@ -12,9 +12,14 @@ Fuehrt den eigentlichen Sync durch:
    (spart API-Calls). Nutzt requests.Session() fuer Connection-Pooling.
    Wenn sich die sync_list geaendert hat, wird automatisch --resync
    mitgegeben.
-2. onedrive --sync --download-only --cleanup-local-files (OneDrive ist
-   Master). Falls onedrive trotzdem zur Laufzeit einen Resync verlangt
-   (z.B. Nachwirkung eines fruehreren fehlgeschlagenen Laufs), wird
+2. onedrive --sync --download-only --cleanup-local-files --syncdir
+   /share/onedrive (OneDrive ist Master). WICHTIG: Ohne explizites
+   --syncdir laedt onedrive standardmaessig nach ~/OneDrive (im
+   Container-Dateisystem, NICHT im persistenten /share-Mount) - das
+   wurde hier ergaenzt, da sonst alle heruntergeladenen Dateien bei
+   einem Container-Neustart verloren gehen wuerden und fuer den Nutzer
+   im HA-Dateibrowser gar nicht sichtbar waeren.
+   Falls onedrive trotzdem zur Laufzeit einen Resync verlangt, wird
    automatisch EINMAL mit --resync --resync-auth nachversucht.
 3. Filtert Dateien innerhalb synchronisierter Ordner nach Dateityp/Alter
 4. Schreibt Status in sync_status.json
@@ -252,25 +257,24 @@ def write_sync_list(config, all_folders):
 def run_onedrive_sync(need_resync):
     """
     Run onedrive sync with OneDrive as master (download-only).
-    --sync: fuehrt den eigentlichen Abgleich durch (Pflicht-Flag seit
-    v2.5.x, ersetzt --synchronize).
+    --syncdir /share/onedrive: WICHTIG - ohne dieses Flag laedt onedrive
+    standardmaessig nach ~/OneDrive im Container-Dateisystem statt in den
+    persistenten HA-Share-Mount.
+    --sync: fuehrt den eigentlichen Abgleich durch.
     --download-only: laedt nur von OneDrive runter, laedt NIE lokale
     Aenderungen hoch.
     --cleanup-local-files: entfernt lokale Dateien deren OneDrive-Pendant
-    geloescht wurde (das ist das gewuenschte "OneDrive ist Master"
-    Verhalten - Loeschungen auf OneDrive propagieren lokal).
+    geloescht wurde.
 
-    ROBUSTHEIT: Falls der erste Versuch (ohne --resync, weil unser eigener
-    Hash-Vergleich keine Aenderung sah) trotzdem mit "resync is required"
-    fehlschlaegt - z.B. weil ein fruehrerer Lauf mit falschen Flags bereits
-    einen aenderungsbeduerftigen Zustand hinterlassen hat, den onedrive
-    intern noch nicht als erledigt markiert hat - wird automatisch EINMAL
-    mit --resync --resync-auth nachversucht.
+    ROBUSTHEIT: Falls der erste Versuch trotzdem mit "resync is required"
+    fehlschlaegt, wird automatisch EINMAL mit --resync --resync-auth
+    nachversucht.
     """
     def build_cmd(with_resync):
         cmd = [
             "onedrive",
             "--confdir", ONEDRIVE_CONFIG_DIR,
+            "--syncdir", SHARE_DIR,
             "--sync",
             "--download-only",
             "--cleanup-local-files",
@@ -306,8 +310,11 @@ def run_onedrive_sync(need_resync):
         except Exception as e:
             return False, str(e), ""
 
+    # Da sich syncdir geaendert hat, ist beim allerersten Lauf mit dem
+    # neuen Pfad ein Resync noetig (onedrive erkennt die geaenderte
+    # sync_dir als Konfigurationsaenderung).
     ok, err, output = run_once(need_resync)
-    if not ok and not need_resync and "resync is required" in output.lower():
+    if not ok and not need_resync and ("resync is required" in output.lower() or "sync_dir" in output.lower()):
         log("[onedrive] Automatischer Nachversuch mit --resync (onedrive verlangte es zur Laufzeit)...")
         ok, err, output = run_once(True)
     if not ok:
