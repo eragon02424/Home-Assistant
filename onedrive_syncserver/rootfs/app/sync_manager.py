@@ -8,6 +8,9 @@ Fuehrt den eigentlichen Sync durch:
    Include/Exclude-Zeilen an den "Grenzen" zwischen aktivierten und
    deaktivierten Aesten - so werden abgewaehlte Ordner (auch verschachtelt)
    GAR NICHT erst heruntergeladen.
+   WICHTIG (v2.5.x): "Exclusions come first. Inclusions follow." - die
+   Reihenfolge in der Datei ist entscheidend, sonst werden Ausschluesse
+   ignoriert.
    Steigt NICHT in deaktivierte Aeste ohne Unterordner-Overrides hinab
    (spart API-Calls). Nutzt requests.Session() fuer Connection-Pooling.
    Wenn sich die sync_list geaendert hat, wird automatisch --resync
@@ -15,10 +18,7 @@ Fuehrt den eigentlichen Sync durch:
 2. onedrive --sync --download-only --cleanup-local-files --syncdir
    /share/onedrive (OneDrive ist Master). WICHTIG: Ohne explizites
    --syncdir laedt onedrive standardmaessig nach ~/OneDrive (im
-   Container-Dateisystem, NICHT im persistenten /share-Mount) - das
-   wurde hier ergaenzt, da sonst alle heruntergeladenen Dateien bei
-   einem Container-Neustart verloren gehen wuerden und fuer den Nutzer
-   im HA-Dateibrowser gar nicht sichtbar waeren.
+   Container-Dateisystem, NICHT im persistenten /share-Mount).
    Falls onedrive trotzdem zur Laufzeit einen Resync verlangt, wird
    automatisch EINMAL mit --resync --resync-auth nachversucht.
 3. Filtert Dateien innerhalb synchronisierter Ordner nach Dateityp/Alter
@@ -202,6 +202,10 @@ def write_sync_list(config, all_folders):
     Schreibt eine onedrive sync_list Datei mit Include/Exclude-Zeilen.
     Gibt zurueck ob sich der Inhalt gegenueber dem letzten Lauf geaendert
     hat (per Hash-Vergleich) - das entscheidet ob ein --resync noetig ist.
+
+    WICHTIG (v2.5.x Dokumentation): "Exclusions come first. Inclusions
+    follow." Die Reihenfolge in der Datei ist entscheidend - Ausschluesse
+    MUESSEN vor Einschluessen stehen, sonst werden sie ignoriert.
     """
     changed = False
 
@@ -226,7 +230,8 @@ def write_sync_list(config, all_folders):
     if not excludes and len(includes) == len(top_level_folders):
         new_content = ""
     else:
-        new_content = "\n".join(includes + excludes) + "\n"
+        # WICHTIG: Excludes zuerst, dann Includes - siehe Docstring oben.
+        new_content = "\n".join(excludes + includes) + "\n"
 
     new_hash = hashlib.sha256(new_content.encode()).hexdigest()
     old_hash = None
@@ -246,7 +251,7 @@ def write_sync_list(config, all_folders):
     else:
         with open(SYNC_LIST_FILE, "w") as f:
             f.write(new_content)
-        log(f"[sync_list] {len(includes)} Einschluss-, {len(excludes)} Ausschluss-Regeln geschrieben")
+        log(f"[sync_list] {len(excludes)} Ausschluss-, {len(includes)} Einschluss-Regeln geschrieben (Excludes zuerst)")
 
     if changed:
         log("[sync_list] Aenderung erkannt - dieser Sync laeuft mit --resync")
@@ -310,9 +315,6 @@ def run_onedrive_sync(need_resync):
         except Exception as e:
             return False, str(e), ""
 
-    # Da sich syncdir geaendert hat, ist beim allerersten Lauf mit dem
-    # neuen Pfad ein Resync noetig (onedrive erkennt die geaenderte
-    # sync_dir als Konfigurationsaenderung).
     ok, err, output = run_once(need_resync)
     if not ok and not need_resync and ("resync is required" in output.lower() or "sync_dir" in output.lower()):
         log("[onedrive] Automatischer Nachversuch mit --resync (onedrive verlangte es zur Laufzeit)...")
