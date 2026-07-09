@@ -6,30 +6,39 @@ Fuehrt den eigentlichen Sync durch:
    gleichzeitig laufen.
 1. Ermittelt Ordner per Graph API und schreibt eine sync_list Datei -
    NUR Include-Zeilen fuer aktivierte Ordner (root-verankert, "/Pfad" und
-   "/Pfad/*" pro Ordner). Steigt NICHT in deaktivierte Aeste ohne
-   Unterordner-Overrides hinab. Nutzt requests.Session() fuer Connection-
-   Pooling. Wenn sich die sync_list geaendert hat, wird automatisch
-   --resync mitgegeben.
-2. onedrive --sync --syncdir /share/onedrive (echter bidirektionaler
-   Sync: laedt lokale Aenderungen hoch UND OneDrive-Aenderungen runter).
-   WICHTIG: Es gibt KEIN festes Zeit-Limit mehr - stattdessen wird
-   AKTIVITAET ueberwacht: Solange der Prozess neue Log-Zeilen produziert
-   (also aktiv arbeitet), laeuft er beliebig lange weiter (auch mehrere
-   Stunden bei sehr grossen OneDrive-Strukturen). Nur wenn STALL_TIMEOUT
-   Sekunden lang GAR KEINE neue Ausgabe mehr kommt (= wirklich haengen
-   geblieben, nicht nur langsam), wird der Prozess abgebrochen.
-   Der aktuelle Fortschritt (letzte Log-Zeile + Zeitstempel) wird
-   laufend in PROGRESS_FILE geschrieben, damit die Web-UI live anzeigen
-   kann woran gerade gearbeitet wird.
-3. Filtert Dateien innerhalb synchronisierter Ordner nach Dateityp/Alter
-   (nur lokale Kopie, nie online). WICHTIG (Bugfix): Ordner die per
-   Konfiguration DEAKTIVIERT sind, werden jetzt tatsaechlich lokal
-   BEREINIGT (Dateien geloescht) statt nur uebersprungen zu werden - das
-   war der eigentliche Grund warum abgewaehlte Scan-Unterordner trotz
-   korrekt funktionierender sync_list weiterhin Dateien lokal vorhielten:
-   es waren Altlasten von einem frueheren, ungefilterten Sync-Lauf, die
-   nie bereinigt wurden weil die alte Logik deaktivierte Ordner einfach
-   ignoriert hat statt sie aufzuraeumen.
+   "/Pfad/*" pro Ordner, praezise pro Unterordner-Ebene). Steigt NICHT in
+   deaktivierte Aeste ohne Unterordner-Overrides hinab. Nutzt
+   requests.Session() fuer Connection-Pooling. Wenn sich die sync_list
+   geaendert hat, wird automatisch --resync mitgegeben.
+2. onedrive --sync --download-only --syncdir /share/onedrive.
+
+   *** SICHERHEITSKRITISCH - NIEMALS AENDERN OHNE AUSDRUECKLICHE
+   BESTAETIGUNG DES NUTZERS ***
+   Zwischenzeitlich lief dieses Add-on OHNE --download-only (echter
+   bidirektionaler Sync). Das fuehrte zu einem ECHTEN DATENVERLUST-
+   VORFALL am 09.07.2026: unser eigener lokaler Cleanup-Schritt (Schritt
+   3, loescht lokale Kopien deaktivierter Ordner) wurde von onedrive als
+   "Nutzer hat das online geloescht" interpretiert und die Loeschung
+   NACH OneDrive hochgeladen - 13 Scan-Ordner wurden dadurch tatsaechlich
+   von OneDrive selbst geloescht (nur durch den OneDrive-Papierkorb
+   rettbar gewesen). --download-only verhindert das strukturell: es
+   werden NIEMALS lokale Aenderungen (auch keine Loeschungen) nach
+   OneDrive hochgeladen, unabhaengig davon was unser eigener Cleanup-
+   Code lokal tut. Echter Upload-Support (neue lokale Dateien zu OneDrive
+   hochladen) ist ein separates, bewusst zu entwerfendes Feature fuer
+   die Zukunft - NICHT einfach durch Entfernen von --download-only
+   nachruestbar, da genau das den Vorfall verursacht hat.
+
+   AKTIVITAETS-UEBERWACHUNG statt festem Zeit-Limit: Jede neue Zeile
+   Ausgabe zaehlt als Lebenszeichen. Nur wenn STALL_TIMEOUT_SECONDS lang
+   GAR NICHTS mehr kommt, wird der Prozess als haengen geblieben
+   betrachtet und abgebrochen. Ansonsten darf der Sync beliebig lange
+   laufen (auch mehrere Stunden bei sehr grossen Strukturen).
+   Der aktuelle Fortschritt wird laufend in PROGRESS_FILE geschrieben.
+3. Filtert Dateien innerhalb synchronisierter Ordner nach Dateityp/Alter,
+   und entfernt komplette lokale Kopien deaktivierter Ordner (Altlasten).
+   Alles NUR lokal - onedrive laeuft im --download-only Modus und laedt
+   diese Loeschungen NIE nach OneDrive hoch.
 4. Schreibt Status in sync_status.json
 """
 
@@ -307,11 +316,12 @@ def write_sync_list(config, all_folders):
 
 def run_onedrive_sync(need_resync):
     """
-    Fuehrt den eigentlichen onedrive Sync durch - echter bidirektionaler
-    Sync: laedt lokale Aenderungen hoch UND OneDrive-Aenderungen runter.
-    --syncdir /share/onedrive: WICHTIG - ohne dieses Flag laedt onedrive
-    standardmaessig nach ~/OneDrive im Container-Dateisystem statt in den
-    persistenten HA-Share-Mount.
+    Fuehrt den eigentlichen onedrive Sync durch.
+
+    *** --download-only ist SICHERHEITSKRITISCH, siehe Modul-Docstring. ***
+    Laedt NUR von OneDrive runter. Lokale Aenderungen (inkl. Loeschungen
+    durch unseren eigenen Cleanup-Schritt) werden NIEMALS nach OneDrive
+    hochgeladen.
 
     AKTIVITAETS-UEBERWACHUNG statt festem Zeit-Limit: Jede neue Zeile
     Ausgabe zaehlt als Lebenszeichen. Nur wenn STALL_TIMEOUT_SECONDS lang
@@ -324,6 +334,7 @@ def run_onedrive_sync(need_resync):
             "--confdir", ONEDRIVE_CONFIG_DIR,
             "--syncdir", SHARE_DIR,
             "--sync",
+            "--download-only",
             "--verbose"
         ]
         if with_resync:
@@ -414,13 +425,10 @@ def get_effective_config(folder_path, config):
 
 def apply_filters_and_cleanup(config):
     """
-    Loescht NUR lokale Kopien (nie online):
+    Loescht NUR lokale Kopien (NIEMALS online - onedrive laeuft im
+    --download-only Modus, die Loeschungen hier werden nicht hochgeladen):
     - Ordner die per Konfiguration DEAKTIVIERT sind: KOMPLETT loeschen
-      (das sind i.d.R. Altlasten von frueheren, ungefilterten Sync-
-      Laeufen oder Reste falls der Ordner erst spaeter deaktiviert
-      wurde - onedrive selbst laedt sie nicht erneut herunter, aber
-      raeumt bereits vorhandene lokale Dateien in ausgeschlossenen
-      Pfaden nicht automatisch auf).
+      (Altlasten von frueheren, ungefilterten Sync-Laeufen).
     - Dateien die nicht zum Filter passen oder zu alt sind: einzeln
       loeschen.
     """
@@ -436,12 +444,12 @@ def apply_filters_and_cleanup(config):
         if not effective["sync"]:
             try:
                 file_count = sum(len(fs) for _, _, fs in os.walk(root))
-                log(f"[CLEANUP] Entferne deaktivierten Ordner komplett: {root} ({file_count} Dateien)")
+                log(f"[CLEANUP] Entferne deaktivierten Ordner komplett (nur lokal): {root} ({file_count} Dateien)")
                 shutil.rmtree(root)
                 files_deleted += file_count
             except FileNotFoundError:
-                pass  # Bereits durch eine uebergeordnete Loeschung entfernt
-            dirs[:] = []  # Nicht weiter in bereits geloeschten Ordner absteigen
+                pass
+            dirs[:] = []
 
     # Schritt 2: Dateityp-/Alters-Filter innerhalb aktivierter Ordner
     for root, dirs, files in os.walk(SHARE_DIR):
@@ -451,7 +459,7 @@ def apply_filters_and_cleanup(config):
 
             effective = get_effective_config(rel_folder, config)
             if not effective["sync"]:
-                continue  # Sollte durch Schritt 1 bereits entfernt sein
+                continue
 
             ext = os.path.splitext(filename)[1].lower()
             files_processed += 1
@@ -463,7 +471,7 @@ def apply_filters_and_cleanup(config):
                 allowed = FILTER_EXTENSIONS.get(filter_type)
 
             if allowed is not None and ext not in allowed:
-                log(f"[FILTER] Removing {filepath} (ext {ext} not in {allowed})")
+                log(f"[FILTER] Removing {filepath} (nur lokal, ext {ext} not in {allowed})")
                 os.remove(filepath)
                 files_deleted += 1
                 continue
@@ -473,7 +481,7 @@ def apply_filters_and_cleanup(config):
             if days is not None:
                 file_age_days = (time.time() - os.path.getmtime(filepath)) / 86400
                 if file_age_days > days:
-                    log(f"[AGE] Removing {filepath} (age {file_age_days:.0f}d > {days}d)")
+                    log(f"[AGE] Removing {filepath} (nur lokal, age {file_age_days:.0f}d > {days}d)")
                     os.remove(filepath)
                     files_deleted += 1
 
