@@ -1,5 +1,4 @@
-"""
-MCP Shopping Products for Home Assistant v1.9.0
+"""MCP Shopping Products for Home Assistant v2.0.0
 
 Two halves:
 1. Ingress web UI (live camera via getUserMedia + zxing-js) - handles the live
@@ -8,96 +7,27 @@ Two halves:
    a placeholder name during scanning, (b) find products missing a barcode
    or picture, (c) build a shopping list from a recipe/message screenshot by
    searching for products by name, and (d) create/edit recipes (including
-   free-text instructions, per-ingredient quantity units, and a dish photo)
-   and push a scaled recipe's ingredients onto Grocy's shopping list.
+   free-text instructions, per-ingredient quantity units) and push a scaled
+   recipe's ingredients onto Grocy's shopping list, and (e) queue recipe
+   image jobs for asynchronous processing via the OneDrive add-on.
 
-Grocy API facts this code relies on (verified against a live Grocy instance
-during development, see conversation history):
-- GET /stock/products/by-barcode/{barcode} returns 200 with product/
-  picture_file_name/stock_amount for a known barcode, or 400 with
-  error_message "No product with barcode ... found" for an unknown one.
-- Product.name has a NOT NULL constraint AND a UNIQUE constraint. An empty
-  string collides after the first use - the barcode string itself is used as
-  a unique placeholder name during scanning instead (see api_create_unknown).
-- query[]=name~<text> (the "~" operator) does a SQL LIKE substring search and
-  returns ALL matches. query[]=name=<text> requires an exact, non-empty value
-  ("Invalid query" if the value is empty) - used for exact-name lookups.
-- Product pictures must be fetched via GET /files/productpictures/{b64name}
-  (this addon has its own isolated /config, no shared filesystem with the
-  Grocy addon) - proxied to the browser via /api/product-picture/{filename}.
-- ProductBarcode is a separate object from Product (POST /objects/product_barcodes) -
-  a product can exist validly with zero linked barcodes and/or no picture.
-- POST /stock/shoppinglist/add-product requires a product_id (not free text);
-  confirmed live (204, entry verified via GET /objects/shopping_list) that it
-  adds/increments an item on the given (or default, list_id=1) shopping list.
-- Recipes: entity names are "recipes" and "recipes_pos". POST /objects/recipes
-  only strictly needs "name" (base_servings/desired_servings default to 1).
-  The "description" field is a RICH-TEXT/HTML field (Grocy's recipe editor is
-  a WYSIWYG editor with bold/underline/list buttons, confirmed from a
-  screenshot of the actual edit page) - it is NOT plain text. Sending plain
-  text containing "\\n" characters gets stored verbatim, but HTML collapses
-  ordinary whitespace/newlines when rendering, so every line runs together
-  into one unbroken paragraph in Grocy's UI (confirmed live: this exact
-  problem was reported and reproduced by fetching the stored description and
-  seeing literal "\\n" characters in it). Fix: create_or_update_recipe now
-  runs description through text_to_html(), which converts blank-line-
-  separated blocks into separate <p> paragraphs and single newlines within a
-  block into <br> tags, before sending it to Grocy.
-  POST /objects/recipes_pos only strictly needs recipe_id/product_id/amount,
-  but ALSO accepts an optional qu_id (column added in migration 0034) to
-  record which quantity unit (g, ml, tsp, piece, pinch, ...) the amount is
-  measured in. Without qu_id, Grocy silently falls back to the product's own
-  default stock unit, which is wrong whenever a recipe's ingredient unit
-  differs from that product's usual stock unit (e.g. "Butter" tracked in
-  "Stück" in stock but needed in "Gramm" for a recipe) - fixed by adding
-  qu_id support to add_recipe_ingredient/update_recipe_ingredient plus a
-  search_quantity_units/create_quantity_unit tool pair.
-- Deleting a recipe does NOT cascade-delete its recipes_pos rows (confirmed
-  live: an orphaned recipes_pos row with a dangling recipe_id remained after
-  DELETE /objects/recipes/{id} and had to be removed separately).
-- add_recipe_to_shopping_list intentionally does NOT use Grocy's stock-
-  fulfillment-based add-not-fulfilled-products-to-shoppinglist endpoint (used
-  in an earlier version) - the user explicitly said the "only order the
-  deficit versus current stock" behavior is not wanted for now. Instead it
-  reads recipes_pos directly and adds amount*multiplier for every ingredient
-  unconditionally.
-- Recipe pictures: the /files/{group}/{fileName} endpoint's "group" path
-  parameter accepts "recipepictures" as a valid FileGroups enum value
-  (confirmed against the OpenAPI schema and live). Since Claude has no direct
-  byte-level access to images the user pastes into chat, set_recipe_picture
-  takes a base64-encoded string parameter instead of a file upload - Claude
-  reads the user-uploaded image from its own sandbox, base64-encodes it
-  there, and passes that string as a tool argument.
-- Grocy's file PUT does NOT overwrite an existing file at the same path - it
-  returns 400 "Error while creating file ..." if one already exists there.
-  Fixed in set_recipe_picture by issuing a DELETE for that path first
-  (best-effort, response ignored) before the PUT.
-
-Why the ingress page uses getUserMedia+zxing-js instead of <input capture>:
-a file-input's capture attribute did not open the camera when this page was
-opened inside the Home Assistant Companion App's ingress webview (confirmed
-by the user testing on-device), while Grocy's own getUserMedia-based scanner,
-running in the very same webview/ingress context, did open the camera.
-
-Routing fix (v1.3.1): mcp.streamable_http_app() already serves its own single
-route internally at exactly "/mcp". Mounting that whole app under ANOTHER
-"/mcp" prefix via Starlette's app.mount() made the endpoint unreachable (307
-to /mcp/, then 404). Fixed by merging mcp_app's routes directly into this
-file's own Starlette app and passing through its lifespan.
-
-Image return fix (v1.3.2): a dict with an Image instance as one of its values
-does NOT produce a viewable image for the MCP client - confirmed live, the
-client received the literal Python repr string instead of a picture. Root
-cause (mcp/server/fastmcp/utilities/func_metadata.py, _convert_to_content):
-FastMCP only special-cases a tool's return value when it IS an Image
-instance directly, or a list/tuple whose items are converted recursively.
-Fix: return [info_dict, Image(...)] as a list instead of nesting the Image
-inside the dict.
+v2.0.0 changes:
+- Added queue_recipe_image_job MCP tool: Claude queues a job {type, grocy_id,
+  bildname} into /data/image_jobs.json. A background worker runs hourly,
+  fetches the image from OneDrive via /api/photo, uploads it to Grocy, and
+  removes the completed job. On failure the job stays in the queue for retry.
+- set_recipe_picture is no longer exposed as an MCP tool (was too slow due to
+  base64 token output). It is used internally by the worker only.
+- Added /share mount so the worker can read /share/onedrive_downloads/.
 """
 
+import asyncio
 import base64
 import html
+import json
 import os
+import threading
+import time
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -114,6 +44,50 @@ GROCY_BASE = f"http://{GROCY_HOST}/api"
 LOCATION_ID = int(os.environ.get("GROCY_LOCATION_ID", "2"))
 QU_PURCHASE = int(os.environ.get("GROCY_QU_PURCHASE", "2"))
 QU_STOCK = int(os.environ.get("GROCY_QU_STOCK", "2"))
+
+# OneDrive SyncServer läuft auf Port 8772 (Ingress-only).
+# Der /api/photo Endpunkt nimmt nur den Dateinamen, der Pfad
+# "Bilder/Eigene Aufnahmen" ist im OneDrive Add-on fest hinterlegt.
+ONEDRIVE_PHOTO_URL = "http://57f327aa-onedrive-syncserver:8772/api/photo"
+
+IMAGE_JOBS_FILE = "/data/image_jobs.json"
+DOWNLOAD_DIR = "/share/onedrive_downloads"
+
+WORKER_INTERVAL_SECONDS = 3600  # 1 Stunde
+
+
+# ── Job Queue helpers ─────────────────────────────────────────────────────────
+
+def load_jobs() -> list:
+    if not os.path.exists(IMAGE_JOBS_FILE):
+        return []
+    try:
+            with open(IMAGE_JOBS_FILE) as f:
+                return json.load(f)
+    except Exception:
+        return []
+
+
+def save_jobs(jobs: list):
+    os.makedirs("/data", exist_ok=True)
+    with open(IMAGE_JOBS_FILE, "w") as f:
+        json.dump(jobs, f, indent=2)
+
+
+def add_job(job: dict):
+    jobs = load_jobs()
+    jobs.append(job)
+    save_jobs(jobs)
+
+
+def remove_job(job_id: str):
+    jobs = load_jobs()
+    jobs = [j for j in jobs if j.get("id") != job_id]
+    save_jobs(jobs)
+
+
+def make_job_id() -> str:
+    return f"job_{int(time.time() * 1000)}"
 
 
 # ── Grocy HTTP helpers ────────────────────────────────────────────────────────
@@ -144,10 +118,7 @@ async def fetch_product_image(client: httpx.AsyncClient, picture_file_name: str)
 
 def text_to_html(text: str) -> str:
     """Convert plain text with blank-line-separated paragraphs and single
-    newlines within a paragraph into HTML - needed because Grocy's recipe
-    description field is a rich-text/HTML field, not plain text, and
-    ordinary "\\n" characters get stored verbatim but collapsed away when
-    rendered as HTML (confirmed live - see module docstring)."""
+    newlines within a paragraph into HTML."""
     if not text:
         return text
     paragraphs = text.split("\n\n")
@@ -156,6 +127,130 @@ def text_to_html(text: str) -> str:
         escaped = html.escape(para).replace("\n", "<br>")
         html_paragraphs.append(f"<p>{escaped}</p>")
     return "".join(html_paragraphs)
+
+
+# ── Worker: stündlicher Hintergrund-Job für Bildverarbeitung ──────────────────
+
+async def _upload_recipe_picture(grocy_id: int, image_bytes: bytes, extension: str = "jpg") -> bool:
+    """Lädt Bild intern zu Grocy hoch (früher set_recipe_picture MCP Tool)."""
+    filename = f"recipe_{grocy_id}.{extension}"
+    fname_b64 = base64.b64encode(filename.encode()).decode()
+    async with httpx.AsyncClient(timeout=30) as client:
+        await client.delete(f"{GROCY_BASE}/files/recipepictures/{fname_b64}")
+        upr = await grocy_put(
+            client,
+            f"/files/recipepictures/{fname_b64}",
+            content=image_bytes,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        if upr.status_code not in (200, 204):
+            print(f"[Worker] Bild-Upload fehlgeschlagen: {upr.status_code} {upr.text}")
+            return False
+        ur = await grocy_put(
+            client,
+            f"/objects/recipes/{grocy_id}",
+            json_body={"picture_file_name": filename},
+        )
+        if ur.status_code not in (200, 204):
+            print(f"[Worker] picture_file_name setzen fehlgeschlagen: {ur.status_code} {ur.text}")
+            return False
+    return True
+
+
+async def process_job(job: dict) -> bool:
+    """Verarbeitet einen einzelnen Job. Gibt True zurück wenn erfolgreich."""
+    job_type = job.get("type")
+    grocy_id = job.get("grocy_id")
+    bildname = job.get("bildname")
+
+    if not grocy_id or not bildname:
+        print(f"[Worker] Ungültiger Job (fehlende Felder): {job}")
+        return False
+
+    local_path = os.path.join(DOWNLOAD_DIR, bildname)
+
+    if not os.path.exists(local_path):
+        print(f"[Worker] Hole Bild von OneDrive: {bildname}")
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(
+                    ONEDRIVE_PHOTO_URL,
+                    json={"filename": bildname},
+                )
+            if not r.is_success:
+                print(f"[Worker] OneDrive /api/photo Fehler: {r.status_code} {r.text}")
+                return False
+            result = r.json()
+            if not result.get("success"):
+                print(f"[Worker] OneDrive Download fehlgeschlagen: {result.get('error')}")
+                return False
+        except Exception as e:
+            print(f"[Worker] OneDrive Verbindungsfehler: {e}")
+            return False
+
+    if not os.path.exists(local_path):
+        print(f"[Worker] Datei nach Download nicht gefunden: {local_path}")
+        return False
+
+    ext = os.path.splitext(bildname)[1].lstrip(".").lower() or "jpg"
+
+    with open(local_path, "rb") as f:
+        image_bytes = f.read()
+
+    print(f"[Worker] Lade Bild zu Grocy hoch: {job_type} id={grocy_id}")
+
+    if job_type == "rezept":
+        success = await _upload_recipe_picture(grocy_id, image_bytes, ext)
+    else:
+        print(f"[Worker] Unbekannter Job-Typ: {job_type}")
+        return False
+
+    if success:
+        print(f"[Worker] Job erfolgreich: {job_type} id={grocy_id} bild={bildname}")
+    return success
+
+
+async def run_worker_cycle():
+    """Läuft einmal durch alle offenen Jobs."""
+    jobs = load_jobs()
+    if not jobs:
+        return
+
+    print(f"[Worker] {len(jobs)} Job(s) in der Queue")
+    completed_ids = []
+
+    for job in jobs:
+        job_id = job.get("id", "unknown")
+        try:
+            success = await process_job(job)
+            if success:
+                completed_ids.append(job_id)
+            else:
+                print(f"[Worker] Job {job_id} fehlgeschlagen, bleibt in Queue")
+        except Exception as e:
+            print(f"[Worker] Unerwarteter Fehler bei Job {job_id}: {e}")
+
+    for job_id in completed_ids:
+        remove_job(job_id)
+
+    if completed_ids:
+        print(f"[Worker] {len(completed_ids)} Job(s) abgeschlossen")
+
+
+def start_background_worker():
+    """Startet den Worker in einem Daemon-Thread."""
+    def worker_loop():
+        time.sleep(60)  # Erster Durchlauf nach 60s
+        while True:
+            try:
+                asyncio.run(run_worker_cycle())
+            except Exception as e:
+                print(f"[Worker] Fehler im Worker-Cycle: {e}")
+            time.sleep(WORKER_INTERVAL_SECONDS)
+
+    t = threading.Thread(target=worker_loop, daemon=True)
+    t.start()
+    print("[Worker] Hintergrund-Worker gestartet (Intervall: 1h)")
 
 
 # ── MCP tools ─────────────────────────────────────────────────────────────────
@@ -174,43 +269,69 @@ mcp = FastMCP(
         "product with just a name (no barcode, no picture) when "
         "search_products found no suitable match. add_to_shopping_list adds a "
         "product_id to Grocy's shopping list by amount.\n\n"
-        "Recipes: create_or_update_recipe upserts a recipe by its exact name "
-        "(name, description - plain text with blank lines between paragraphs "
-        "and single newlines for line breaks, e.g. numbered steps each on "
-        "their own line - this gets converted to HTML automatically since "
-        "Grocy's description field is rich-text, not plain text; and "
-        "base_servings, the serving count all ingredient amounts are defined "
-        "for). search_recipes finds a recipe by name. get_recipe_ingredients "
-        "lists a recipe's ingredients including their quantity unit. "
-        "search_quantity_units/create_quantity_unit look up or create units "
-        "like Gramm/Teelöffel/Prise - always pass the correct qu_id to "
-        "add_recipe_ingredient/update_recipe_ingredient, since omitting it "
-        "silently defaults to the product's own stock unit which is usually "
-        "wrong for a recipe (e.g. Butter tracked in Stück in stock but "
-        "needed in Gramm for a recipe). "
+        "Recipes: create_or_update_recipe upserts a recipe by its exact name. "
+        "After creating a recipe, use queue_recipe_image_job to schedule the "
+        "recipe photo upload - pass the filename of the image the user sent "
+        "(visible in the chat upload), and the worker will fetch it from "
+        "OneDrive and attach it to the recipe automatically within the hour. "
+        "search_recipes finds a recipe by name. get_recipe_ingredients lists "
+        "a recipe's ingredients including their quantity unit. "
+        "search_quantity_units/create_quantity_unit look up or create units. "
         "add_recipe_ingredient/update_recipe_ingredient/remove_recipe_ingredient "
-        "manage individual ingredients. add_recipe_to_shopping_list takes "
-        "every ingredient's amount times a multiplier and adds it to the "
-        "shopping list directly - it does NOT check current stock or "
-        "existing shopping list amounts, it always adds the full scaled "
-        "quantity (and does not currently convert units - the shopping list "
-        "amount will be in the ingredient's recipe unit). set_recipe_picture "
-        "attaches a dish photo to a recipe (pass the image as a base64 "
-        "string, read from Claude's own sandbox) and overwrites any existing "
-        "one; get_recipe_picture retrieves it again."
+        "manage individual ingredients. add_recipe_to_shopping_list adds all "
+        "ingredients to the shopping list scaled by a multiplier."
     ),
 )
 mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
 @mcp.tool()
+async def queue_recipe_image_job(recipe_id: int, bildname: str) -> dict:
+    """Queue an asynchronous job to fetch a recipe photo from OneDrive and
+    attach it to the recipe in Grocy. The worker runs hourly and retries
+    failed jobs automatically.
+
+    Args:
+        recipe_id: The Grocy recipe ID (from create_or_update_recipe).
+        bildname: The filename of the photo as uploaded to OneDrive
+                  (e.g. 'IMG_20260709_123456.jpg'). The OneDrive add-on
+                  always looks in 'Bilder/Eigene Aufnahmen' - only the
+                  filename is needed here, not the full path.
+
+    Returns {"success": true, "job_id", "message"} on success.
+    The worker will pick this up within the next hour."""
+    if not bildname or not recipe_id:
+        return {"success": False, "error": "recipe_id und bildname sind Pflichtfelder"}
+
+    job = {
+        "id": make_job_id(),
+        "type": "rezept",
+        "grocy_id": recipe_id,
+        "bildname": bildname,
+        "queued_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    add_job(job)
+    print(f"[Queue] Neuer Job: {job}")
+    return {
+        "success": True,
+        "job_id": job["id"],
+        "message": f"Job in Queue: Bild '{bildname}' wird innerhalb der nächsten Stunde für Rezept {recipe_id} hinterlegt.",
+    }
+
+
+@mcp.tool()
+async def list_image_jobs() -> dict:
+    """List all pending image jobs in the queue. Useful to check whether
+    a previously queued recipe image has already been processed."""
+    jobs = load_jobs()
+    return {"job_count": len(jobs), "jobs": jobs}
+
+
+@mcp.tool()
 async def get_next_unnamed_product() -> list:
     """Return the next Grocy product that still has its barcode as a placeholder
     name (real name not filled in yet), along with its barcode and product
-    photo. Returns just {"found": false} when none are left.
-    A product still needs naming if its name exactly matches one of its own
-    linked barcodes - this is checked in Python since Grocy's query[] filter
-    does not support this kind of comparison."""
+    photo. Returns just {"found": false} when none are left."""
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_get(client, "/objects/products")
         if pr.status_code != 200:
@@ -233,7 +354,6 @@ async def get_next_unnamed_product() -> list:
         product = candidates[0]
         product_id = product["id"]
         barcode = product["name"]
-
         info = {"found": True, "product_id": product_id, "barcode": barcode}
 
         picture_file_name = product.get("picture_file_name")
@@ -250,11 +370,7 @@ async def get_next_unnamed_product() -> list:
 
 @mcp.tool()
 async def get_next_product_without_barcode() -> list:
-    """Return the next Grocy product that has no barcode linked to it at all
-    (checked by cross-referencing every product id against the full
-    product_barcodes list - not the same case as get_next_unnamed_product,
-    which is about products that DO have a barcode but it's being used as a
-    placeholder name). Returns just {"found": false} when none are left."""
+    """Return the next Grocy product that has no barcode linked to it at all."""
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_get(client, "/objects/products")
         if pr.status_code != 200:
@@ -284,11 +400,7 @@ async def get_next_product_without_barcode() -> list:
 
 @mcp.tool()
 async def get_next_product_without_picture() -> dict:
-    """Return the next Grocy product that has no picture_file_name set at all
-    (regardless of whether it has a real name or a barcode-as-placeholder
-    name). Returns {"found": false, "product_id", "name", "barcode"} - there is
-    no image to return here by definition, since this tool exists to find
-    products that are missing one."""
+    """Return the next Grocy product that has no picture_file_name set at all."""
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_get(client, "/objects/products")
         if pr.status_code != 200:
@@ -319,10 +431,7 @@ async def get_next_product_without_picture() -> dict:
 
 @mcp.tool()
 async def update_product(product_id: int, name: str, description: str = "", product_group_id: int | None = None) -> dict:
-    """Update a Grocy product's name and optionally description/product group,
-    after reviewing its photo. Args: product_id, name (required, non-empty,
-    must not equal the product's barcode - Grocy names must be unique),
-    description (optional free text), product_group_id (optional category id)."""
+    """Update a Grocy product's name and optionally description/product group."""
     body = {"name": name, "description": description}
     if product_group_id is not None:
         body["product_group_id"] = product_group_id
@@ -335,8 +444,7 @@ async def update_product(product_id: int, name: str, description: str = "", prod
 
 @mcp.tool()
 async def add_product_barcode(product_id: int, barcode: str) -> dict:
-    """Link a barcode to an existing Grocy product that currently has none.
-    Args: product_id, barcode (the EAN/UPC string to link)."""
+    """Link a barcode to an existing Grocy product that currently has none."""
     async with httpx.AsyncClient(timeout=15) as client:
         r = await grocy_post(client, "/objects/product_barcodes", {"product_id": product_id, "barcode": barcode})
         if r.status_code != 200:
@@ -346,14 +454,7 @@ async def add_product_barcode(product_id: int, barcode: str) -> dict:
 
 @mcp.tool()
 async def search_products(query: str) -> dict:
-    """Broad substring search for Grocy products by name (SQL LIKE, e.g.
-    'Mehl' returns every product whose name contains 'Mehl' - Vollkornmehl,
-    Weizenmehl Type 405, etc. all at once). Returns {"results": [{"product_id",
-    "name"}, ...]}. Caller must pick the correct product_id from the list
-    based on context (e.g. the user asking specifically for '405') - this
-    tool does not attempt to disambiguate itself, and if the distinguishing
-    detail isn't actually part of the stored name, it cannot be told apart
-    from the returned data alone."""
+    """Broad substring search for Grocy products by name."""
     async with httpx.AsyncClient(timeout=15) as client:
         r = await grocy_get(client, "/objects/products", params={"query[]": f"name~{query}"})
         if r.status_code != 200:
@@ -364,10 +465,7 @@ async def search_products(query: str) -> dict:
 
 @mcp.tool()
 async def create_product_simple(name: str) -> dict:
-    """Create a new Grocy product with just a name - no barcode, no picture.
-    Use this when search_products found no suitable existing match for an
-    item from a shopping list/recipe. Uses this addon's configured default
-    location_id/qu_id_purchase/qu_id_stock."""
+    """Create a new Grocy product with just a name - no barcode, no picture."""
     async with httpx.AsyncClient(timeout=15) as client:
         r = await grocy_post(client, "/objects/products", {
             "name": name,
@@ -382,11 +480,7 @@ async def create_product_simple(name: str) -> dict:
 
 @mcp.tool()
 async def add_to_shopping_list(product_id: int, amount: float = 1, note: str = "") -> dict:
-    """Add a product to Grocy's default shopping list (list_id=1). If the
-    product is already on the list, Grocy increases the existing amount
-    rather than duplicating the entry (this is Grocy's own behavior, not
-    something this tool checks for). Args: product_id, amount (default 1),
-    note (optional)."""
+    """Add a product to Grocy's default shopping list (list_id=1)."""
     async with httpx.AsyncClient(timeout=15) as client:
         body = {"product_id": product_id, "product_amount": amount}
         if note:
@@ -404,10 +498,7 @@ async def add_to_shopping_list(product_id: int, amount: float = 1, note: str = "
 
 @mcp.tool()
 async def search_quantity_units(query: str = "") -> dict:
-    """Look up Grocy quantity units by name (substring search; pass an empty
-    query to list all of them). Returns {"results": [{"qu_id", "name"}, ...]}.
-    Use this before add_recipe_ingredient to find the correct qu_id for a
-    unit like Gramm/ml/Teelöffel/Stück/Prise/Päckchen."""
+    """Look up Grocy quantity units by name (substring search; pass empty to list all)."""
     async with httpx.AsyncClient(timeout=15) as client:
         params = {"query[]": f"name~{query}"} if query else None
         r = await grocy_get(client, "/objects/quantity_units", params=params)
@@ -419,8 +510,7 @@ async def search_quantity_units(query: str = "") -> dict:
 
 @mcp.tool()
 async def create_quantity_unit(name: str, name_plural: str = "") -> dict:
-    """Create a new Grocy quantity unit (e.g. 'Gramm', 'Teelöffel', 'Prise').
-    Args: name, name_plural (defaults to name if not given)."""
+    """Create a new Grocy quantity unit (e.g. 'Gramm', 'Teelöffel', 'Prise')."""
     async with httpx.AsyncClient(timeout=15) as client:
         r = await grocy_post(client, "/objects/quantity_units", {
             "name": name,
@@ -434,15 +524,9 @@ async def create_quantity_unit(name: str, name_plural: str = "") -> dict:
 @mcp.tool()
 async def create_or_update_recipe(name: str, description: str = "", base_servings: float = 1) -> dict:
     """Create a new recipe, or update an existing one if a recipe with this
-    EXACT name already exists (matched via an exact, case-sensitive name
-    lookup). Args: name (required - used as the lookup key), description
-    (plain text - write it with blank lines between paragraphs and a single
-    newline per line break, e.g. numbered steps each on their own line; this
-    is automatically converted to HTML before saving, since Grocy's
-    description field is rich-text/HTML and does not respect plain
-    newlines), base_servings (default 1 - the serving count all ingredient
-    amounts are defined for). Returns {"success", "recipe_id",
-    "created": true|false}."""
+    EXACT name already exists. Description is plain text (converted to HTML
+    automatically). After creating a recipe, call queue_recipe_image_job to
+    schedule the photo upload."""
     html_description = text_to_html(description)
     async with httpx.AsyncClient(timeout=15) as client:
         existing = await grocy_get(client, "/objects/recipes", params={"query[]": f"name={name}"})
@@ -468,8 +552,7 @@ async def create_or_update_recipe(name: str, description: str = "", base_serving
 
 @mcp.tool()
 async def search_recipes(query: str) -> dict:
-    """Broad substring search for Grocy recipes by name. Returns
-    {"results": [{"recipe_id", "name", "base_servings", "description"}, ...]}."""
+    """Broad substring search for Grocy recipes by name."""
     async with httpx.AsyncClient(timeout=15) as client:
         r = await grocy_get(client, "/objects/recipes", params={"query[]": f"name~{query}"})
         if r.status_code != 200:
@@ -488,11 +571,7 @@ async def search_recipes(query: str) -> dict:
 
 @mcp.tool()
 async def get_recipe_ingredients(recipe_id: int) -> dict:
-    """List all ingredients of a recipe. Returns {"results": [{"recipe_pos_id",
-    "product_id", "product_name", "amount", "qu_id", "unit_name"}, ...]} where
-    amount is defined for the recipe's base_servings, and unit_name is null
-    if no qu_id was set on that ingredient (meaning Grocy falls back to the
-    product's own default stock unit)."""
+    """List all ingredients of a recipe with quantity units."""
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_get(client, "/objects/recipes_pos", params={"query[]": f"recipe_id={recipe_id}"})
         if pr.status_code != 200:
@@ -526,15 +605,7 @@ async def get_recipe_ingredients(recipe_id: int) -> dict:
 
 @mcp.tool()
 async def add_recipe_ingredient(recipe_id: int, product_id: int, amount: float, qu_id: int | None = None) -> dict:
-    """Add one ingredient to a recipe. Args: recipe_id, product_id, amount
-    (the quantity of this product needed for the recipe's base_servings -
-    e.g. if base_servings=4 and the recipe needs 200g flour for 4 servings,
-    amount=200, not a per-serving amount), qu_id (the quantity unit id from
-    search_quantity_units/create_quantity_unit - e.g. Gramm for flour,
-    Teelöffel for cocoa powder. STRONGLY RECOMMENDED to always set this: if
-    omitted, Grocy silently uses the product's own default stock unit, which
-    is very often wrong for a recipe amount - e.g. a product tracked in
-    'Stück' in stock but needed in 'Gramm' for this recipe)."""
+    """Add one ingredient to a recipe."""
     async with httpx.AsyncClient(timeout=15) as client:
         body = {
             "recipe_id": recipe_id,
@@ -551,10 +622,7 @@ async def add_recipe_ingredient(recipe_id: int, product_id: int, amount: float, 
 
 @mcp.tool()
 async def update_recipe_ingredient(recipe_pos_id: int, amount: float, qu_id: int | None = None) -> dict:
-    """Change the amount (and optionally the quantity unit) of an existing
-    recipe ingredient. Args: recipe_pos_id (from get_recipe_ingredients),
-    amount (new quantity, at the recipe's base_servings), qu_id (optional -
-    only changes the unit if given)."""
+    """Change the amount (and optionally the quantity unit) of an existing recipe ingredient."""
     body = {"amount": amount}
     if qu_id is not None:
         body["qu_id"] = qu_id
@@ -567,8 +635,7 @@ async def update_recipe_ingredient(recipe_pos_id: int, amount: float, qu_id: int
 
 @mcp.tool()
 async def remove_recipe_ingredient(recipe_pos_id: int) -> dict:
-    """Remove an ingredient from a recipe. Args: recipe_pos_id (from
-    get_recipe_ingredients)."""
+    """Remove an ingredient from a recipe."""
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.delete(f"{GROCY_BASE}/objects/recipes_pos/{recipe_pos_id}")
         if r.status_code not in (200, 204):
@@ -578,16 +645,7 @@ async def remove_recipe_ingredient(recipe_pos_id: int) -> dict:
 
 @mcp.tool()
 async def add_recipe_to_shopping_list(recipe_id: int, multiplier: float = 1) -> dict:
-    """Add every ingredient of a recipe to Grocy's shopping list, each scaled
-    by multiplier (e.g. multiplier=1.5 doubles-and-a-half every ingredient
-    amount). This adds the full scaled amount unconditionally - it does NOT
-    check current stock or existing shopping list amounts and subtract them
-    first (that stock-fulfillment behavior was intentionally removed per the
-    user's request). Note: this does not convert units - the shopping list
-    entry gets the recipe ingredient's amount as-is, in whatever unit that
-    ingredient's qu_id is (or the product's default stock unit if none was
-    set). Returns {"success", "added": [{"product_id", "product_name",
-    "amount"}, ...]}."""
+    """Add every ingredient of a recipe to Grocy's shopping list, scaled by multiplier."""
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_get(client, "/objects/recipes_pos", params={"query[]": f"recipe_id={recipe_id}"})
         if pr.status_code != 200:
@@ -618,56 +676,7 @@ async def add_recipe_to_shopping_list(recipe_id: int, multiplier: float = 1) -> 
         return {"success": True, "added": added}
 
 
-@mcp.tool()
-async def set_recipe_picture(recipe_id: int, image_base64: str, extension: str = "jpg") -> dict:
-    """Attach a dish photo to a recipe. Args: recipe_id, image_base64 (the
-    image's bytes, base64-encoded as a string - Claude reads the image from
-    its own sandbox and encodes it before calling this), extension (file
-    extension without dot, default 'jpg'). Overwrites any existing picture on
-    this recipe."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            image_bytes = base64.b64decode(image_base64)
-        except Exception as e:
-            return {"success": False, "error": f"Invalid base64: {e}"}
-
-        filename = f"recipe_{recipe_id}.{extension}"
-        fname_b64 = base64.b64encode(filename.encode()).decode()
-        # Delete any existing file at this path first - Grocy's file PUT does
-        # not overwrite, it errors "Error while creating file ..." if a file
-        # already exists there (confirmed live: re-uploading a picture to the
-        # same recipe_id failed with this error until this delete was added).
-        await client.delete(f"{GROCY_BASE}/files/recipepictures/{fname_b64}")
-        upr = await grocy_put(client, f"/files/recipepictures/{fname_b64}", content=image_bytes, headers={"Content-Type": "application/octet-stream"})
-        if upr.status_code not in (200, 204):
-            return {"success": False, "error": f"Upload fehlgeschlagen: Grocy returned {upr.status_code}: {upr.text}"}
-
-        ur = await grocy_put(client, f"/objects/recipes/{recipe_id}", json_body={"picture_file_name": filename})
-        if ur.status_code not in (200, 204):
-            return {"success": False, "error": f"Grocy returned {ur.status_code}: {ur.text}"}
-
-        return {"success": True, "recipe_id": recipe_id, "picture_file_name": filename}
-
-
-@mcp.tool()
-async def get_recipe_picture(recipe_id: int) -> list:
-    """Retrieve a recipe's dish photo, if one is set. Returns just
-    {"found": false} if the recipe has no picture_file_name set."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        rr = await grocy_get(client, f"/objects/recipes/{recipe_id}")
-        if rr.status_code != 200:
-            return [{"found": False, "error": f"Grocy returned {rr.status_code}: {rr.text}"}]
-        picture_file_name = rr.json().get("picture_file_name")
-        if not picture_file_name:
-            return [{"found": False}]
-
-        image = await fetch_image(client, "recipepictures", picture_file_name)
-        if not image:
-            return [{"found": False, "error": "Could not fetch picture"}]
-        return [{"found": True, "recipe_id": recipe_id}, image]
-
-
-# ── Ingress web UI (scan workflow, no Claude involved) ───────────────────────
+# ── Ingress web UI ─────────────────────────────────────────────────────────────
 
 async def index(request: Request):
     with open("/static/index.html") as f:
@@ -675,9 +684,6 @@ async def index(request: Request):
 
 
 async def api_check_barcode(request: Request):
-    """Body: JSON {barcode}. Read-only check against Grocy, books nothing.
-    Returns {found: true, name, picture_file_name, stock_amount} or
-    {found: false}."""
     data = await request.json()
     barcode = data.get("barcode")
     if not barcode:
@@ -703,8 +709,6 @@ async def api_check_barcode(request: Request):
 
 
 async def api_product_picture(request: Request):
-    """Proxies a product picture from Grocy to the browser (the browser
-    cannot reach Grocy's internal hostname directly)."""
     filename = request.path_params["filename"]
     fname_b64 = base64.b64encode(filename.encode()).decode()
     async with httpx.AsyncClient(timeout=15) as client:
@@ -715,10 +719,6 @@ async def api_product_picture(request: Request):
 
 
 async def api_book(request: Request):
-    """Body: JSON {barcode, amount, action}. Books directly - the frontend
-    only calls this once a barcode is already confirmed known (either it was
-    found by api_check_barcode, or it was just created by api_create_unknown).
-    Returns status: ok | error."""
     data = await request.json()
     barcode = data.get("barcode")
     amount = data.get("amount", "1")
@@ -737,19 +737,11 @@ async def api_book(request: Request):
 
 
 async def api_create_unknown(request: Request):
-    """Body: multipart form with 'photo' (product front photo, a single
-    explicit capture, not a continuous stream) and 'barcode'.
-    Reuses an existing product with name==barcode if one already exists
-    (e.g. left over from a previously interrupted run), otherwise creates a
-    new one using the barcode itself as a (unique, valid) placeholder name.
-    Ensures the barcode is linked and uploads the picture. Does NOT book any
-    stock - the frontend calls /api/book separately afterwards."""
     form = await request.form()
     photo = await form["photo"].read()
     barcode = form["barcode"]
 
     async with httpx.AsyncClient(timeout=15) as client:
-        # Reuse an existing product with this exact placeholder name if present.
         existing = await grocy_get(client, "/objects/products", params={"query[]": f"name={barcode}"})
         product_id = None
         if existing.status_code == 200 and existing.json():
@@ -765,7 +757,6 @@ async def api_create_unknown(request: Request):
                 return JSONResponse({"status": "error", "message": f"Produkt anlegen fehlgeschlagen: {pr.text}"})
             product_id = pr.json()["created_object_id"]
 
-        # Link the barcode only if not already linked to this product.
         existing_barcodes = await grocy_get(client, "/objects/product_barcodes", params={"query[]": f"product_id={product_id}"})
         already_linked = existing_barcodes.status_code == 200 and any(
             b["barcode"] == barcode for b in existing_barcodes.json()
@@ -786,10 +777,7 @@ async def api_create_unknown(request: Request):
         return JSONResponse({"status": "ok", "product_id": product_id})
 
 
-# ── App assembly ──────────────────────────────────────────────────────────────
-# mcp_app's own route ("/mcp") is merged directly into this app's route list
-# (not nested via Mount). Its lifespan is passed through so FastMCP's session
-# manager actually starts.
+# ── App assembly ───────────────────────────────────────────────────────────────
 
 mcp_app = mcp.streamable_http_app()
 
@@ -805,4 +793,5 @@ app = Starlette(
 )
 
 if __name__ == "__main__":
+    start_background_worker()
     uvicorn.run(app, host="0.0.0.0", port=8770)
