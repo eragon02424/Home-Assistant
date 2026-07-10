@@ -1,13 +1,14 @@
-"""MCP Shopping Products for Home Assistant v3.5.0
+"""MCP Shopping Products for Home Assistant v3.6.0
 
-v3.5.0 changes:
-- needs_user_decision=true no longer blocks the worker.
-  The flag is now purely informational (signals Claude to notify the user).
-  The worker still retries the job every minute - the file may have been
-  uploaded to OneDrive in the meantime.
-  Only dismiss_failed_image_job() actually removes a job from the queue.
-- Counter continues to increment past MAX_IMAGE_ATTEMPTS so Claude can
-  see how many total attempts have been made.
+v3.6.0 changes:
+- New MCP tool: upload_recipe_picture_base64(recipe_id, image_base64, ext)
+  Uploads a recipe picture directly via base64, completely bypassing the
+  OneDrive filename-matching workflow. Use this when the user shares an
+  image directly with Claude - avoids the "what's the OneDrive filename"
+  friction entirely. Slower (base64 output is token-bound, ~few minutes
+  for a compressed image) but always works without extra coordination.
+
+v3.5.0: needs_user_decision is informational only, worker always retries
 
 v3.4.0: image worker iterates through all active jobs until one succeeds
 v3.3.0: merge_products tool, auto-merge on UNIQUE name conflict
@@ -489,6 +490,8 @@ mcp = FastMCP(
         "  When you see needs_user_decision=true: inform the user of the error and\n"
         "  the bildname, so they can upload the file to OneDrive.\n"
         "  dismiss_failed_image_job(job_id) only removes a job if user explicitly asks.\n\n"
+        "RECIPE PICTURES: prefer upload_recipe_picture_base64() when the user shares\n"
+        "  an image directly with Claude - bypasses OneDrive entirely.\n\n"
         "HELPERS: list_locations(), list_product_groups(), search_quantity_units()"
     ),
 )
@@ -514,6 +517,31 @@ async def merge_products(product_id_to_remove: int, product_id_to_keep: int) -> 
     save_search_terms(terms)
     print(f"[Merge] {product_id_to_remove} -> {product_id_to_keep} erfolgreich")
     return {"success": True, "merged_into": product_id_to_keep, "removed": product_id_to_remove}
+
+
+@mcp.tool()
+async def upload_recipe_picture_base64(recipe_id: int, image_base64: str, ext: str = "jpg") -> dict:
+    """Upload a recipe picture directly via base64, bypassing OneDrive entirely.
+    Use this when the OneDrive filename workflow is too cumbersome (e.g. Claude
+    was given the image directly by the user). Claude should resize/compress
+    the image before base64-encoding to keep upload size reasonable - this
+    call is token-cost bound (large base64 strings are slow to send).
+
+    Args:
+        recipe_id: Grocy recipe ID to attach the picture to.
+        image_base64: Raw base64-encoded image data (no data: URI prefix).
+        ext: File extension, default jpg."""
+    try:
+        image_bytes = base64.b64decode(image_base64)
+    except Exception as e:
+        return {"success": False, "error": f"Base64 Dekodierung fehlgeschlagen: {e}"}
+    if len(image_bytes) > 5_000_000:
+        return {"success": False,
+                "error": f"Bild zu groß ({len(image_bytes)} bytes) - bitte weiter verkleinern"}
+    success = await _upload_recipe_picture(recipe_id, image_bytes, ext)
+    if success:
+        return {"success": True, "recipe_id": recipe_id, "bytes": len(image_bytes)}
+    return {"success": False, "error": "Grocy Upload fehlgeschlagen"}
 
 
 @mcp.tool()
