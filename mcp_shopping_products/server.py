@@ -1,17 +1,14 @@
-"""MCP Shopping Products for Home Assistant v2.1.0
+"""MCP Shopping Products for Home Assistant v2.2.0
 
-v2.1.0 changes:
-- get_image_job(job_id): read a single queued image job by ID
-- list_product_groups: list all Grocy product groups with id/name/description
-- create_product_group(name, description): create a new product group
-- update_product_group(group_id, name, description): rename or edit a group
-- delete_product_group(group_id): delete a group (Grocy check: warns if products still assigned)
+v2.2.0 changes:
+- trigger_image_worker: new MCP tool that runs the job queue immediately
+  instead of waiting for the next hourly cycle. Uses an asyncio.Event to
+  signal the background thread; the tool awaits the result (max 120s) and
+  returns a summary of what was processed. A _worker_lock prevents parallel
+  runs if the hourly timer fires during a manual trigger.
 
-v2.0.0 changes:
-- queue_recipe_image_job / list_image_jobs: async OneDrive image pipeline
-- Background worker (hourly): fetches image from OneDrive, uploads to Grocy, removes job
-- set_recipe_picture removed as MCP tool (internal use only by worker)
-- /share mount added for /share/onedrive_downloads/
+v2.1.0: get_image_job, list/create/update/delete_product_group
+v2.0.0: queue_recipe_image_job, async OneDrive worker, /share mount
 """
 
 import asyncio
@@ -43,8 +40,17 @@ IMAGE_JOBS_FILE = "/data/image_jobs.json"
 DOWNLOAD_DIR = "/share/onedrive_downloads"
 WORKER_INTERVAL_SECONDS = 3600
 
+# Prevents two worker cycles running in parallel (hourly + manual trigger)
+_worker_lock = threading.Lock()
 
-# ── Job Queue helpers ────────────────────────────────────────────────────
+# Signalled by trigger_image_worker to wake the background thread immediately
+_worker_trigger = threading.Event()
+
+# Shared result written by the last worker cycle, read by trigger_image_worker
+_last_cycle_result: dict = {}
+
+
+# ── Job Queue helpers ──────────────────────────────────────────────────
 
 def load_jobs() -> list:
     if not os.path.exists(IMAGE_JOBS_FILE):
@@ -55,62 +61,56 @@ def load_jobs() -> list:
     except Exception:
         return []
 
-
 def save_jobs(jobs: list):
     os.makedirs("/data", exist_ok=True)
     with open(IMAGE_JOBS_FILE, "w") as f:
         json.dump(jobs, f, indent=2)
-
 
 def add_job(job: dict):
     jobs = load_jobs()
     jobs.append(job)
     save_jobs(jobs)
 
-
 def remove_job(job_id: str):
     jobs = load_jobs()
     jobs = [j for j in jobs if j.get("id") != job_id]
     save_jobs(jobs)
 
-
 def make_job_id() -> str:
     return f"job_{int(time.time() * 1000)}"
 
 
-# ── Grocy HTTP helpers ───────────────────────────────────────────────────────
+# ── Grocy HTTP helpers ────────────────────────────────────────────────
 
-async def grocy_get(client: httpx.AsyncClient, path: str, params: dict | None = None):
+async def grocy_get(client, path, params=None):
     return await client.get(f"{GROCY_BASE}{path}", params=params)
 
-async def grocy_post(client: httpx.AsyncClient, path: str, json_body: dict):
+async def grocy_post(client, path, json_body):
     return await client.post(f"{GROCY_BASE}{path}", json=json_body)
 
-async def grocy_put(client: httpx.AsyncClient, path: str, json_body: dict | None = None, content: bytes | None = None, headers: dict | None = None):
+async def grocy_put(client, path, json_body=None, content=None, headers=None):
     return await client.put(f"{GROCY_BASE}{path}", json=json_body, content=content, headers=headers)
 
-async def fetch_image(client: httpx.AsyncClient, group: str, picture_file_name: str) -> MCPImage | None:
+async def fetch_image(client, group, picture_file_name):
     fname_b64 = base64.b64encode(picture_file_name.encode()).decode()
     r = await grocy_get(client, f"/files/{group}/{fname_b64}")
     if r.status_code == 200:
         return MCPImage(data=r.content, format="jpeg")
     return None
 
-async def fetch_product_image(client: httpx.AsyncClient, picture_file_name: str) -> MCPImage | None:
+async def fetch_product_image(client, picture_file_name):
     return await fetch_image(client, "productpictures", picture_file_name)
 
 def text_to_html(text: str) -> str:
     if not text:
         return text
-    paragraphs = text.split("\n\n")
-    html_paragraphs = []
-    for para in paragraphs:
-        escaped = html.escape(para).replace("\n", "<br>")
-        html_paragraphs.append(f"<p>{escaped}</p>")
-    return "".join(html_paragraphs)
+    return "".join(
+        f"<p>{html.escape(para).replace(chr(10), '<br>')}</p>"
+        for para in text.split("\n\n")
+    )
 
 
-# ── Worker ─────────────────────────────────────────────────────────────────────
+# ── Worker ──────────────────────────────────────────────────────────────────
 
 async def _upload_recipe_picture(grocy_id: int, image_bytes: bytes, extension: str = "jpg") -> bool:
     filename = f"recipe_{grocy_id}.{extension}"
@@ -122,7 +122,8 @@ async def _upload_recipe_picture(grocy_id: int, image_bytes: bytes, extension: s
         if upr.status_code not in (200, 204):
             print(f"[Worker] Bild-Upload fehlgeschlagen: {upr.status_code} {upr.text}")
             return False
-        ur = await grocy_put(client, f"/objects/recipes/{grocy_id}", json_body={"picture_file_name": filename})
+        ur = await grocy_put(client, f"/objects/recipes/{grocy_id}",
+                             json_body={"picture_file_name": filename})
         if ur.status_code not in (200, 204):
             print(f"[Worker] picture_file_name setzen fehlgeschlagen: {ur.status_code} {ur.text}")
             return False
@@ -145,7 +146,7 @@ async def process_job(job: dict) -> bool:
                 print(f"[Worker] OneDrive Fehler: {r.status_code} {r.text}")
                 return False
             if not r.json().get("success"):
-                print(f"[Worker] OneDrive Download fehlgeschlagen: {r.json().get('error')}")
+                print(f"[Worker] OneDrive fehlgeschlagen: {r.json().get('error')}")
                 return False
         except Exception as e:
             print(f"[Worker] OneDrive Verbindungsfehler: {e}")
@@ -166,72 +167,129 @@ async def process_job(job: dict) -> bool:
         print(f"[Worker] Job erfolgreich: {job_type} id={grocy_id} bild={bildname}")
     return success
 
-async def run_worker_cycle():
+async def run_worker_cycle() -> dict:
+    """Runs one pass over all pending jobs. Returns a result summary dict."""
+    global _last_cycle_result
     jobs = load_jobs()
     if not jobs:
-        return
+        result = {"jobs_found": 0, "completed": [], "failed": []}
+        _last_cycle_result = result
+        return result
     print(f"[Worker] {len(jobs)} Job(s) in Queue")
-    completed_ids = []
+    completed = []
+    failed = []
     for job in jobs:
         job_id = job.get("id", "unknown")
         try:
             success = await process_job(job)
             if success:
-                completed_ids.append(job_id)
+                completed.append(job_id)
             else:
+                failed.append(job_id)
                 print(f"[Worker] Job {job_id} fehlgeschlagen, bleibt in Queue")
         except Exception as e:
+            failed.append(job_id)
             print(f"[Worker] Fehler bei Job {job_id}: {e}")
-    for job_id in completed_ids:
+    for job_id in completed:
         remove_job(job_id)
-    if completed_ids:
-        print(f"[Worker] {len(completed_ids)} Job(s) abgeschlossen")
+    if completed:
+        print(f"[Worker] {len(completed)} Job(s) abgeschlossen")
+    result = {"jobs_found": len(jobs), "completed": completed, "failed": failed}
+    _last_cycle_result = result
+    return result
+
+def _run_cycle_in_thread():
+    """Called from the background thread. Acquires lock and runs the async cycle."""
+    if not _worker_lock.acquire(blocking=False):
+        print("[Worker] Cycle bereits aktiv, überspringe")
+        return
+    try:
+        asyncio.run(run_worker_cycle())
+    except Exception as e:
+        print(f"[Worker] Fehler im Cycle: {e}")
+    finally:
+        _worker_lock.release()
 
 def start_background_worker():
     def worker_loop():
-        time.sleep(60)
+        # First run after 60s; then wait for either the interval or a manual trigger
+        _worker_trigger.wait(timeout=60)
         while True:
-            try:
-                asyncio.run(run_worker_cycle())
-            except Exception as e:
-                print(f"[Worker] Fehler im Worker-Cycle: {e}")
-            time.sleep(WORKER_INTERVAL_SECONDS)
+            _worker_trigger.clear()
+            _run_cycle_in_thread()
+            # Sleep until next hourly tick OR until triggered manually
+            _worker_trigger.wait(timeout=WORKER_INTERVAL_SECONDS)
     t = threading.Thread(target=worker_loop, daemon=True)
     t.start()
-    print("[Worker] Hintergrund-Worker gestartet (Intervall: 1h)")
+    print("[Worker] Hintergrund-Worker gestartet (Intervall: 1h, manuell triggerbar)")
 
 
-# ── MCP tools ───────────────────────────────────────────────────────────────
+# ── MCP tools ─────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
     name="MCP Shopping Products",
     instructions=(
-        "Tools to maintain Grocy products, recipes, shopping lists and product groups. "
-        "Queue tools: queue_recipe_image_job schedules async OneDrive->Grocy image upload; "
-        "list_image_jobs shows all pending jobs; get_image_job reads a single job by ID.\n\n"
+        "Tools for Grocy products, recipes, shopping lists and product groups.\n\n"
+        "Image queue: queue_recipe_image_job, list_image_jobs, get_image_job, "
+        "trigger_image_worker (run worker NOW instead of waiting for hourly cycle).\n\n"
         "Product groups: list_product_groups, create_product_group, "
-        "update_product_group, delete_product_group - manage Grocy product categories.\n\n"
+        "update_product_group, delete_product_group.\n\n"
         "Products: search_products, create_product_simple, update_product, "
-        "add_product_barcode, get_next_unnamed_product, get_next_product_without_barcode, "
-        "get_next_product_without_picture.\n\n"
-        "Shopping list: add_to_shopping_list.\n\n"
-        "Recipes: create_or_update_recipe (call queue_recipe_image_job after!), "
-        "search_recipes, get_recipe_ingredients, add_recipe_ingredient, "
-        "update_recipe_ingredient, remove_recipe_ingredient, add_recipe_to_shopping_list.\n\n"
+        "add_product_barcode, get_next_unnamed_product, "
+        "get_next_product_without_barcode, get_next_product_without_picture.\n\n"
+        "Shopping: add_to_shopping_list.\n\n"
+        "Recipes: create_or_update_recipe, search_recipes, get_recipe_ingredients, "
+        "add_recipe_ingredient, update_recipe_ingredient, remove_recipe_ingredient, "
+        "add_recipe_to_shopping_list.\n\n"
         "Units: search_quantity_units, create_quantity_unit."
     ),
 )
 mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
-# ── Job Queue tools ───────────────────────────────────────────────────────────
+@mcp.tool()
+async def trigger_image_worker() -> dict:
+    """Trigger the image job worker immediately without waiting for the
+    next hourly cycle. Useful after queuing a job to process it right away.
+
+    Signals the background thread to wake up and run a full cycle, then
+    waits up to 120 seconds for the result. Returns a summary:
+    {"triggered": true, "jobs_found", "completed": [...job_ids...],
+     "failed": [...job_ids...], "timed_out": false}.
+
+    If the worker is already running (e.g. hourly timer just fired),
+    the trigger is queued and will take effect on the next iteration."""
+    if not load_jobs():
+        return {"triggered": False, "message": "Keine Jobs in Queue - nichts zu tun."}
+
+    # Clear any stale previous result so we can detect the new one
+    global _last_cycle_result
+    _last_cycle_result = {}
+
+    # Wake the background thread
+    _worker_trigger.set()
+    print("[Worker] Manuell getriggert")
+
+    # Poll for up to 120s until the cycle completes (result appears)
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        await asyncio.sleep(2)
+        result = _last_cycle_result
+        if result:  # cycle wrote something
+            return {"triggered": True, "timed_out": False, **result}
+
+    return {
+        "triggered": True,
+        "timed_out": True,
+        "message": "Worker läuft noch (>120s) - mit list_image_jobs später prüfen.",
+    }
+
 
 @mcp.tool()
 async def queue_recipe_image_job(recipe_id: int, bildname: str) -> dict:
     """Queue an async job: fetch photo from OneDrive and attach to recipe in Grocy.
-    Worker runs hourly, retries on failure (job stays in queue).
-    Args: recipe_id (from create_or_update_recipe), bildname (filename only,
-    e.g. 'IMG_20260709_123456.jpg' - OneDrive path is fixed in the add-on)."""
+    Args: recipe_id, bildname (filename only, e.g. 'IMG_20260709_123456.jpg').
+    Call trigger_image_worker afterwards to process immediately."""
     if not bildname or not recipe_id:
         return {"success": False, "error": "recipe_id und bildname sind Pflichtfelder"}
     job = {
@@ -243,58 +301,43 @@ async def queue_recipe_image_job(recipe_id: int, bildname: str) -> dict:
     }
     add_job(job)
     print(f"[Queue] Neuer Job: {job}")
-    return {
-        "success": True,
-        "job_id": job["id"],
-        "message": f"Job in Queue: '{bildname}' wird innerhalb der n\u00e4chsten Stunde f\u00fcr Rezept {recipe_id} hinterlegt.",
-    }
+    return {"success": True, "job_id": job["id"],
+            "message": f"Job in Queue: '{bildname}' für Rezept {recipe_id}. trigger_image_worker() aufrufen zum sofortigen Start."}
 
 
 @mcp.tool()
 async def list_image_jobs() -> dict:
     """List all pending image jobs in the queue."""
-    jobs = load_jobs()
-    return {"job_count": len(jobs), "jobs": jobs}
+    return {"job_count": len(load_jobs()), "jobs": load_jobs()}
 
 
 @mcp.tool()
 async def get_image_job(job_id: str) -> dict:
-    """Read a single image job from the queue by its job_id.
-    Returns the job dict if found, or {"found": false} if it no longer exists
-    (meaning it was already processed successfully by the worker)."""
-    jobs = load_jobs()
-    for job in jobs:
+    """Read a single image job by job_id. Returns {found: false} if already processed."""
+    for job in load_jobs():
         if job.get("id") == job_id:
             return {"found": True, "job": job}
     return {"found": False, "job_id": job_id,
-            "note": "Job nicht in Queue - wurde vermutlich erfolgreich verarbeitet."}
+            "note": "Nicht in Queue - vermutlich erfolgreich verarbeitet."}
 
-
-# ── Product group tools ───────────────────────────────────────────────────────
 
 @mcp.tool()
 async def list_product_groups(query: str = "") -> dict:
-    """List all Grocy product groups, optionally filtered by name substring.
-    Returns {"results": [{"group_id", "name", "description"}, ...]}.
-    Use group_id with update_product(product_group_id=...) to assign a product
-    to a group, or with create_product_group/update_product_group/delete_product_group."""
+    """List all Grocy product groups, optionally filtered by name substring."""
     async with httpx.AsyncClient(timeout=15) as client:
         params = {"query[]": f"name~{query}"} if query else None
         r = await grocy_get(client, "/objects/product_groups", params=params)
         if r.status_code != 200:
             return {"results": [], "error": f"Grocy returned {r.status_code}: {r.text}"}
-        groups = r.json()
         return {"results": [
             {"group_id": g["id"], "name": g.get("name"), "description": g.get("description")}
-            for g in groups
+            for g in r.json()
         ]}
 
 
 @mcp.tool()
 async def create_product_group(name: str, description: str = "") -> dict:
-    """Create a new Grocy product group (category).
-    Args: name (required, must be unique), description (optional).
-    Returns {"success", "group_id", "name"}."""
+    """Create a new Grocy product group."""
     async with httpx.AsyncClient(timeout=15) as client:
         body = {"name": name}
         if description:
@@ -307,13 +350,10 @@ async def create_product_group(name: str, description: str = "") -> dict:
 
 @mcp.tool()
 async def update_product_group(group_id: int, name: str, description: str = "") -> dict:
-    """Rename or update description of an existing product group.
-    Args: group_id (from list_product_groups), name (new name, required),
-    description (optional, pass empty string to clear).
-    Returns {"success", "group_id", "name"}."""
+    """Rename or update description of an existing product group."""
     async with httpx.AsyncClient(timeout=15) as client:
-        body = {"name": name, "description": description}
-        r = await grocy_put(client, f"/objects/product_groups/{group_id}", json_body=body)
+        r = await grocy_put(client, f"/objects/product_groups/{group_id}",
+                            json_body={"name": name, "description": description})
         if r.status_code not in (200, 204):
             return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
         return {"success": True, "group_id": group_id, "name": name}
@@ -321,10 +361,7 @@ async def update_product_group(group_id: int, name: str, description: str = "") 
 
 @mcp.tool()
 async def delete_product_group(group_id: int) -> dict:
-    """Delete a Grocy product group by ID. Grocy does not cascade-delete:
-    products assigned to this group keep their product_group_id but it will
-    point to a non-existent group. Reassign affected products first if needed.
-    Returns {"success", "group_id"}."""
+    """Delete a Grocy product group by ID."""
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.delete(f"{GROCY_BASE}/objects/product_groups/{group_id}")
         if r.status_code not in (200, 204):
@@ -332,15 +369,13 @@ async def delete_product_group(group_id: int) -> dict:
         return {"success": True, "group_id": group_id}
 
 
-# ── Existing tools (unchanged) ──────────────────────────────────────────────
-
 @mcp.tool()
 async def get_next_unnamed_product() -> list:
     """Return the next Grocy product that still has its barcode as placeholder name."""
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_get(client, "/objects/products")
         if pr.status_code != 200:
-            return [{"found": False, "error": f"Grocy returned {pr.status_code}: {pr.text}"}]
+            return [{"found": False, "error": f"Grocy returned {pr.status_code}"}]
         products = pr.json()
         br = await grocy_get(client, "/objects/product_barcodes")
         barcodes_by_product: dict[int, list[str]] = {}
@@ -351,14 +386,12 @@ async def get_next_unnamed_product() -> list:
         if not candidates:
             return [{"found": False}]
         product = candidates[0]
-        product_id = product["id"]
-        barcode = product["name"]
-        info = {"found": True, "product_id": product_id, "barcode": barcode}
-        picture_file_name = product.get("picture_file_name")
-        if picture_file_name:
-            image = await fetch_product_image(client, picture_file_name)
-            if image:
-                return [info, image]
+        info = {"found": True, "product_id": product["id"], "barcode": product["name"]}
+        pfn = product.get("picture_file_name")
+        if pfn:
+            img = await fetch_product_image(client, pfn)
+            if img:
+                return [info, img]
             info["picture_error"] = "Could not fetch picture"
         else:
             info["picture_error"] = "No picture_file_name set"
@@ -371,22 +404,22 @@ async def get_next_product_without_barcode() -> list:
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_get(client, "/objects/products")
         if pr.status_code != 200:
-            return [{"found": False, "error": f"Grocy returned {pr.status_code}: {pr.text}"}]
+            return [{"found": False, "error": f"Grocy returned {pr.status_code}"}]
         products = pr.json()
         br = await grocy_get(client, "/objects/product_barcodes")
-        product_ids_with_barcode = set()
+        ids_with_bc = set()
         if br.status_code == 200:
-            product_ids_with_barcode = {entry["product_id"] for entry in br.json()}
-        candidates = [p for p in products if p["id"] not in product_ids_with_barcode]
+            ids_with_bc = {e["product_id"] for e in br.json()}
+        candidates = [p for p in products if p["id"] not in ids_with_bc]
         if not candidates:
             return [{"found": False}]
         product = candidates[0]
         info = {"found": True, "product_id": product["id"], "name": product.get("name")}
-        picture_file_name = product.get("picture_file_name")
-        if picture_file_name:
-            image = await fetch_product_image(client, picture_file_name)
-            if image:
-                return [info, image]
+        pfn = product.get("picture_file_name")
+        if pfn:
+            img = await fetch_product_image(client, pfn)
+            if img:
+                return [info, img]
         return [info]
 
 
@@ -396,22 +429,23 @@ async def get_next_product_without_picture() -> dict:
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_get(client, "/objects/products")
         if pr.status_code != 200:
-            return {"found": False, "error": f"Grocy returned {pr.status_code}: {pr.text}"}
-        products = pr.json()
-        candidates = [p for p in products if not p.get("picture_file_name")]
+            return {"found": False, "error": f"Grocy returned {pr.status_code}"}
+        candidates = [p for p in pr.json() if not p.get("picture_file_name")]
         if not candidates:
             return {"found": False}
         product = candidates[0]
-        product_id = product["id"]
         barcode = None
-        br = await grocy_get(client, "/objects/product_barcodes", params={"query[]": f"product_id={product_id}"})
+        br = await grocy_get(client, "/objects/product_barcodes",
+                             params={"query[]": f"product_id={product['id']}"})
         if br.status_code == 200 and br.json():
             barcode = br.json()[0]["barcode"]
-        return {"found": True, "product_id": product_id, "name": product.get("name"), "barcode": barcode}
+        return {"found": True, "product_id": product["id"],
+                "name": product.get("name"), "barcode": barcode}
 
 
 @mcp.tool()
-async def update_product(product_id: int, name: str, description: str = "", product_group_id: int | None = None) -> dict:
+async def update_product(product_id: int, name: str, description: str = "",
+                         product_group_id: int | None = None) -> dict:
     """Update a Grocy product's name, description and/or product group."""
     body = {"name": name, "description": description}
     if product_group_id is not None:
@@ -427,7 +461,8 @@ async def update_product(product_id: int, name: str, description: str = "", prod
 async def add_product_barcode(product_id: int, barcode: str) -> dict:
     """Link a barcode to an existing Grocy product."""
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await grocy_post(client, "/objects/product_barcodes", {"product_id": product_id, "barcode": barcode})
+        r = await grocy_post(client, "/objects/product_barcodes",
+                             {"product_id": product_id, "barcode": barcode})
         if r.status_code != 200:
             return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
         return {"success": True, "product_id": product_id, "barcode": barcode}
@@ -465,12 +500,10 @@ async def add_to_shopping_list(product_id: int, amount: float = 1, note: str = "
             body["note"] = note
         r = await grocy_post(client, "/stock/shoppinglist/add-product", body)
         if r.status_code != 204:
-            error_message = ""
             try:
-                error_message = r.json().get("error_message", "")
+                return {"success": False, "error": r.json().get("error_message", r.text)}
             except Exception:
-                pass
-            return {"success": False, "error": error_message or r.text}
+                return {"success": False, "error": r.text}
         return {"success": True, "product_id": product_id, "amount": amount}
 
 
@@ -489,7 +522,8 @@ async def search_quantity_units(query: str = "") -> dict:
 async def create_quantity_unit(name: str, name_plural: str = "") -> dict:
     """Create a new Grocy quantity unit."""
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await grocy_post(client, "/objects/quantity_units", {"name": name, "name_plural": name_plural or name})
+        r = await grocy_post(client, "/objects/quantity_units",
+                             {"name": name, "name_plural": name_plural or name})
         if r.status_code != 200:
             return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
         return {"success": True, "qu_id": int(r.json()["created_object_id"]), "name": name}
@@ -497,20 +531,20 @@ async def create_quantity_unit(name: str, name_plural: str = "") -> dict:
 
 @mcp.tool()
 async def create_or_update_recipe(name: str, description: str = "", base_servings: float = 1) -> dict:
-    """Create or update a recipe by exact name. Plain text description is auto-converted to HTML.
-    After creating, call queue_recipe_image_job to schedule the photo upload."""
-    html_description = text_to_html(description)
+    """Create or update a recipe by exact name. Plain text -> HTML auto-convert.
+    Afterwards call queue_recipe_image_job + trigger_image_worker."""
+    html_desc = text_to_html(description)
     async with httpx.AsyncClient(timeout=15) as client:
         existing = await grocy_get(client, "/objects/recipes", params={"query[]": f"name={name}"})
         if existing.status_code == 200 and existing.json():
             recipe_id = existing.json()[0]["id"]
             ur = await grocy_put(client, f"/objects/recipes/{recipe_id}",
-                                 json_body={"description": html_description, "base_servings": base_servings})
+                                 json_body={"description": html_desc, "base_servings": base_servings})
             if ur.status_code not in (200, 204):
                 return {"success": False, "error": f"Grocy returned {ur.status_code}: {ur.text}"}
             return {"success": True, "recipe_id": recipe_id, "name": name, "created": False}
         cr = await grocy_post(client, "/objects/recipes",
-                              {"name": name, "description": html_description, "base_servings": base_servings})
+                              {"name": name, "description": html_desc, "base_servings": base_servings})
         if cr.status_code != 200:
             return {"success": False, "error": f"Grocy returned {cr.status_code}: {cr.text}"}
         return {"success": True, "recipe_id": int(cr.json()["created_object_id"]), "name": name, "created": True}
@@ -553,7 +587,8 @@ async def get_recipe_ingredients(recipe_id: int) -> dict:
 
 
 @mcp.tool()
-async def add_recipe_ingredient(recipe_id: int, product_id: int, amount: float, qu_id: int | None = None) -> dict:
+async def add_recipe_ingredient(recipe_id: int, product_id: int, amount: float,
+                                qu_id: int | None = None) -> dict:
     """Add one ingredient to a recipe."""
     async with httpx.AsyncClient(timeout=15) as client:
         body = {"recipe_id": recipe_id, "product_id": product_id, "amount": amount}
@@ -566,7 +601,8 @@ async def add_recipe_ingredient(recipe_id: int, product_id: int, amount: float, 
 
 
 @mcp.tool()
-async def update_recipe_ingredient(recipe_pos_id: int, amount: float, qu_id: int | None = None) -> dict:
+async def update_recipe_ingredient(recipe_pos_id: int, amount: float,
+                                   qu_id: int | None = None) -> dict:
     """Change amount and/or unit of an existing recipe ingredient."""
     body = {"amount": amount}
     if qu_id is not None:
@@ -600,26 +636,26 @@ async def add_recipe_to_shopping_list(recipe_id: int, multiplier: float = 1) -> 
             return {"success": False, "error": "Recipe has no ingredients"}
         added = []
         for pos in positions:
-            scaled_amount = pos["amount"] * multiplier
+            scaled = pos["amount"] * multiplier
             ar = await grocy_post(client, "/stock/shoppinglist/add-product",
-                                  {"product_id": pos["product_id"], "product_amount": scaled_amount})
+                                  {"product_id": pos["product_id"], "product_amount": scaled})
             if ar.status_code != 204:
-                error_message = ""
                 try:
-                    error_message = ar.json().get("error_message", "")
+                    err = ar.json().get("error_message", ar.text)
                 except Exception:
-                    pass
-                return {"success": False, "error": f"Failed on product_id {pos['product_id']}: {error_message or ar.text}",
+                    err = ar.text
+                return {"success": False,
+                        "error": f"Failed on product_id {pos['product_id']}: {err}",
                         "added_so_far": added}
             name = None
             prod = await grocy_get(client, f"/objects/products/{pos['product_id']}")
             if prod.status_code == 200:
                 name = prod.json().get("name")
-            added.append({"product_id": pos["product_id"], "product_name": name, "amount": scaled_amount})
+            added.append({"product_id": pos["product_id"], "product_name": name, "amount": scaled})
         return {"success": True, "added": added}
 
 
-# ── Ingress web UI ────────────────────────────────────────────────────────────
+# ── Ingress web UI ─────────────────────────────────────────────────────────
 
 async def index(request: Request):
     with open("/static/index.html") as f:
@@ -661,7 +697,8 @@ async def api_book(request: Request):
     amount = data.get("amount", "1")
     action = data.get("action", "add")
     async with httpx.AsyncClient(timeout=15) as client:
-        body = {"amount": float(amount), "transaction_type": "purchase" if action == "add" else "consume"}
+        body = {"amount": float(amount),
+                "transaction_type": "purchase" if action == "add" else "consume"}
         r = await grocy_post(client, f"/stock/products/by-barcode/{barcode}/{action}", body)
         if r.status_code == 200:
             return JSONResponse({"status": "ok", "barcode": barcode})
@@ -687,27 +724,32 @@ async def api_create_unknown(request: Request):
                 "qu_id_purchase": QU_PURCHASE, "qu_id_stock": QU_STOCK,
             })
             if pr.status_code != 200:
-                return JSONResponse({"status": "error", "message": f"Produkt anlegen fehlgeschlagen: {pr.text}"})
+                return JSONResponse({"status": "error",
+                                     "message": f"Produkt anlegen fehlgeschlagen: {pr.text}"})
             product_id = pr.json()["created_object_id"]
-        existing_barcodes = await grocy_get(client, "/objects/product_barcodes", params={"query[]": f"product_id={product_id}"})
+        existing_barcodes = await grocy_get(client, "/objects/product_barcodes",
+                                            params={"query[]": f"product_id={product_id}"})
         already_linked = existing_barcodes.status_code == 200 and any(
             b["barcode"] == barcode for b in existing_barcodes.json())
         if not already_linked:
             bcr = await grocy_post(client, "/objects/product_barcodes",
                                    {"product_id": int(product_id), "barcode": barcode})
             if bcr.status_code != 200:
-                return JSONResponse({"status": "error", "message": f"Barcode verknuepfen fehlgeschlagen: {bcr.text}"})
+                return JSONResponse({"status": "error",
+                                     "message": f"Barcode verknuepfen fehlgeschlagen: {bcr.text}"})
         filename = f"scan_{barcode}.jpg"
         fname_b64 = base64.b64encode(filename.encode()).decode()
         upr = await grocy_put(client, f"/files/productpictures/{fname_b64}", content=photo,
                               headers={"Content-Type": "application/octet-stream"})
         if upr.status_code not in (200, 204):
-            return JSONResponse({"status": "error", "message": f"Bild-Upload fehlgeschlagen: {upr.text}"})
-        await grocy_put(client, f"/objects/products/{product_id}", json_body={"picture_file_name": filename})
+            return JSONResponse({"status": "error",
+                                 "message": f"Bild-Upload fehlgeschlagen: {upr.text}"})
+        await grocy_put(client, f"/objects/products/{product_id}",
+                        json_body={"picture_file_name": filename})
         return JSONResponse({"status": "ok", "product_id": product_id})
 
 
-# ── App assembly ─────────────────────────────────────────────────────────────
+# ── App assembly ───────────────────────────────────────────────────────────
 
 mcp_app = mcp.streamable_http_app()
 
