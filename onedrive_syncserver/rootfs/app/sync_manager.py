@@ -13,15 +13,22 @@ Fuehrt den eigentlichen Sync durch:
 
 2. Ablauf pro Sync-Lauf (SICHERHEITSKRITISCH-Architektur):
 
-   a) Download-Pass (--download-only): laedt NUR von OneDrive runter,
+   a) Paperless-Export: kopiert NEUE/GEAENDERTE Dokumente aus
+      PAPERLESS_SOURCE_DIR (Paperless-ngx "originals" Ordner) NUR EINSEITIG
+      nach SHARE_DIR/Paperless-Export. Es wird NIE aus SHARE_DIR zurueck
+      nach Paperless kopiert, und lokal in Paperless-Export geloeschte
+      Dateien werden NICHT automatisch aus Paperless nachgeliefert-geloescht
+      (rein additiv/aktualisierend, keine Loeschungen in diese Richtung).
+   b) Download-Pass (--download-only): laedt NUR von OneDrive runter,
       laedt NIEMALS lokale Aenderungen hoch.
-   b) Lokaler Cleanup (Dateityp-/Alters-Filter, deaktivierte Ordner
+   c) Lokaler Cleanup (Dateityp-/Alters-Filter, deaktivierte Ordner
       loeschen) - NUR lokal, NACH dem Download damit frisch geladene
       Dateien korrekt gegen die Filter geprueft werden.
-   c) Upload-Pass (--upload-only --no-remote-delete): laedt NUR neue/
-      geaenderte lokale Dateien HOCH. "--no-remote-delete" verhindert
-      explizit dass lokale LOESCHUNGEN (z.B. aus Schritt b) als
-      Loeschungen auf OneDrive ankommen.
+   d) Upload-Pass (--upload-only --no-remote-delete): laedt NUR neue/
+      geaenderte lokale Dateien HOCH (das umfasst auch frisch aus
+      Paperless kopierte Dokumente aus Schritt a). "--no-remote-delete"
+      verhindert explizit dass lokale LOESCHUNGEN (z.B. aus Schritt c)
+      als Loeschungen auf OneDrive ankommen.
 
    *** NIEMALS auf einen einzelnen "--sync" Durchlauf ohne diese Trennung
    zurueckwechseln, ohne ausdrueckliche Bestaetigung des Nutzers! ***
@@ -30,10 +37,9 @@ Fuehrt den eigentlichen Sync durch:
    unser eigener lokaler Cleanup-Schritt von onedrive als "Nutzer hat
    online geloescht" interpretiert und hochgeladen - 13 Ordner wurden
    dadurch tatsaechlich von OneDrive geloescht (nur per OneDrive-
-   Papierkorb gerettet). Die Drei-Schritt-Architektur mit
-   --no-remote-delete auf dem Upload-Pass verhindert das strukturell:
-   der Upload-Pass kann NIEMALS remote loeschen, unabhaengig davon was
-   lokal geloescht wurde.
+   Papierkorb gerettet). Die Architektur mit --no-remote-delete auf dem
+   Upload-Pass verhindert das strukturell: der Upload-Pass kann NIEMALS
+   remote loeschen, unabhaengig davon was lokal geloescht wurde.
 
    AKTIVITAETS-UEBERWACHUNG statt festem Zeit-Limit: Jede neue Zeile
    Ausgabe zaehlt als Lebenszeichen. Nur wenn STALL_TIMEOUT_SECONDS lang
@@ -65,6 +71,15 @@ LOCK_FILE = f"{CONFIG_DIR}/sync.lock"
 SHARE_DIR = "/share/onedrive"
 STATUS_FILE = f"{CONFIG_DIR}/sync_status.json"
 PROGRESS_FILE = f"{CONFIG_DIR}/sync_progress.json"
+
+# Paperless-ngx Export: kopiert einseitig (nur Paperless -> OneDrive-Ordner)
+# neue/geaenderte Dokumente aus dem Paperless "originals" Verzeichnis in
+# einen dedizierten Unterordner, der dann ganz normal per Upload-Pass nach
+# OneDrive hochgeladen wird. Paperless selbst schreibt hier nie etwas
+# zurueck, und wir loeschen hier nichts automatisch (der Nutzer entfernt
+# ggf. manuell falls gewuenscht).
+PAPERLESS_SOURCE_DIR = "/share/paperless/media/documents/originals"
+PAPERLESS_EXPORT_SUBDIR = "Paperless-Export"
 
 CLIENT_ID = "d50ca740-c83f-4d1b-b616-12c519384f0c"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
@@ -145,6 +160,55 @@ def acquire_lock():
 def release_lock():
     if os.path.exists(LOCK_FILE):
         os.remove(LOCK_FILE)
+
+
+def sync_paperless_export():
+    """
+    Kopiert einseitig neue/geaenderte Dateien aus PAPERLESS_SOURCE_DIR
+    (Paperless-ngx "originals") nach SHARE_DIR/Paperless-Export, damit sie
+    danach ganz normal per Upload-Pass nach OneDrive hochgeladen werden.
+    - Kopiert nur wenn Datei im Ziel fehlt ODER sich Groesse/Aenderungsdatum
+      unterscheiden (einfacher, robuster Change-Check ohne Hashing).
+    - Loescht NIE etwas - weder in Paperless noch im Export-Ordner - auch
+      wenn Paperless-seitig ein Dokument entfernt wurde. Der Nutzer hat
+      angegeben, hier i.d.R. nicht manuell einzugreifen; falls doch,
+      bleibt die Kopie im Export-Ordner einfach bestehen (keine
+      automatische Bereinigung).
+    - Erhaelt die Ordnerstruktur falls Paperless irgendwann mit
+      PAPERLESS_FILENAME_FORMAT in Unterordner organisiert.
+    """
+    if not os.path.isdir(PAPERLESS_SOURCE_DIR):
+        log(f"[paperless] Quellordner nicht gefunden, ueberspringe: {PAPERLESS_SOURCE_DIR}")
+        return 0
+
+    dest_root = os.path.join(SHARE_DIR, PAPERLESS_EXPORT_SUBDIR)
+    os.makedirs(dest_root, exist_ok=True)
+
+    copied = 0
+    for root, dirs, files in os.walk(PAPERLESS_SOURCE_DIR):
+        rel_dir = os.path.relpath(root, PAPERLESS_SOURCE_DIR)
+        dest_dir = dest_root if rel_dir == "." else os.path.join(dest_root, rel_dir)
+        for filename in files:
+            src_path = os.path.join(root, filename)
+            dest_path = os.path.join(dest_dir, filename)
+
+            needs_copy = True
+            if os.path.exists(dest_path):
+                src_stat = os.stat(src_path)
+                dst_stat = os.stat(dest_path)
+                if src_stat.st_size == dst_stat.st_size and int(src_stat.st_mtime) <= int(dst_stat.st_mtime):
+                    needs_copy = False
+
+            if needs_copy:
+                os.makedirs(dest_dir, exist_ok=True)
+                shutil.copy2(src_path, dest_path)
+                copied += 1
+                log(f"[paperless] Kopiert: {filename}")
+                write_progress("paperless", f"Kopiere: {filename}")
+
+    if copied:
+        log(f"[paperless] {copied} neue/geaenderte Dokumente nach {PAPERLESS_EXPORT_SUBDIR}/ kopiert")
+    return copied
 
 
 # --- Graph API Hilfsfunktionen (requests.Session fuer Connection-Reuse) ---
@@ -501,6 +565,16 @@ def main():
         config = load_config()
         status = load_status()
         errors = []
+
+        # 0) Paperless-Export: neue/geaenderte Dokumente einseitig in
+        #    einen dedizierten Unterordner kopieren, damit sie im
+        #    Upload-Pass automatisch nach OneDrive mitgenommen werden.
+        try:
+            write_progress("paperless", "Pruefe Paperless-Dokumente...")
+            sync_paperless_export()
+        except Exception as e:
+            log(f"[WARN] Paperless-Export fehlgeschlagen: {e}")
+            errors.append(f"{datetime.now().strftime('%H:%M')} Paperless-Export Fehler: {e}")
 
         need_resync = False
         try:
