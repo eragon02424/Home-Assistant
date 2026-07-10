@@ -1,17 +1,12 @@
-"""MCP Shopping Products for Home Assistant v3.1.0
+"""MCP Shopping Products for Home Assistant v3.2.0
 
-v3.1.0 changes:
-- Three separate review tools instead of one get_products_for_review():
-    get_products_for_name_review()   - Claude's task: set name/group/location/units
-    get_products_for_lookup_decision() - Claude's task: pick OFF result index
-    get_products_pending_lookup()    - info only: waiting for worker, no action needed
-- update_product_full() no longer queues directly into lookup_pending.
-  The auto-queue worker does that, but ONLY after verifying both:
-    1. claude_reviewed: is present in description
-    2. search_term is set in search_terms.json
-  This prevents OFF lookups for products Claude hasn't reviewed yet.
-- list_lookup_jobs() kept as backward-compat alias.
+v3.2.0 changes:
+- Image jobs now track failed_attempts (max 3). After 3 failures the job is
+  marked needs_user_decision=true and skipped by the worker. The job stays
+  visible in list_image_jobs() so Claude can report it to the user.
+  New MCP tool: dismiss_failed_image_job(job_id) to remove a stuck job.
 
+v3.1.0: Three separate review tools, auto-queue worker fix (claude_reviewed gate)
 v3.0.0: Three per-minute workers, OFF lookup, image download, auto-queue
 v2.2.0: trigger_image_worker MCP tool
 v2.1.0: get_image_job, product group CRUD
@@ -52,18 +47,19 @@ LOOKUP_DONE_FILE = f"{DATA_DIR}/lookup_done.json"
 SEARCH_TERMS_FILE = f"{DATA_DIR}/search_terms.json"
 DOWNLOAD_DIR = "/share/onedrive_downloads"
 
-OFF_USER_AGENT = "GrocyMCP/3.1 (home-assistant-addon; contact=eragon02424)"
+OFF_USER_AGENT = "GrocyMCP/3.2 (home-assistant-addon; contact=eragon02424)"
 OFF_SEARCH_URL = "https://search.openfoodfacts.org/search"
 OFF_EAN_URL = "https://world.openfoodfacts.org/api/v2/product/{ean}.json"
 
 CLAUDE_REVIEWED_MARKER = "claude_reviewed:"
+MAX_IMAGE_ATTEMPTS = 3  # After this many failures, mark needs_user_decision=true
 
 _image_trigger = threading.Event()
 _lookup_trigger = threading.Event()
 _last_image_result: dict = {}
 
 
-# ── File helpers ────────────────────────────────────────────────────
+# ── File helpers ───────────────────────────────────────────────
 
 def _load_json(path: str, default):
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -84,7 +80,7 @@ def make_job_id() -> str:
     return f"job_{int(time.time() * 1000)}"
 
 
-# ── image_jobs ────────────────────────────────────────────────────────────
+# ── image_jobs ─────────────────────────────────────────────────────
 
 def load_image_jobs() -> list:
     return _load_json(IMAGE_JOBS_FILE, [])
@@ -97,6 +93,10 @@ def add_image_job(job: dict):
     for existing in jobs:
         if existing.get("grocy_id") == job.get("grocy_id") and existing.get("type") == job.get("type"):
             return
+    # Initialize failure tracking fields
+    job.setdefault("failed_attempts", 0)
+    job.setdefault("needs_user_decision", False)
+    job.setdefault("last_error", None)
     jobs.append(job)
     save_image_jobs(jobs)
 
@@ -104,7 +104,7 @@ def remove_image_job(job_id: str):
     save_image_jobs([j for j in load_image_jobs() if j.get("id") != job_id])
 
 
-# ── lookup_pending ─────────────────────────────────────────────────────
+# ── lookup_pending ──────────────────────────────────────────────────
 
 def load_lookup_pending() -> list:
     return _load_json(LOOKUP_PENDING_FILE, [])
@@ -129,7 +129,7 @@ def remove_lookup_pending(product_id: int):
     save_lookup_pending([i for i in load_lookup_pending() if i["product_id"] != product_id])
 
 
-# ── lookup_done ──────────────────────────────────────────────────────────
+# ── lookup_done ──────────────────────────────────────────────────────
 
 def load_lookup_done() -> list:
     return _load_json(LOOKUP_DONE_FILE, [])
@@ -141,7 +141,7 @@ def remove_lookup_done(job_id: str):
     save_lookup_done([i for i in load_lookup_done() if i.get("id") != job_id])
 
 
-# ── search_terms ───────────────────────────────────────────────────────
+# ── search_terms ───────────────────────────────────────────────────
 
 def load_search_terms() -> dict:
     return _load_json(SEARCH_TERMS_FILE, {})
@@ -155,7 +155,7 @@ def set_search_term_local(product_id: int, term: str):
     save_search_terms(terms)
 
 
-# ── Grocy HTTP helpers ────────────────────────────────────────────────
+# ── Grocy HTTP helpers ─────────────────────────────────────────────
 
 async def grocy_get(client, path, params=None):
     return await client.get(f"{GROCY_BASE}{path}", params=params)
@@ -182,7 +182,7 @@ def text_to_html(text: str) -> str:
     )
 
 
-# ── OpenFoodFacts helpers ─────────────────────────────────────────────
+# ── OpenFoodFacts helpers ──────────────────────────────────────────
 
 def off_lookup_ean(ean: str) -> list:
     try:
@@ -222,7 +222,7 @@ def off_search_text(search_term: str) -> list:
     return []
 
 
-# ── Worker: OFF lookup (1/min) ───────────────────────────────────────────
+# ── Worker: OFF lookup (1/min) ────────────────────────────────────────
 
 def _run_off_lookup_tick():
     pending = load_lookup_pending()
@@ -273,7 +273,7 @@ def start_off_lookup_worker():
     print("[OFF] Lookup-Worker gestartet (1/min)")
 
 
-# ── Worker: image download (1/min) ───────────────────────────────────────
+# ── Worker: image download (1/min) ────────────────────────────────────
 
 async def _upload_product_picture(grocy_id: int, image_bytes: bytes, ext: str = "jpg") -> bool:
     filename = f"product_{grocy_id}.{ext}"
@@ -303,36 +303,36 @@ async def _upload_recipe_picture(grocy_id: int, image_bytes: bytes, ext: str = "
                              json_body={"picture_file_name": filename})
         return ur.status_code in (200, 204)
 
-async def _process_one_image_job(job: dict) -> bool:
+async def _process_one_image_job(job: dict) -> tuple[bool, str | None]:
+    """Returns (success, error_message)."""
     job_type = job.get("type")
     grocy_id = job.get("grocy_id")
     if job_type == "product_image":
         image_url = job.get("image_url")
         if not image_url:
-            return False
+            return False, "Keine image_url im Job"
         print(f"[Image] Lade Produktbild: {image_url[:60]}...")
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.get(image_url, headers={"User-Agent": OFF_USER_AGENT},
                                      follow_redirects=True)
             if not r.is_success:
-                print(f"[Image] Download {r.status_code}")
-                return False
+                return False, f"HTTP {r.status_code} beim Bilddownload"
             image_bytes = r.content
         except Exception as e:
-            print(f"[Image] Download Fehler: {e}")
-            return False
+            return False, f"Download Fehler: {e}"
         ext = image_url.split(".")[-1].split("?")[0].lower()
         if ext not in ("jpg", "jpeg", "png", "webp"):
             ext = "jpg"
         success = await _upload_product_picture(grocy_id, image_bytes, ext)
         if success:
             print(f"[Image] Produktbild gesetzt product_id={grocy_id}")
-        return success
+            return True, None
+        return False, "Grocy Upload fehlgeschlagen"
     if job_type == "rezept":
         bildname = job.get("bildname")
         if not bildname:
-            return False
+            return False, "Kein bildname im Job"
         local_path = os.path.join(DOWNLOAD_DIR, bildname)
         if not os.path.exists(local_path):
             print(f"[Image] OneDrive: {bildname}")
@@ -340,39 +340,65 @@ async def _process_one_image_job(job: dict) -> bool:
                 async with httpx.AsyncClient(timeout=60) as client:
                     r = await client.post(ONEDRIVE_PHOTO_URL, json={"filename": bildname})
                 if not r.is_success or not r.json().get("success"):
-                    print(f"[Image] OneDrive Fehler: {r.text[:80]}")
-                    return False
+                    err = r.json().get("error", r.text[:80]) if r.is_success else r.text[:80]
+                    return False, f"OneDrive: {err}"
             except Exception as e:
-                print(f"[Image] OneDrive Fehler: {e}")
-                return False
+                return False, f"OneDrive Verbindungsfehler: {e}"
         if not os.path.exists(local_path):
-            return False
+            return False, f"Datei nicht gefunden nach OneDrive-Download: {bildname}"
         ext = os.path.splitext(bildname)[1].lstrip(".").lower() or "jpg"
         with open(local_path, "rb") as f:
             image_bytes = f.read()
         success = await _upload_recipe_picture(grocy_id, image_bytes, ext)
         if success:
             print(f"[Image] Rezeptbild gesetzt recipe_id={grocy_id}")
-        return success
-    print(f"[Image] Unbekannter Typ: {job_type}")
-    return False
+            return True, None
+        return False, "Grocy Upload fehlgeschlagen"
+    return False, f"Unbekannter Job-Typ: {job_type}"
 
 async def _run_image_tick() -> dict:
     global _last_image_result
     jobs = load_image_jobs()
-    if not jobs:
+
+    # Find first job that is NOT blocked (needs_user_decision=false)
+    active_job = None
+    for j in jobs:
+        if not j.get("needs_user_decision", False):
+            active_job = j
+            break
+
+    if not active_job:
+        # All jobs are blocked or queue is empty
+        blocked = [j for j in jobs if j.get("needs_user_decision")]
+        if blocked:
+            print(f"[Image] {len(blocked)} Job(s) blockiert (needs_user_decision), übersprungen")
         return {}
-    job = jobs[0]
-    job_id = job.get("id", "unknown")
-    print(f"[Image] Job {job_id} type={job.get('type')}")
+
+    job_id = active_job.get("id", "unknown")
+    print(f"[Image] Job {job_id} type={active_job.get('type')} attempt={active_job.get('failed_attempts', 0) + 1}")
+
     try:
-        success = await _process_one_image_job(job)
+        success, error_msg = await _process_one_image_job(active_job)
     except Exception as e:
-        print(f"[Image] Fehler: {e}")
-        success = False
+        success, error_msg = False, str(e)
+
     if success:
         remove_image_job(job_id)
-    result = {"processed": job_id, "success": success}
+        result = {"processed": job_id, "success": True}
+    else:
+        # Update failure counter in the job
+        jobs_updated = load_image_jobs()
+        for j in jobs_updated:
+            if j.get("id") == job_id:
+                j["failed_attempts"] = j.get("failed_attempts", 0) + 1
+                j["last_error"] = error_msg
+                if j["failed_attempts"] >= MAX_IMAGE_ATTEMPTS:
+                    j["needs_user_decision"] = True
+                    print(f"[Image] Job {job_id} nach {MAX_IMAGE_ATTEMPTS} Versuchen blockiert: {error_msg}")
+                break
+        save_image_jobs(jobs_updated)
+        result = {"processed": job_id, "success": False, "error": error_msg}
+
     _last_image_result = result
     return result
 
@@ -390,11 +416,7 @@ def start_image_worker():
     print("[Image] Image-Worker gestartet (1/min)")
 
 
-# ── Auto-queue worker (every 5min) ─────────────────────────────────────
-# IMPORTANT: only queues products where BOTH conditions are true:
-#   1. description contains claude_reviewed: (Claude has reviewed the product)
-#   2. search_terms.json has an entry for this product_id (search term is set)
-# This prevents OFF lookups for products Claude hasn't cleaned up yet.
+# ── Auto-queue worker (every 5min) ──────────────────────────────────
 
 async def _auto_queue_products_for_lookup():
     try:
@@ -415,17 +437,13 @@ async def _auto_queue_products_for_lookup():
         added = 0
         for p in products:
             pid = p["id"]
-            # Skip if already has a picture
             if p.get("picture_file_name"):
                 continue
-            # Skip if already in any pipeline stage
             if pid in pending_ids or pid in done_ids or pid in image_job_ids:
                 continue
-            # GATE 1: Must be reviewed by Claude
             desc = p.get("description") or ""
             if CLAUDE_REVIEWED_MARKER not in desc:
                 continue
-            # GATE 2: Must have a search term set
             st = search_terms.get(str(pid))
             if not st:
                 continue
@@ -450,7 +468,7 @@ def start_auto_queue_worker():
     print("[AutoQ] Auto-Queue-Worker gestartet (alle 5min)")
 
 
-# ── MCP tools ────────────────────────────────────────────────────────
+# ── MCP tools ─────────────────────────────────────────────────
 
 mcp = FastMCP(
     name="MCP Shopping Products",
@@ -458,31 +476,23 @@ mcp = FastMCP(
         "Tools for Grocy products, recipes, shopping lists, product groups and data maintenance.\n\n"
         "THREE REVIEW TOOLS - each with a clear task:\n"
         "1. get_products_for_name_review() - Claude's task: set name/group/location/units/MHD/search_term\n"
-        "   Call update_product_full() for each. Worker queues for OFF lookup automatically after.\n"
         "2. get_products_for_lookup_decision() - Claude's task: pick the right OFF result\n"
-        "   Call set_lookup_decision(job_id, index) or skip_lookup_job(job_id) for each.\n"
-        "3. get_products_pending_lookup() - INFO ONLY, no action needed\n"
-        "   Shows products Claude reviewed, waiting for the worker to query OFF.\n\n"
-        "FLOW:\n"
-        "Claude reviews name -> update_product_full() -> auto-queue worker -> OFF lookup ->\n"
-        "if 1 result: image_job auto-created; if N results: get_products_for_lookup_decision()\n\n"
-        "IMAGE QUEUE (automatic, 1 image/min):\n"
-        "list_image_jobs(), get_image_job(), queue_recipe_image_job(), trigger_image_worker()\n\n"
+        "3. get_products_pending_lookup() - INFO ONLY, no action needed\n\n"
+        "IMPORTANT: list_image_jobs() now shows needs_user_decision=true for stuck jobs.\n"
+        "When you see needs_user_decision=true, inform the user about the problem and\n"
+        "call dismiss_failed_image_job(job_id) after the user confirms to remove it.\n\n"
+        "IMAGE QUEUE: list_image_jobs(), dismiss_failed_image_job(), trigger_image_worker()\n"
         "HELPERS: list_locations(), list_product_groups(), search_quantity_units()"
     ),
 )
 mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
-# ── Review tool 1: Name/data maintenance ────────────────────────────────────
-
 @mcp.tool()
 async def get_products_for_name_review() -> dict:
     """CLAUDE'S TASK: Set name, group, location, quantity units, MHD and search_term.
     Returns products where description does NOT contain 'claude_reviewed:'.
-    Process each with update_product_full(). The auto-queue worker will then
-    automatically queue them for OFF lookup once reviewed.
-    Only call this when you want to do data maintenance work."""
+    Process each with update_product_full()."""
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_get(client, "/objects/products")
         if pr.status_code != 200:
@@ -501,9 +511,7 @@ async def get_products_for_name_review() -> dict:
             continue
         pid = p["id"]
         results.append({
-            "product_id": pid,
-            "name": p.get("name"),
-            "description": desc,
+            "product_id": pid, "name": p.get("name"), "description": desc,
             "product_group_id": p.get("product_group_id"),
             "location_id": p.get("location_id"),
             "qu_id_stock": p.get("qu_id_stock"),
@@ -516,43 +524,32 @@ async def get_products_for_name_review() -> dict:
     return {"count": len(results), "results": results}
 
 
-# ── Review tool 2: OFF lookup decision ──────────────────────────────────
-
 @mcp.tool()
 async def get_products_for_lookup_decision() -> dict:
     """CLAUDE'S TASK: Pick the right OpenFoodFacts result for each product.
-    Returns jobs where the worker found multiple OFF results (decision == null
-    AND off_results is not empty). For each job call:
-      set_lookup_decision(job_id, index)  - to pick a result
-      skip_lookup_job(job_id)             - if no result fits
-    The chosen image_url is then queued for download by the worker."""
+    Returns jobs with multiple OFF results where decision == null.
+    Use set_lookup_decision(job_id, index) or skip_lookup_job(job_id)."""
     done = load_lookup_done()
-    # Only jobs where Claude must decide (multiple results, no decision yet)
     needs_decision = [
         j for j in done
         if j.get("decision") is None and len(j.get("off_results", [])) > 0
     ]
-    return {
-        "count": len(needs_decision),
-        "jobs": needs_decision,
-    }
+    return {"count": len(needs_decision), "jobs": needs_decision}
 
-
-# ── Review tool 3: Pending lookup status ───────────────────────────────
 
 @mcp.tool()
 async def get_products_pending_lookup() -> dict:
-    """INFO ONLY - no action needed from Claude.
-    Shows products that have been reviewed (claude_reviewed: set) and have a
-    search_term, but are still waiting for the worker to query OpenFoodFacts.
-    Includes counts for: queued in lookup_pending, in lookup_done with no results
-    (worker found nothing), and in image_jobs (image download pending)."""
+    """INFO ONLY - no action needed. Shows pipeline status:
+    - queued_for_lookup: waiting for worker to query OFF
+    - no_off_results: worker found nothing (Claude can skip these)
+    - image_download_pending: image jobs in queue (including stuck ones)"""
     pending = load_lookup_pending()
     done = load_lookup_done()
-    image_jobs = [j for j in load_image_jobs() if j.get("type") == "product_image"]
-    # Jobs with no OFF results (worker found nothing, Claude should skip)
+    image_jobs = load_image_jobs()
+    product_image_jobs = [j for j in image_jobs if j.get("type") == "product_image"]
     no_results = [j for j in done if j.get("decision") is None
                   and len(j.get("off_results", [])) == 0]
+    stuck = [j for j in image_jobs if j.get("needs_user_decision")]
     return {
         "queued_for_lookup": len(pending),
         "lookup_pending": [{"product_id": i["product_id"], "grocy_name": i["grocy_name"],
@@ -560,30 +557,25 @@ async def get_products_pending_lookup() -> dict:
         "no_off_results_count": len(no_results),
         "no_off_results": [{"job_id": j["id"], "product_id": j["product_id"],
                             "grocy_name": j["grocy_name"]} for j in no_results],
-        "image_download_pending": len(image_jobs),
-        "image_jobs": [{"grocy_id": j["grocy_id"]} for j in image_jobs],
+        "image_download_pending": len(product_image_jobs),
+        "stuck_image_jobs": [{"job_id": j["id"], "type": j["type"],
+                              "grocy_id": j["grocy_id"],
+                              "failed_attempts": j.get("failed_attempts", 0),
+                              "last_error": j.get("last_error")} for j in stuck],
     }
 
 
-# ── Backward compat alias ──────────────────────────────────────────────────
-
 @mcp.tool()
 async def list_lookup_jobs() -> dict:
-    """Alias for get_products_for_lookup_decision(). Shows jobs needing Claude's decision.
-    Use get_products_for_lookup_decision() for clarity."""
+    """Alias for get_products_for_lookup_decision()."""
     done = load_lookup_done()
     needs_decision = [
         j for j in done
         if j.get("decision") is None and len(j.get("off_results", [])) > 0
     ]
-    return {
-        "pending_count": len(needs_decision),
-        "jobs": needs_decision,
-        "lookup_pending_count": len(load_lookup_pending()),
-    }
+    return {"pending_count": len(needs_decision), "jobs": needs_decision,
+            "lookup_pending_count": len(load_lookup_pending())}
 
-
-# ── update_product_full ─────────────────────────────────────────────────
 
 @mcp.tool()
 async def update_product_full(
@@ -598,16 +590,11 @@ async def update_product_full(
     default_best_before_days: int = 0,
     reviewed: bool = True,
 ) -> dict:
-    """Full product update: name, search_term, description, group, location, units, MHD.
-    If reviewed=True (default), appends 'claude_reviewed:YYYY-MM-DD' to description.
-    Does NOT queue for OFF lookup directly - the auto-queue worker does that
-    automatically every 5 minutes after verifying the reviewed marker is set.
-
+    """Full product update. If reviewed=True appends claude_reviewed:YYYY-MM-DD.
+    Auto-queue worker queues for OFF lookup within 5 minutes.
     Locations: 2=Kühlschrank, 3=Vorratsschrank, 4=Gefrierschrank, 5=Lagerschrank"""
-    # Save search_term locally (worker uses this for OFF lookup)
     if search_term:
         set_search_term_local(product_id, search_term)
-    # Build description with reviewed marker
     final_desc = description or ""
     if reviewed:
         marker = f"{CLAUDE_REVIEWED_MARKER}{time.strftime('%Y-%m-%d')}"
@@ -626,21 +613,13 @@ async def update_product_full(
         r = await grocy_put(client, f"/objects/products/{product_id}", json_body=body)
         if r.status_code not in (200, 204):
             return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
-    return {
-        "success": True,
-        "product_id": product_id,
-        "name": name,
-        "search_term": search_term,
-        "reviewed": reviewed,
-        "note": "Auto-queue worker queues for OFF lookup within 5 minutes.",
-    }
+    return {"success": True, "product_id": product_id, "name": name,
+            "search_term": search_term, "reviewed": reviewed}
 
 
 @mcp.tool()
 async def set_search_term(product_id: int, search_term: str) -> dict:
-    """Update only the search term for a product (stored locally, not in Grocy).
-    Only useful after update_product_full() if you want to change the search term later.
-    The auto-queue worker picks it up within 5 minutes if product is reviewed."""
+    """Update only the search term for a product (stored locally, not in Grocy)."""
     set_search_term_local(product_id, search_term)
     return {"success": True, "product_id": product_id, "search_term": search_term}
 
@@ -648,8 +627,7 @@ async def set_search_term(product_id: int, search_term: str) -> dict:
 @mcp.tool()
 async def set_lookup_decision(job_id: str, decision_index: int) -> dict:
     """Write Claude's decision index for an OFF lookup job.
-    Worker downloads and uploads the image - Claude only writes the number.
-    Args: job_id from get_products_for_lookup_decision(), decision_index = chosen 'index'."""
+    Worker downloads and uploads the image - Claude only writes the number."""
     done = load_lookup_done()
     for job in done:
         if job.get("id") == job_id:
@@ -671,7 +649,7 @@ async def set_lookup_decision(job_id: str, decision_index: int) -> dict:
 
 @mcp.tool()
 async def skip_lookup_job(job_id: str) -> dict:
-    """Skip an OFF lookup job (no suitable result found). Removes from queue."""
+    """Skip an OFF lookup job (no suitable result). Removes from queue."""
     if not any(j.get("id") == job_id for j in load_lookup_done()):
         return {"success": False, "error": f"Job {job_id} nicht gefunden"}
     remove_lookup_done(job_id)
@@ -679,34 +657,53 @@ async def skip_lookup_job(job_id: str) -> dict:
 
 
 @mcp.tool()
-async def list_locations() -> dict:
-    """List all Grocy storage locations.
-    Returns {"results": [{"location_id", "name", "description"}, ...]}."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await grocy_get(client, "/objects/locations")
-        if r.status_code != 200:
-            return {"results": [], "error": f"Grocy returned {r.status_code}"}
-        return {"results": [
-            {"location_id": l["id"], "name": l.get("name"), "description": l.get("description")}
-            for l in r.json()
-        ]}
+async def list_image_jobs() -> dict:
+    """List all pending image jobs.
+    Jobs with needs_user_decision=true are stuck (failed 3 times) and skipped
+    by the worker. Use dismiss_failed_image_job() to remove them after checking
+    with the user what went wrong."""
+    jobs = load_image_jobs()
+    stuck = [j for j in jobs if j.get("needs_user_decision")]
+    active = [j for j in jobs if not j.get("needs_user_decision")]
+    return {
+        "job_count": len(jobs),
+        "active_count": len(active),
+        "stuck_count": len(stuck),
+        "active_jobs": active,
+        "stuck_jobs": stuck,
+    }
 
 
 @mcp.tool()
-async def trigger_image_worker() -> dict:
-    """Trigger image worker + OFF lookup worker immediately.
-    Processes one image job now. Waits up to 30s for result."""
-    global _last_image_result
-    _last_image_result = {}
-    _image_trigger.set()
-    _lookup_trigger.set()
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        await asyncio.sleep(1)
-        if _last_image_result:
-            return {"triggered": True, "timed_out": False, **_last_image_result}
-    return {"triggered": True, "timed_out": True,
-            "message": "Worker noch aktiv - mit list_image_jobs prüfen."}
+async def dismiss_failed_image_job(job_id: str) -> dict:
+    """Remove a stuck image job (needs_user_decision=true) from the queue.
+    Only call this after informing the user about the failure and getting
+    confirmation to remove it. The product will have no picture."""
+    jobs = load_image_jobs()
+    job = next((j for j in jobs if j.get("id") == job_id), None)
+    if not job:
+        return {"success": False, "error": f"Job {job_id} nicht gefunden"}
+    if not job.get("needs_user_decision"):
+        return {"success": False,
+                "error": "Job ist nicht blockiert - nur stuck Jobs können dismissed werden"}
+    remove_image_job(job_id)
+    return {
+        "success": True,
+        "job_id": job_id,
+        "grocy_id": job.get("grocy_id"),
+        "type": job.get("type"),
+        "last_error": job.get("last_error"),
+        "note": "Job entfernt. Produkt hat kein Bild.",
+    }
+
+
+@mcp.tool()
+async def get_image_job(job_id: str) -> dict:
+    """Read a single image job by id."""
+    for job in load_image_jobs():
+        if job.get("id") == job_id:
+            return {"found": True, "job": job}
+    return {"found": False, "job_id": job_id, "note": "Nicht in Queue - vermutlich verarbeitet."}
 
 
 @mcp.tool()
@@ -721,20 +718,30 @@ async def queue_recipe_image_job(recipe_id: int, bildname: str) -> dict:
 
 
 @mcp.tool()
-async def list_image_jobs() -> dict:
-    """List all pending image jobs."""
-    jobs = load_image_jobs()
-    return {"job_count": len(jobs), "jobs": jobs}
+async def trigger_image_worker() -> dict:
+    """Trigger image worker + OFF lookup worker immediately."""
+    global _last_image_result
+    _last_image_result = {}
+    _image_trigger.set()
+    _lookup_trigger.set()
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        await asyncio.sleep(1)
+        if _last_image_result:
+            return {"triggered": True, "timed_out": False, **_last_image_result}
+    return {"triggered": True, "timed_out": True,
+            "message": "Worker noch aktiv - mit list_image_jobs prüfen."}
 
 
 @mcp.tool()
-async def get_image_job(job_id: str) -> dict:
-    """Read a single image job. {found: false} = already processed."""
-    for job in load_image_jobs():
-        if job.get("id") == job_id:
-            return {"found": True, "job": job}
-    return {"found": False, "job_id": job_id,
-            "note": "Nicht in Queue - vermutlich verarbeitet."}
+async def list_locations() -> dict:
+    """List all Grocy storage locations."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await grocy_get(client, "/objects/locations")
+        if r.status_code != 200:
+            return {"results": [], "error": f"Grocy returned {r.status_code}"}
+        return {"results": [{"location_id": l["id"], "name": l.get("name"),
+                             "description": l.get("description")} for l in r.json()]}
 
 
 @mcp.tool()
@@ -857,7 +864,7 @@ async def get_next_product_without_picture() -> dict:
 @mcp.tool()
 async def update_product(product_id: int, name: str, description: str = "",
                          product_group_id: int | None = None) -> dict:
-    """Quick name/description/group update (use update_product_full for maintenance)."""
+    """Quick name/description/group update."""
     body = {"name": name, "description": description}
     if product_group_id is not None:
         body["product_group_id"] = product_group_id
@@ -1065,7 +1072,7 @@ async def add_recipe_to_shopping_list(recipe_id: int, multiplier: float = 1) -> 
         return {"success": True, "added": added}
 
 
-# ── Ingress web UI ──────────────────────────────────────────────────
+# ── Ingress web UI ──────────────────────────────────────────────
 
 async def index(request: Request):
     with open("/static/index.html") as f:
@@ -1158,7 +1165,7 @@ async def api_create_unknown(request: Request):
         return JSONResponse({"status": "ok", "product_id": product_id})
 
 
-# ── App assembly ────────────────────────────────────────────────────
+# ── App assembly ──────────────────────────────────────────────
 
 mcp_app = mcp.streamable_http_app()
 
