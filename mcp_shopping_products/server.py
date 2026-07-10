@@ -1,12 +1,17 @@
-"""MCP Shopping Products for Home Assistant v3.7.0
+"""MCP Shopping Products for Home Assistant v3.8.0
 
-v3.7.0 changes:
-- New Ingress UI tab "Einkaufsliste": shows the Grocy shopping list grouped
-  by product category, with swipe-right-to-delete per item (removes from
-  Grocy shopping list). Two new API endpoints:
-    GET  /api/shopping-list         - grouped list with pictures/units
-    POST /api/shopping-list/remove  - delete one shopping_list entry by id
+v3.8.0 changes:
+- Shopping list swipe-to-delete is now a SOFT delete. Swiping an item moves
+  it to a "bald löschen" (pending-delete) list at the bottom instead of
+  deleting it from Grocy immediately.
+- Items sit in pending-delete for PENDING_DELETE_HOURS (2h). A background
+  worker checks every 5min and permanently deletes expired items from Grocy.
+- Swiping an item right within the pending-delete section restores it to
+  the normal shopping list (undo).
+- New endpoint POST /api/shopping-list/restore.
+- api_shopping_list now returns "pending_delete" array with hours_left per item.
 
+v3.7.0: shopping list tab, grouped by category, hard delete on swipe
 v3.6.0: upload_recipe_picture_base64 tool (bypasses OneDrive for recipe pics)
 v3.5.0: needs_user_decision is informational only, worker always retries
 
@@ -49,7 +54,10 @@ IMAGE_JOBS_FILE = f"{DATA_DIR}/image_jobs.json"
 LOOKUP_PENDING_FILE = f"{DATA_DIR}/lookup_pending.json"
 LOOKUP_DONE_FILE = f"{DATA_DIR}/lookup_done.json"
 SEARCH_TERMS_FILE = f"{DATA_DIR}/search_terms.json"
+SHOPPING_PENDING_DELETE_FILE = f"{DATA_DIR}/shopping_pending_delete.json"
 DOWNLOAD_DIR = "/share/onedrive_downloads"
+
+PENDING_DELETE_HOURS = 2  # Items sit here before being permanently removed from Grocy
 
 OFF_USER_AGENT = "GrocyMCP/3.5 (home-assistant-addon; contact=eragon02424)"
 OFF_SEARCH_URL = "https://search.openfoodfacts.org/search"
@@ -149,6 +157,80 @@ def set_search_term_local(product_id: int, term: str):
     terms = load_search_terms()
     terms[str(product_id)] = term
     save_search_terms(terms)
+
+
+# ── shopping list pending-delete helpers ────────────────────────
+
+def load_shopping_pending_delete() -> list:
+    return _load_json(SHOPPING_PENDING_DELETE_FILE, [])
+
+def save_shopping_pending_delete(items):
+    _save_json(SHOPPING_PENDING_DELETE_FILE, items)
+
+def mark_pending_delete(list_item_id: int):
+    items = load_shopping_pending_delete()
+    if any(i["list_item_id"] == list_item_id for i in items):
+        return
+    items.append({"list_item_id": list_item_id,
+                  "marked_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    save_shopping_pending_delete(items)
+
+def unmark_pending_delete(list_item_id: int):
+    save_shopping_pending_delete(
+        [i for i in load_shopping_pending_delete() if i["list_item_id"] != list_item_id]
+    )
+
+def is_pending_delete(list_item_id: int) -> bool:
+    return any(i["list_item_id"] == list_item_id for i in load_shopping_pending_delete())
+
+
+async def _purge_expired_pending_deletes():
+    """Permanently delete from Grocy any shopping list items that have sat in
+    the pending-delete list for longer than PENDING_DELETE_HOURS."""
+    items = load_shopping_pending_delete()
+    if not items:
+        return
+    now = time.time()
+    still_pending = []
+    to_delete = []
+    for item in items:
+        try:
+            marked_at = time.mktime(time.strptime(item["marked_at"], "%Y-%m-%dT%H:%M:%S"))
+        except Exception:
+            marked_at = now  # malformed timestamp - keep it pending, don't crash
+        age_hours = (now - marked_at) / 3600
+        if age_hours >= PENDING_DELETE_HOURS:
+            to_delete.append(item["list_item_id"])
+        else:
+            still_pending.append(item)
+    if to_delete:
+        async with httpx.AsyncClient(timeout=15) as client:
+            for list_item_id in to_delete:
+                try:
+                    r = await client.delete(f"{GROCY_BASE}/objects/shopping_list/{list_item_id}")
+                    if r.status_code in (200, 204):
+                        print(f"[ShoppingList] Endgueltig geloescht: {list_item_id}")
+                    else:
+                        print(f"[ShoppingList] Loeschen fehlgeschlagen {list_item_id}: {r.status_code}")
+                        still_pending.append({"list_item_id": list_item_id,
+                                              "marked_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+                except Exception as e:
+                    print(f"[ShoppingList] Fehler beim Loeschen {list_item_id}: {e}")
+                    still_pending.append({"list_item_id": list_item_id,
+                                          "marked_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    save_shopping_pending_delete(still_pending)
+
+def start_shopping_purge_worker():
+    def loop():
+        time.sleep(60)
+        while True:
+            try:
+                asyncio.run(_purge_expired_pending_deletes())
+            except Exception as e:
+                print(f"[ShoppingList] Purge-Worker Fehler: {e}")
+            time.sleep(300)  # check every 5 minutes
+    threading.Thread(target=loop, daemon=True).start()
+    print("[ShoppingList] Purge-Worker gestartet (Pruefung alle 5min)")
 
 
 # ── Grocy HTTP helpers ─────────────────────────────────────────
@@ -1222,12 +1304,19 @@ async def api_create_unknown(request: Request):
 
 async def api_shopping_list(request: Request):
     """Return the shopping list grouped by product category (like Grocy's own grouping).
-    Each group has a name and a list of items with list_item_id (shopping_list entry
-    id, needed for deletion), product_id, name, amount, unit, picture_file_name."""
+    Excludes items currently marked pending-delete (shown separately). Each group has
+    a name and a list of items with list_item_id, product_id, name, amount, unit,
+    picture_file_name. Also returns pending_delete: items swiped away, waiting to be
+    permanently removed after PENDING_DELETE_HOURS, each with hours_left."""
+    await _purge_expired_pending_deletes()  # opportunistic purge on every load
+    pending_ids = {i["list_item_id"] for i in load_shopping_pending_delete()}
+    pending_meta = {i["list_item_id"]: i["marked_at"] for i in load_shopping_pending_delete()}
+
     async with httpx.AsyncClient(timeout=15) as client:
         sl = await grocy_get(client, "/objects/shopping_list")
         if sl.status_code != 200:
-            return JSONResponse({"groups": [], "error": f"Grocy returned {sl.status_code}"})
+            return JSONResponse({"groups": [], "pending_delete": [],
+                                 "error": f"Grocy returned {sl.status_code}"})
         entries = sl.json()
 
         products_r = await grocy_get(client, "/objects/products")
@@ -1240,15 +1329,15 @@ async def api_shopping_list(request: Request):
         unit_names = {u["id"]: u.get("name", "") for u in units_r.json()} if units_r.status_code == 200 else {}
 
     grouped: dict = {}
+    pending_items = []
     ungrouped_label = "Sonstiges"
     for entry in entries:
+        list_item_id = entry["id"]
         pid = entry.get("product_id")
         product = products_by_id.get(pid, {})
-        group_id = product.get("product_group_id")
-        group_name = group_names.get(group_id, ungrouped_label) if group_id else ungrouped_label
         qu_id = product.get("qu_id_purchase")
         item = {
-            "list_item_id": entry["id"],
+            "list_item_id": list_item_id,
             "product_id": pid,
             "name": product.get("name", entry.get("note") or "Unbekanntes Produkt"),
             "amount": entry.get("amount", 1),
@@ -1256,6 +1345,18 @@ async def api_shopping_list(request: Request):
             "picture_file_name": product.get("picture_file_name"),
             "note": entry.get("note", ""),
         }
+        if list_item_id in pending_ids:
+            marked_at_str = pending_meta.get(list_item_id)
+            try:
+                marked_at = time.mktime(time.strptime(marked_at_str, "%Y-%m-%dT%H:%M:%S"))
+                hours_left = max(0, PENDING_DELETE_HOURS - (time.time() - marked_at) / 3600)
+            except Exception:
+                hours_left = PENDING_DELETE_HOURS
+            item["hours_left"] = round(hours_left, 1)
+            pending_items.append(item)
+            continue
+        group_id = product.get("product_group_id")
+        group_name = group_names.get(group_id, ungrouped_label) if group_id else ungrouped_label
         grouped.setdefault(group_name, []).append(item)
 
     group_names_sorted = sorted(k for k in grouped if k != ungrouped_label)
@@ -1267,20 +1368,36 @@ async def api_shopping_list(request: Request):
         items = sorted(grouped[gname], key=lambda i: i["name"].lower())
         result_groups.append({"category": gname, "items": items})
 
-    return JSONResponse({"groups": result_groups, "total_items": len(entries)})
+    pending_items.sort(key=lambda i: i["name"].lower())
+
+    return JSONResponse({
+        "groups": result_groups,
+        "pending_delete": pending_items,
+        "total_items": len(entries) - len(pending_items),
+    })
 
 
 async def api_shopping_list_remove(request: Request):
-    """Remove a single item from the Grocy shopping list by its shopping_list entry id."""
+    """Mark a shopping list item as pending-delete (soft delete).
+    The item is NOT removed from Grocy yet - it moves to the 'bald löschen' list
+    and gets permanently deleted after PENDING_DELETE_HOURS unless restored."""
     data = await request.json()
     list_item_id = data.get("list_item_id")
     if not list_item_id:
         return JSONResponse({"status": "error", "message": "list_item_id fehlt"})
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.delete(f"{GROCY_BASE}/objects/shopping_list/{list_item_id}")
-        if r.status_code not in (200, 204):
-            return JSONResponse({"status": "error", "message": f"Grocy returned {r.status_code}"})
-        return JSONResponse({"status": "ok", "list_item_id": list_item_id})
+    mark_pending_delete(int(list_item_id))
+    return JSONResponse({"status": "ok", "list_item_id": list_item_id})
+
+
+async def api_shopping_list_restore(request: Request):
+    """Restore a shopping list item from the pending-delete list back to the
+    normal shopping list (undo a swipe)."""
+    data = await request.json()
+    list_item_id = data.get("list_item_id")
+    if not list_item_id:
+        return JSONResponse({"status": "error", "message": "list_item_id fehlt"})
+    unmark_pending_delete(int(list_item_id))
+    return JSONResponse({"status": "ok", "list_item_id": list_item_id})
 
 
 # ── App assembly ─────────────────────────────────────────
@@ -1296,6 +1413,7 @@ app = Starlette(
         Route("/api/product-picture/{filename}", api_product_picture, methods=["GET"]),
         Route("/api/shopping-list", api_shopping_list, methods=["GET"]),
         Route("/api/shopping-list/remove", api_shopping_list_remove, methods=["POST"]),
+        Route("/api/shopping-list/restore", api_shopping_list_restore, methods=["POST"]),
     ] + mcp_app.routes,
     lifespan=mcp_app.router.lifespan_context,
 )
@@ -1304,4 +1422,5 @@ if __name__ == "__main__":
     start_image_worker()
     start_off_lookup_worker()
     start_auto_queue_worker()
+    start_shopping_purge_worker()
     uvicorn.run(app, host="0.0.0.0", port=8770)
