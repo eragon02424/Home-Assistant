@@ -1,16 +1,19 @@
-"""MCP Shopping Products for Home Assistant v3.4.0
+"""MCP Shopping Products for Home Assistant v3.5.0
 
-v3.4.0 changes:
-- Image worker tick now iterates through ALL active jobs per minute until
-  one succeeds. Failed jobs (not yet stuck) are skipped and their counter
-  incremented, then the next job is tried. This guarantees at least one
-  successful download per minute as long as any active job exists.
-  Previously the tick stopped after the first job regardless of outcome.
+v3.5.0 changes:
+- needs_user_decision=true no longer blocks the worker.
+  The flag is now purely informational (signals Claude to notify the user).
+  The worker still retries the job every minute - the file may have been
+  uploaded to OneDrive in the meantime.
+  Only dismiss_failed_image_job() actually removes a job from the queue.
+- Counter continues to increment past MAX_IMAGE_ATTEMPTS so Claude can
+  see how many total attempts have been made.
 
-v3.3.0: merge_products tool, update_product_full auto-merge on name conflict
+v3.4.0: image worker iterates through all active jobs until one succeeds
+v3.3.0: merge_products tool, auto-merge on UNIQUE name conflict
 v3.2.0: failed image job handling (needs_user_decision after 3 attempts)
 v3.1.0: three separate review tools, auto-queue claude_reviewed gate
-v3.0.0: three per-minute workers, OFF lookup, image download, auto-queue
+v3.0.0: three per-minute workers
 """
 
 import asyncio
@@ -47,12 +50,13 @@ LOOKUP_DONE_FILE = f"{DATA_DIR}/lookup_done.json"
 SEARCH_TERMS_FILE = f"{DATA_DIR}/search_terms.json"
 DOWNLOAD_DIR = "/share/onedrive_downloads"
 
-OFF_USER_AGENT = "GrocyMCP/3.4 (home-assistant-addon; contact=eragon02424)"
+OFF_USER_AGENT = "GrocyMCP/3.5 (home-assistant-addon; contact=eragon02424)"
 OFF_SEARCH_URL = "https://search.openfoodfacts.org/search"
 OFF_EAN_URL = "https://world.openfoodfacts.org/api/v2/product/{ean}.json"
 
 CLAUDE_REVIEWED_MARKER = "claude_reviewed:"
-MAX_IMAGE_ATTEMPTS = 3
+NOTIFY_AFTER_ATTEMPTS = 3  # After this many failures, set needs_user_decision=true
+                             # Worker still retries - flag is informational only
 
 _image_trigger = threading.Event()
 _lookup_trigger = threading.Event()
@@ -345,45 +349,34 @@ async def _process_one_image_job(job: dict) -> tuple[bool, str | None]:
 
 
 async def _run_image_tick() -> dict:
-    """Process image jobs until one succeeds or all active jobs are exhausted.
+    """Process image jobs until one succeeds or all jobs in this tick are exhausted.
 
-    Per tick:
-    - Stuck jobs (needs_user_decision=true) are always skipped.
-    - Failed jobs (not yet stuck) are tried: on failure their counter is
-      incremented (and marked stuck if >= MAX_IMAGE_ATTEMPTS), then the
-      next job is tried immediately in the same tick.
-    - The tick ends as soon as one job succeeds OR every active job has
-      been attempted once.
-    This guarantees at least one successful download per minute.
+    All jobs are tried regardless of needs_user_decision.
+    needs_user_decision=true is purely informational (tells Claude to notify
+    the user), but does NOT prevent retries. The file may have been uploaded
+    to OneDrive in the meantime.
+    Only dismiss_failed_image_job() actually removes a job.
     """
     global _last_image_result
 
-    # Snapshot active job IDs for this tick (to avoid infinite loops if
-    # new jobs get added mid-tick)
-    jobs_snapshot = [j for j in load_image_jobs() if not j.get("needs_user_decision", False)]
-    if not jobs_snapshot:
-        stuck_count = sum(1 for j in load_image_jobs() if j.get("needs_user_decision"))
-        if stuck_count:
-            print(f"[Image] {stuck_count} Job(s) blockiert, nichts zu tun")
+    all_jobs = load_image_jobs()
+    if not all_jobs:
         return {}
 
-    attempted_ids = set()
+    # Snapshot job IDs for this tick to avoid infinite loops
+    job_ids_this_tick = [j.get("id") for j in all_jobs]
     result = {}
 
-    for job in jobs_snapshot:
-        job_id = job.get("id", "unknown")
-        if job_id in attempted_ids:
-            continue
-        attempted_ids.add(job_id)
-
-        # Re-read the job from disk in case it was updated by a previous iteration
+    for job_id in job_ids_this_tick:
+        # Re-read from disk each iteration (previous iteration may have modified)
         current_jobs = load_image_jobs()
         current_job = next((j for j in current_jobs if j.get("id") == job_id), None)
-        if current_job is None or current_job.get("needs_user_decision"):
-            continue  # Already removed or stuck by previous iteration
+        if current_job is None:
+            continue  # Already removed
 
         attempt_nr = current_job.get("failed_attempts", 0) + 1
-        print(f"[Image] Job {job_id} type={current_job.get('type')} attempt={attempt_nr}")
+        flag = " [needs_user_decision]" if current_job.get("needs_user_decision") else ""
+        print(f"[Image] Job {job_id} type={current_job.get('type')} attempt={attempt_nr}{flag}")
 
         try:
             success, error_msg = await _process_one_image_job(current_job)
@@ -396,23 +389,20 @@ async def _run_image_tick() -> dict:
             _last_image_result = result
             return result  # Done for this tick
 
-        # Failure: increment counter, maybe mark stuck, then continue to next job
+        # Failure: increment counter, set needs_user_decision after threshold
         jobs_updated = load_image_jobs()
         for j in jobs_updated:
             if j.get("id") == job_id:
                 j["failed_attempts"] = j.get("failed_attempts", 0) + 1
                 j["last_error"] = error_msg
-                if j["failed_attempts"] >= MAX_IMAGE_ATTEMPTS:
+                if j["failed_attempts"] >= NOTIFY_AFTER_ATTEMPTS and not j.get("needs_user_decision"):
                     j["needs_user_decision"] = True
-                    print(f"[Image] Job {job_id} blockiert nach {MAX_IMAGE_ATTEMPTS} Versuchen: {error_msg}")
-                else:
-                    print(f"[Image] Job {job_id} Fehler ({j['failed_attempts']}/{MAX_IMAGE_ATTEMPTS}): {error_msg} — nächster Job")
+                    print(f"[Image] Job {job_id}: needs_user_decision gesetzt nach {j['failed_attempts']} Versuchen")
                 break
         save_image_jobs(jobs_updated)
         result = {"processed": job_id, "success": False, "error": error_msg}
-        # Continue loop to try next job
+        print(f"[Image] Job {job_id} Fehler ({attempt_nr}): {error_msg} — nächster Job")
 
-    # All active jobs tried, none succeeded
     _last_image_result = result
     return result
 
@@ -490,13 +480,15 @@ mcp = FastMCP(
         "Tools for Grocy products, recipes, shopping lists, product groups and data maintenance.\n\n"
         "THREE REVIEW TOOLS:\n"
         "1. get_products_for_name_review() -> update_product_full()\n"
-        "   If update_product_full returns 'merged': a duplicate existed and was merged.\n"
         "2. get_products_for_lookup_decision() -> set_lookup_decision() or skip_lookup_job()\n"
         "3. get_products_pending_lookup() - INFO ONLY\n\n"
         "MERGE: merge_products(product_id_to_remove, product_id_to_keep)\n"
         "  - update_product_full() auto-merges on UNIQUE name conflict.\n\n"
-        "STUCK JOBS: list_image_jobs() shows stuck_jobs. Inform user, then\n"
-        "  dismiss_failed_image_job(job_id) to remove.\n\n"
+        "STUCK JOBS: list_image_jobs() shows needs_user_decision=true jobs.\n"
+        "  The worker STILL RETRIES these every minute (file may appear on OneDrive).\n"
+        "  When you see needs_user_decision=true: inform the user of the error and\n"
+        "  the bildname, so they can upload the file to OneDrive.\n"
+        "  dismiss_failed_image_job(job_id) only removes a job if user explicitly asks.\n\n"
         "HELPERS: list_locations(), list_product_groups(), search_quantity_units()"
     ),
 )
@@ -526,9 +518,7 @@ async def merge_products(product_id_to_remove: int, product_id_to_keep: int) -> 
 
 @mcp.tool()
 async def get_products_for_name_review() -> dict:
-    """CLAUDE'S TASK: Set name, group, location, units, MHD and search_term.
-    Returns products without 'claude_reviewed:' in description.
-    Process each with update_product_full()."""
+    """CLAUDE'S TASK: Set name, group, location, units, MHD and search_term."""
     async with httpx.AsyncClient(timeout=15) as client:
         pr = await grocy_get(client, "/objects/products")
         if pr.status_code != 200:
@@ -637,7 +627,7 @@ async def get_products_pending_lookup() -> dict:
     image_jobs = load_image_jobs()
     no_results = [j for j in done if j.get("decision") is None
                   and len(j.get("off_results", [])) == 0]
-    stuck = [j for j in image_jobs if j.get("needs_user_decision")]
+    needs_attention = [j for j in image_jobs if j.get("needs_user_decision")]
     product_image_jobs = [j for j in image_jobs if j.get("type") == "product_image"]
     return {
         "queued_for_lookup": len(pending),
@@ -647,9 +637,10 @@ async def get_products_pending_lookup() -> dict:
         "no_off_results": [{"job_id": j["id"], "product_id": j["product_id"],
                             "grocy_name": j["grocy_name"]} for j in no_results],
         "image_download_pending": len(product_image_jobs),
-        "stuck_image_jobs": [{"job_id": j["id"], "type": j["type"], "grocy_id": j["grocy_id"],
-                              "failed_attempts": j.get("failed_attempts", 0),
-                              "last_error": j.get("last_error")} for j in stuck],
+        "needs_attention": [{"job_id": j["id"], "type": j["type"], "grocy_id": j["grocy_id"],
+                             "bildname": j.get("bildname"),
+                             "failed_attempts": j.get("failed_attempts", 0),
+                             "last_error": j.get("last_error")} for j in needs_attention],
     }
 
 
@@ -703,27 +694,35 @@ async def skip_lookup_job(job_id: str) -> dict:
 
 @mcp.tool()
 async def list_image_jobs() -> dict:
-    """List all pending image jobs, separated into active and stuck.
-    Stuck jobs (needs_user_decision=true) are skipped by the worker."""
+    """List all pending image jobs.
+    Jobs with needs_user_decision=true have failed 3+ times but are still
+    retried every minute. The worker does NOT block on these.
+    Use dismiss_failed_image_job() only if the user explicitly wants to remove a job."""
     jobs = load_image_jobs()
-    stuck = [j for j in jobs if j.get("needs_user_decision")]
+    needs_attention = [j for j in jobs if j.get("needs_user_decision")]
     active = [j for j in jobs if not j.get("needs_user_decision")]
-    return {"job_count": len(jobs), "active_count": len(active), "stuck_count": len(stuck),
-            "active_jobs": active, "stuck_jobs": stuck}
+    return {
+        "job_count": len(jobs),
+        "active_count": len(active),
+        "needs_attention_count": len(needs_attention),
+        "active_jobs": active,
+        "needs_attention_jobs": needs_attention,
+    }
 
 
 @mcp.tool()
 async def dismiss_failed_image_job(job_id: str) -> dict:
-    """Remove a stuck image job after user confirmation."""
+    """Permanently remove an image job from the queue.
+    Only use when the user explicitly asks to remove a job.
+    needs_user_decision jobs are still retried automatically - dismissing
+    stops all future attempts for this job."""
     jobs = load_image_jobs()
     job = next((j for j in jobs if j.get("id") == job_id), None)
     if not job:
         return {"success": False, "error": f"Job {job_id} nicht gefunden"}
-    if not job.get("needs_user_decision"):
-        return {"success": False, "error": "Nur stuck Jobs können dismissed werden"}
     remove_image_job(job_id)
     return {"success": True, "job_id": job_id, "grocy_id": job.get("grocy_id"),
-            "last_error": job.get("last_error"), "note": "Job entfernt. Produkt hat kein Bild."}
+            "last_error": job.get("last_error"), "note": "Job entfernt. Keine weiteren Versuche."}
 
 
 @mcp.tool()
