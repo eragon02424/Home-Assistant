@@ -1,13 +1,13 @@
-"""MCP Shopping Products for Home Assistant v3.6.0
+"""MCP Shopping Products for Home Assistant v3.7.0
 
-v3.6.0 changes:
-- New MCP tool: upload_recipe_picture_base64(recipe_id, image_base64, ext)
-  Uploads a recipe picture directly via base64, completely bypassing the
-  OneDrive filename-matching workflow. Use this when the user shares an
-  image directly with Claude - avoids the "what's the OneDrive filename"
-  friction entirely. Slower (base64 output is token-bound, ~few minutes
-  for a compressed image) but always works without extra coordination.
+v3.7.0 changes:
+- New Ingress UI tab "Einkaufsliste": shows the Grocy shopping list grouped
+  by product category, with swipe-right-to-delete per item (removes from
+  Grocy shopping list). Two new API endpoints:
+    GET  /api/shopping-list         - grouped list with pictures/units
+    POST /api/shopping-list/remove  - delete one shopping_list entry by id
 
+v3.6.0: upload_recipe_picture_base64 tool (bypasses OneDrive for recipe pics)
 v3.5.0: needs_user_decision is informational only, worker always retries
 
 v3.4.0: image worker iterates through all active jobs until one succeeds
@@ -1220,6 +1220,69 @@ async def api_create_unknown(request: Request):
         return JSONResponse({"status": "ok", "product_id": product_id})
 
 
+async def api_shopping_list(request: Request):
+    """Return the shopping list grouped by product category (like Grocy's own grouping).
+    Each group has a name and a list of items with list_item_id (shopping_list entry
+    id, needed for deletion), product_id, name, amount, unit, picture_file_name."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        sl = await grocy_get(client, "/objects/shopping_list")
+        if sl.status_code != 200:
+            return JSONResponse({"groups": [], "error": f"Grocy returned {sl.status_code}"})
+        entries = sl.json()
+
+        products_r = await grocy_get(client, "/objects/products")
+        products_by_id = {p["id"]: p for p in products_r.json()} if products_r.status_code == 200 else {}
+
+        groups_r = await grocy_get(client, "/objects/product_groups")
+        group_names = {g["id"]: g.get("name", "Sonstiges") for g in groups_r.json()} if groups_r.status_code == 200 else {}
+
+        units_r = await grocy_get(client, "/objects/quantity_units")
+        unit_names = {u["id"]: u.get("name", "") for u in units_r.json()} if units_r.status_code == 200 else {}
+
+    grouped: dict = {}
+    ungrouped_label = "Sonstiges"
+    for entry in entries:
+        pid = entry.get("product_id")
+        product = products_by_id.get(pid, {})
+        group_id = product.get("product_group_id")
+        group_name = group_names.get(group_id, ungrouped_label) if group_id else ungrouped_label
+        qu_id = product.get("qu_id_purchase")
+        item = {
+            "list_item_id": entry["id"],
+            "product_id": pid,
+            "name": product.get("name", entry.get("note") or "Unbekanntes Produkt"),
+            "amount": entry.get("amount", 1),
+            "unit": unit_names.get(qu_id, ""),
+            "picture_file_name": product.get("picture_file_name"),
+            "note": entry.get("note", ""),
+        }
+        grouped.setdefault(group_name, []).append(item)
+
+    group_names_sorted = sorted(k for k in grouped if k != ungrouped_label)
+    if ungrouped_label in grouped:
+        group_names_sorted.append(ungrouped_label)
+
+    result_groups = []
+    for gname in group_names_sorted:
+        items = sorted(grouped[gname], key=lambda i: i["name"].lower())
+        result_groups.append({"category": gname, "items": items})
+
+    return JSONResponse({"groups": result_groups, "total_items": len(entries)})
+
+
+async def api_shopping_list_remove(request: Request):
+    """Remove a single item from the Grocy shopping list by its shopping_list entry id."""
+    data = await request.json()
+    list_item_id = data.get("list_item_id")
+    if not list_item_id:
+        return JSONResponse({"status": "error", "message": "list_item_id fehlt"})
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.delete(f"{GROCY_BASE}/objects/shopping_list/{list_item_id}")
+        if r.status_code not in (200, 204):
+            return JSONResponse({"status": "error", "message": f"Grocy returned {r.status_code}"})
+        return JSONResponse({"status": "ok", "list_item_id": list_item_id})
+
+
 # ── App assembly ─────────────────────────────────────────
 
 mcp_app = mcp.streamable_http_app()
@@ -1231,6 +1294,8 @@ app = Starlette(
         Route("/api/book", api_book, methods=["POST"]),
         Route("/api/create-unknown", api_create_unknown, methods=["POST"]),
         Route("/api/product-picture/{filename}", api_product_picture, methods=["GET"]),
+        Route("/api/shopping-list", api_shopping_list, methods=["GET"]),
+        Route("/api/shopping-list/remove", api_shopping_list_remove, methods=["POST"]),
     ] + mcp_app.routes,
     lifespan=mcp_app.router.lifespan_context,
 )
