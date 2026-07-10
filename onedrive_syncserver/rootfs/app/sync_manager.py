@@ -19,6 +19,10 @@ Fuehrt den eigentlichen Sync durch:
       nach Paperless kopiert, und lokal in Paperless-Export geloeschte
       Dateien werden NICHT automatisch aus Paperless nachgeliefert-geloescht
       (rein additiv/aktualisierend, keine Loeschungen in diese Richtung).
+      WICHTIG: der frisch angelegte Ordner existiert beim allerersten Mal
+      nur LOKAL (noch nicht auf OneDrive) - wird in main() explizit zur
+      sync_list-Ordnerliste hinzugefuegt, da sonst der Upload-Pass ihn
+      wegen der Default-Exclude-Logik von sync_list ignorieren wuerde.
    b) Download-Pass (--download-only): laedt NUR von OneDrive runter,
       laedt NIEMALS lokale Aenderungen hoch.
    c) Lokaler Cleanup (Dateityp-/Alters-Filter, deaktivierte Ordner
@@ -583,6 +587,17 @@ def main():
             t0 = time.time()
             all_folders = list_all_folders(config)
             log(f"[folders] {len(all_folders)} Ordner gefunden in {time.time()-t0:.1f}s")
+
+            # WICHTIG: Paperless-Export existiert beim allerersten Mal nur
+            # LOKAL (noch nicht auf OneDrive, da noch nie hochgeladen).
+            # Da sync_list per Default alles ausschliesst was nicht
+            # gelistet ist, wuerde der frisch angelegte Ordner sonst vom
+            # Upload-Pass ignoriert. Deshalb hier explizit ergaenzen.
+            if PAPERLESS_EXPORT_SUBDIR not in all_folders and os.path.isdir(os.path.join(SHARE_DIR, PAPERLESS_EXPORT_SUBDIR)):
+                all_folders.append(PAPERLESS_EXPORT_SUBDIR)
+                all_folders.sort()
+                log(f"[folders] '{PAPERLESS_EXPORT_SUBDIR}' lokal vorhanden aber noch nicht auf OneDrive - zur sync_list hinzugefuegt")
+
             need_resync = write_sync_list(config, all_folders)
         except Exception as e:
             log(f"[WARN] Konnte sync_list nicht aktualisieren: {e}")
