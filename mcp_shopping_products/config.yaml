@@ -1,6 +1,6 @@
 name: "Einkaufsscanner"
 description: "Scan groceries into Grocy (Ingress camera page) and let Claude fill in missing product names via MCP tools"
-version: "3.6.0"
+version: "3.7.0"
 slug: "mcp_shopping_products"
 init: false
 arch:
