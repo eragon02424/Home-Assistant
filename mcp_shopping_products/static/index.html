@@ -6,25 +6,45 @@
 <title>Shopping Scan</title>
 <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
 <style>
-  body { font-family: sans-serif; background:#111; color:#eee; margin:0; padding:16px; }
-  h2 { margin-top:0; }
-  .step { display:none; }
+  body { font-family: sans-serif; background:#111; color:#eee; margin:0; padding:0; padding-bottom:70px; }
+  h2 { margin:16px; }
+  .step { display:none; padding:0 16px; }
   .step.active { display:block; }
   button { font-size:1.2em; padding:12px 20px; margin:8px 0; width:100%; border-radius:8px; border:none; background:#2a6; color:#fff; }
   button.secondary { background:#446; }
   input[type=number] { font-size:1.2em; padding:10px; width:100%; box-sizing:border-box; margin:8px 0; }
-  #status { margin:12px 0; padding:10px; border-radius:8px; min-height:1.2em; }
+  #status { margin:12px 16px; padding:10px; border-radius:8px; min-height:1.2em; }
   .ok { background:#264; }
   .err { background:#622; }
   label { display:block; margin-top:12px; }
   video { width:100%; border-radius:8px; background:#000; }
   #barcodeLabel, #productName { font-size:1.3em; margin:8px 0; }
   #productPic { max-width:100%; border-radius:8px; margin:8px 0; display:none; }
+
+  /* Tab bar */
+  #tabbar { position:fixed; bottom:0; left:0; right:0; display:flex; background:#1a1a1a; border-top:1px solid #333; }
+  #tabbar button { flex:1; margin:0; border-radius:0; background:transparent; color:#888; padding:14px 0; font-size:1em; }
+  #tabbar button.active { color:#2a6; font-weight:bold; }
+
+  /* Shopping list */
+  #shoppingListWrap { padding:16px; }
+  .sl-category { font-size:0.95em; text-transform:uppercase; letter-spacing:0.05em; color:#8a8; margin:20px 0 8px; padding-bottom:4px; border-bottom:1px solid #333; }
+  .sl-category:first-child { margin-top:0; }
+  .sl-item-outer { position:relative; overflow:hidden; border-radius:8px; margin-bottom:8px; }
+  .sl-item-bg { position:absolute; inset:0; background:#c33; display:flex; align-items:center; padding-left:20px; color:#fff; font-size:1.1em; }
+  .sl-item { position:relative; display:flex; align-items:center; gap:12px; background:#1d1d1d; padding:10px 14px; border-radius:8px; touch-action:pan-y; transition:transform 0.15s ease-out; }
+  .sl-item img { width:44px; height:44px; object-fit:cover; border-radius:6px; background:#333; flex-shrink:0; }
+  .sl-item .noimg { width:44px; height:44px; border-radius:6px; background:#333; flex-shrink:0; display:flex; align-items:center; justify-content:center; font-size:1.3em; color:#666; }
+  .sl-item .info { flex:1; min-width:0; }
+  .sl-item .name { font-size:1.05em; }
+  .sl-item .amount { color:#999; font-size:0.9em; }
+  #slEmpty { text-align:center; color:#777; margin-top:40px; }
+  #slLoading { text-align:center; color:#777; margin-top:40px; }
 </style>
 </head>
 <body>
 
-<h2>Grocy Schnellscan</h2>
+<h2 id="pageTitle">Grocy Schnellscan</h2>
 <div id="status"></div>
 
 <div id="step-video" class="step active">
@@ -49,7 +69,18 @@
   <button id="btnCapture">Foto aufnehmen &amp; Produkt anlegen</button>
 </div>
 
+<div id="step-shoppinglist" class="step">
+  <div id="shoppingListWrap">
+    <div id="slLoading">Lade Einkaufsliste...</div>
+  </div>
+</div>
+
 <canvas id="captureCanvas" style="display:none;"></canvas>
+
+<div id="tabbar">
+  <button id="tabScan" class="active">Scan</button>
+  <button id="tabList">Einkaufsliste</button>
+</div>
 
 <script>
 // WICHTIG: alle eigenen API-Pfade unten sind dokumentrelativ (kein fuehrender
@@ -70,6 +101,7 @@ hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
 const reader = new ZXing.BrowserMultiFormatReader(hints);
 
 let pendingBarcode = null;
+let currentTab = 'scan';
 
 function showStep(id) {
   document.querySelectorAll('.step').forEach(e => e.classList.remove('active'));
@@ -80,6 +112,17 @@ function showStatus(msg, ok) {
   const el = document.getElementById('status');
   el.textContent = msg;
   el.className = ok ? 'ok' : 'err';
+}
+
+function clearStatus() {
+  const el = document.getElementById('status');
+  el.textContent = '';
+  el.className = '';
+}
+
+function stopAllStreams() {
+  try { reader.reset(); } catch (e) {}
+  if (photo2Stream) { photo2Stream.getTracks().forEach(t => t.stop()); photo2Stream = null; }
 }
 
 function startScanning() {
@@ -203,6 +246,168 @@ document.getElementById('btnCapture').onclick = async () => {
 document.getElementById('btnAdd').onclick = () => book('add');
 document.getElementById('btnConsume').onclick = () => book('consume');
 document.getElementById('btnCancel').onclick = () => startScanning();
+
+// ── Shopping list tab ──────────────────────────────────────────────
+
+async function loadShoppingList() {
+  const wrap = document.getElementById('shoppingListWrap');
+  wrap.innerHTML = '<div id="slLoading">Lade Einkaufsliste...</div>';
+  try {
+    const res = await fetch('api/shopping-list');
+    const data = await res.json();
+    if (data.error) {
+      wrap.innerHTML = '<div id="slEmpty">Fehler: ' + data.error + '</div>';
+      return;
+    }
+    if (!data.groups || data.groups.length === 0) {
+      wrap.innerHTML = '<div id="slEmpty">Einkaufsliste ist leer 🎉</div>';
+      return;
+    }
+    wrap.innerHTML = '';
+    for (const group of data.groups) {
+      const catEl = document.createElement('div');
+      catEl.className = 'sl-category';
+      catEl.textContent = group.category;
+      wrap.appendChild(catEl);
+
+      for (const item of group.items) {
+        wrap.appendChild(buildShoppingListRow(item));
+      }
+    }
+  } catch (err) {
+    wrap.innerHTML = '<div id="slEmpty">Netzwerk-Fehler: ' + err + '</div>';
+  }
+}
+
+function buildShoppingListRow(item) {
+  const outer = document.createElement('div');
+  outer.className = 'sl-item-outer';
+
+  const bg = document.createElement('div');
+  bg.className = 'sl-item-bg';
+  bg.textContent = 'Entfernen';
+  outer.appendChild(bg);
+
+  const row = document.createElement('div');
+  row.className = 'sl-item';
+  row.dataset.listItemId = item.list_item_id;
+
+  if (item.picture_file_name) {
+    const img = document.createElement('img');
+    img.src = 'api/product-picture/' + encodeURIComponent(item.picture_file_name);
+    row.appendChild(img);
+  } else {
+    const noimg = document.createElement('div');
+    noimg.className = 'noimg';
+    noimg.textContent = '🛒';
+    row.appendChild(noimg);
+  }
+
+  const info = document.createElement('div');
+  info.className = 'info';
+  const nameEl = document.createElement('div');
+  nameEl.className = 'name';
+  nameEl.textContent = item.name;
+  info.appendChild(nameEl);
+  const amountEl = document.createElement('div');
+  amountEl.className = 'amount';
+  amountEl.textContent = item.amount + (item.unit ? ' ' + item.unit : '');
+  info.appendChild(amountEl);
+  row.appendChild(info);
+
+  outer.appendChild(row);
+  attachSwipe(row, outer, item.list_item_id);
+  return outer;
+}
+
+function attachSwipe(row, outer, listItemId) {
+  let startX = 0;
+  let currentX = 0;
+  let dragging = false;
+  const threshold = 90; // px to trigger delete
+
+  row.addEventListener('touchstart', (e) => {
+    startX = e.touches[0].clientX;
+    dragging = true;
+    row.style.transition = 'none';
+  }, { passive: true });
+
+  row.addEventListener('touchmove', (e) => {
+    if (!dragging) return;
+    currentX = e.touches[0].clientX - startX;
+    if (currentX < 0) currentX = 0; // only allow right swipe
+    row.style.transform = 'translateX(' + currentX + 'px)';
+  }, { passive: true });
+
+  row.addEventListener('touchend', async () => {
+    if (!dragging) return;
+    dragging = false;
+    row.style.transition = 'transform 0.15s ease-out';
+    if (currentX > threshold) {
+      row.style.transform = 'translateX(100%)';
+      await removeShoppingListItem(listItemId, outer);
+    } else {
+      row.style.transform = 'translateX(0)';
+    }
+    currentX = 0;
+  });
+}
+
+async function removeShoppingListItem(listItemId, outerEl) {
+  try {
+    const res = await fetch('api/shopping-list/remove', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ list_item_id: listItemId })
+    });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      outerEl.style.transition = 'max-height 0.2s ease, opacity 0.2s ease, margin 0.2s ease';
+      outerEl.style.maxHeight = outerEl.offsetHeight + 'px';
+      requestAnimationFrame(() => {
+        outerEl.style.maxHeight = '0px';
+        outerEl.style.opacity = '0';
+        outerEl.style.marginBottom = '0px';
+      });
+      setTimeout(() => {
+        outerEl.remove();
+        const wrap = document.getElementById('shoppingListWrap');
+        if (!wrap.querySelector('.sl-item-outer')) {
+          loadShoppingList();
+        }
+      }, 220);
+    } else {
+      alert('Fehler beim Entfernen: ' + data.message);
+      outerEl.querySelector('.sl-item').style.transform = 'translateX(0)';
+    }
+  } catch (err) {
+    alert('Netzwerk-Fehler: ' + err);
+    outerEl.querySelector('.sl-item').style.transform = 'translateX(0)';
+  }
+}
+
+// ── Tab switching ───────────────────────────────────────────────────
+
+function switchTab(tab) {
+  currentTab = tab;
+  document.getElementById('tabScan').classList.toggle('active', tab === 'scan');
+  document.getElementById('tabList').classList.toggle('active', tab === 'list');
+  clearStatus();
+
+  if (tab === 'scan') {
+    document.getElementById('pageTitle').textContent = 'Grocy Schnellscan';
+    document.getElementById('step-shoppinglist').classList.remove('active');
+    startScanning();
+  } else {
+    stopAllStreams();
+    document.getElementById('pageTitle').textContent = 'Einkaufsliste';
+    showStep('step-shoppinglist');
+    loadShoppingList();
+  }
+}
+
+document.getElementById('tabScan').onclick = () => switchTab('scan');
+document.getElementById('tabList').onclick = () => switchTab('list');
 
 startScanning();
 </script>
