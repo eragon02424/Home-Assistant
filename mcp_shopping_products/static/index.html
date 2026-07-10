@@ -40,6 +40,12 @@
   .sl-item .amount { color:#999; font-size:0.9em; }
   #slEmpty { text-align:center; color:#777; margin-top:40px; }
   #slLoading { text-align:center; color:#777; margin-top:40px; }
+
+  /* Pending delete section */
+  .sl-pending-header { font-size:0.95em; text-transform:uppercase; letter-spacing:0.05em; color:#c77; margin:28px 0 8px; padding-bottom:4px; border-bottom:1px solid #422; }
+  .sl-pending-item .sl-item { background:#231717; opacity:0.8; }
+  .sl-pending-item .sl-item-bg { background:#2a6; }
+  .sl-hours-left { color:#c99; font-size:0.8em; margin-top:2px; }
 </style>
 </head>
 <body>
@@ -259,19 +265,32 @@ async function loadShoppingList() {
       wrap.innerHTML = '<div id="slEmpty">Fehler: ' + data.error + '</div>';
       return;
     }
-    if (!data.groups || data.groups.length === 0) {
+    const hasGroups = data.groups && data.groups.length > 0;
+    const hasPending = data.pending_delete && data.pending_delete.length > 0;
+    if (!hasGroups && !hasPending) {
       wrap.innerHTML = '<div id="slEmpty">Einkaufsliste ist leer 🎉</div>';
       return;
     }
     wrap.innerHTML = '';
-    for (const group of data.groups) {
+    for (const group of (data.groups || [])) {
       const catEl = document.createElement('div');
       catEl.className = 'sl-category';
       catEl.textContent = group.category;
       wrap.appendChild(catEl);
 
       for (const item of group.items) {
-        wrap.appendChild(buildShoppingListRow(item));
+        wrap.appendChild(buildShoppingListRow(item, false));
+      }
+    }
+
+    if (hasPending) {
+      const header = document.createElement('div');
+      header.className = 'sl-pending-header';
+      header.textContent = 'Bald löschen';
+      wrap.appendChild(header);
+
+      for (const item of data.pending_delete) {
+        wrap.appendChild(buildShoppingListRow(item, true));
       }
     }
   } catch (err) {
@@ -279,13 +298,13 @@ async function loadShoppingList() {
   }
 }
 
-function buildShoppingListRow(item) {
+function buildShoppingListRow(item, isPending) {
   const outer = document.createElement('div');
-  outer.className = 'sl-item-outer';
+  outer.className = isPending ? 'sl-item-outer sl-pending-item' : 'sl-item-outer';
 
   const bg = document.createElement('div');
   bg.className = 'sl-item-bg';
-  bg.textContent = 'Entfernen';
+  bg.textContent = isPending ? 'Wiederherstellen' : 'Entfernen';
   outer.appendChild(bg);
 
   const row = document.createElement('div');
@@ -313,18 +332,24 @@ function buildShoppingListRow(item) {
   amountEl.className = 'amount';
   amountEl.textContent = item.amount + (item.unit ? ' ' + item.unit : '');
   info.appendChild(amountEl);
+  if (isPending) {
+    const hoursEl = document.createElement('div');
+    hoursEl.className = 'sl-hours-left';
+    hoursEl.textContent = 'Endgültig löschen in ' + item.hours_left + ' h';
+    info.appendChild(hoursEl);
+  }
   row.appendChild(info);
 
   outer.appendChild(row);
-  attachSwipe(row, outer, item.list_item_id);
+  attachSwipe(row, outer, item.list_item_id, isPending);
   return outer;
 }
 
-function attachSwipe(row, outer, listItemId) {
+function attachSwipe(row, outer, listItemId, isPending) {
   let startX = 0;
   let currentX = 0;
   let dragging = false;
-  const threshold = 90; // px to trigger delete
+  const threshold = 90; // px to trigger action
 
   row.addEventListener('touchstart', (e) => {
     startX = e.touches[0].clientX;
@@ -345,12 +370,30 @@ function attachSwipe(row, outer, listItemId) {
     row.style.transition = 'transform 0.15s ease-out';
     if (currentX > threshold) {
       row.style.transform = 'translateX(100%)';
-      await removeShoppingListItem(listItemId, outer);
+      if (isPending) {
+        await restoreShoppingListItem(listItemId, outer);
+      } else {
+        await removeShoppingListItem(listItemId, outer);
+      }
     } else {
       row.style.transform = 'translateX(0)';
     }
     currentX = 0;
   });
+}
+
+function collapseAndRemove(outerEl, afterRemove) {
+  outerEl.style.transition = 'max-height 0.2s ease, opacity 0.2s ease, margin 0.2s ease';
+  outerEl.style.maxHeight = outerEl.offsetHeight + 'px';
+  requestAnimationFrame(() => {
+    outerEl.style.maxHeight = '0px';
+    outerEl.style.opacity = '0';
+    outerEl.style.marginBottom = '0px';
+  });
+  setTimeout(() => {
+    outerEl.remove();
+    if (afterRemove) afterRemove();
+  }, 220);
 }
 
 async function removeShoppingListItem(listItemId, outerEl) {
@@ -362,22 +405,29 @@ async function removeShoppingListItem(listItemId, outerEl) {
     });
     const data = await res.json();
     if (data.status === 'ok') {
-      outerEl.style.transition = 'max-height 0.2s ease, opacity 0.2s ease, margin 0.2s ease';
-      outerEl.style.maxHeight = outerEl.offsetHeight + 'px';
-      requestAnimationFrame(() => {
-        outerEl.style.maxHeight = '0px';
-        outerEl.style.opacity = '0';
-        outerEl.style.marginBottom = '0px';
-      });
-      setTimeout(() => {
-        outerEl.remove();
-        const wrap = document.getElementById('shoppingListWrap');
-        if (!wrap.querySelector('.sl-item-outer')) {
-          loadShoppingList();
-        }
-      }, 220);
+      collapseAndRemove(outerEl, () => loadShoppingList());
     } else {
       alert('Fehler beim Entfernen: ' + data.message);
+      outerEl.querySelector('.sl-item').style.transform = 'translateX(0)';
+    }
+  } catch (err) {
+    alert('Netzwerk-Fehler: ' + err);
+    outerEl.querySelector('.sl-item').style.transform = 'translateX(0)';
+  }
+}
+
+async function restoreShoppingListItem(listItemId, outerEl) {
+  try {
+    const res = await fetch('api/shopping-list/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ list_item_id: listItemId })
+    });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      collapseAndRemove(outerEl, () => loadShoppingList());
+    } else {
+      alert('Fehler beim Wiederherstellen: ' + data.message);
       outerEl.querySelector('.sl-item').style.transform = 'translateX(0)';
     }
   } catch (err) {
