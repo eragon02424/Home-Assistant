@@ -1,4 +1,12 @@
-"""MCP Shopping Products for Home Assistant v3.8.0
+"""MCP Shopping Products for Home Assistant v3.9.0
+
+v3.9.0 changes:
+- New tool get_recipe_type_options(): reads the allowed values of the
+  Grocy 'rezeptart' userfield (entity=recipes, preset-list) so recipe
+  categorization stays in sync with what's configured in Grocy.
+- create_or_update_recipe() gained an optional 'rezeptart' parameter that
+  sets the userfield via PUT /api/userfields/recipes/{id} right after
+  creating/updating the recipe.
 
 v3.8.0 changes:
 - Shopping list swipe-to-delete is now a SOFT delete. Swiping an item moves
@@ -574,6 +582,8 @@ mcp = FastMCP(
         "  dismiss_failed_image_job(job_id) only removes a job if user explicitly asks.\n\n"
         "RECIPE PICTURES: prefer upload_recipe_picture_base64() when the user shares\n"
         "  an image directly with Claude - bypasses OneDrive entirely.\n\n"
+        "RECIPE CATEGORIZATION: call get_recipe_type_options() to see the current list of\n"
+        "  allowed 'Rezeptart' values, then pass one as create_or_update_recipe(rezeptart=...).\n\n"
         "HELPERS: list_locations(), list_product_groups(), search_quantity_units()"
     ),
 )
@@ -1085,8 +1095,26 @@ async def create_quantity_unit(name: str, name_plural: str = "") -> dict:
 
 
 @mcp.tool()
-async def create_or_update_recipe(name: str, description: str = "", base_servings: float = 1) -> dict:
-    """Create or update a recipe."""
+async def get_recipe_type_options() -> dict:
+    """List the allowed values for the recipe 'Rezeptart' userfield (preset-list on entity=recipes).
+    Use this to see which categories exist before setting rezeptart on a recipe."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await grocy_get(client, "/objects/userfields", params={"query[]": "name=rezeptart"})
+        if r.status_code != 200 or not r.json():
+            return {"options": [], "error": f"Grocy returned {r.status_code}"}
+        field = next((f for f in r.json() if f.get("entity") == "recipes"), None)
+        if not field:
+            return {"options": [], "error": "userfield 'rezeptart' on entity 'recipes' not found"}
+        config = field.get("config") or ""
+        options = [line for line in config.split("\n") if line.strip()]
+        return {"options": options}
+
+
+@mcp.tool()
+async def create_or_update_recipe(name: str, description: str = "", base_servings: float = 1,
+                                   rezeptart: str = "") -> dict:
+    """Create or update a recipe. Optionally set 'rezeptart' (one value from
+    get_recipe_type_options) to categorize the recipe, e.g. 'Auflauf', 'Kuchen', 'Suppen'."""
     html_desc = text_to_html(description)
     async with httpx.AsyncClient(timeout=15) as client:
         existing = await grocy_get(client, "/objects/recipes", params={"query[]": f"name={name}"})
@@ -1096,13 +1124,25 @@ async def create_or_update_recipe(name: str, description: str = "", base_serving
                                  json_body={"description": html_desc, "base_servings": base_servings})
             if ur.status_code not in (200, 204):
                 return {"success": False, "error": f"Grocy returned {ur.status_code}"}
+            if rezeptart:
+                uf = await grocy_put(client, f"/userfields/recipes/{recipe_id}",
+                                     json_body={"rezeptart": rezeptart})
+                if uf.status_code not in (200, 204):
+                    return {"success": True, "recipe_id": recipe_id, "name": name, "created": False,
+                            "userfield_warning": f"Grocy returned {uf.status_code} setting rezeptart"}
             return {"success": True, "recipe_id": recipe_id, "name": name, "created": False}
         cr = await grocy_post(client, "/objects/recipes",
                               {"name": name, "description": html_desc, "base_servings": base_servings})
         if cr.status_code != 200:
             return {"success": False, "error": f"Grocy returned {cr.status_code}"}
-        return {"success": True, "recipe_id": int(cr.json()["created_object_id"]),
-                "name": name, "created": True}
+        recipe_id = int(cr.json()["created_object_id"])
+        if rezeptart:
+            uf = await grocy_put(client, f"/userfields/recipes/{recipe_id}",
+                                 json_body={"rezeptart": rezeptart})
+            if uf.status_code not in (200, 204):
+                return {"success": True, "recipe_id": recipe_id, "name": name, "created": True,
+                        "userfield_warning": f"Grocy returned {uf.status_code} setting rezeptart"}
+        return {"success": True, "recipe_id": recipe_id, "name": name, "created": True}
 
 
 @mcp.tool()
