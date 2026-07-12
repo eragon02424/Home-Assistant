@@ -4,46 +4,50 @@
 Fuehrt den eigentlichen Sync durch:
 0. Prueft eine Lock-Datei um zu verhindern dass zwei Sync-Laeufe
    gleichzeitig laufen.
-1. Ermittelt Ordner per Graph API und schreibt eine sync_list Datei -
-   NUR Include-Zeilen fuer aktivierte Ordner (root-verankert, "/Pfad" und
-   "/Pfad/*" pro Ordner, praezise pro Unterordner-Ebene). Steigt NICHT in
-   deaktivierte Aeste ohne Unterordner-Overrides hinab. Nutzt
-   requests.Session() fuer Connection-Pooling. Wenn sich die sync_list
-   geaendert hat, wird automatisch --resync mitgegeben.
+1. Ermittelt Ordner per Graph API und schreibt eine sync_list Datei mit
+   EXPLIZITEN Exclude-Zeilen (Excludes zuerst, siehe unten) fuer jeden
+   deaktivierten Unterordner UND Include-Zeilen fuer aktivierte Ordner
+   (root-verankert, "/Pfad" und "/Pfad/*" pro Ordner, praezise pro
+   Unterordner-Ebene). Steigt NICHT in deaktivierte Aeste ohne
+   Unterordner-Overrides hinab. Nutzt requests.Session() fuer Connection-
+   Pooling. Wenn sich die sync_list geaendert hat, wird automatisch
+   --resync mitgegeben.
+
+   WICHTIG (Bugfix 12.07.2026): Reines WEGLASSEN eines deaktivierten
+   Unterordners (kein Include, aber auch kein explizites Exclude) hat bei
+   sehr grossen/tief verschachtelten Strukturen (z.B. "Dokumente/
+   Programmieren" mit tausenden Unity/Xamarin Build-Artefakten) NICHT
+   zuverlaessig funktioniert - onedrive hat diese Ordner trotzdem als
+   "included by sync_list config" behandelt, obwohl sie in keiner
+   Include-Zeile auftauchten. Erst ein EXPLIZITES "!/Pfad/*" fuer jeden
+   deaktivierten Unterordner (Excludes vor Includes in der Datei) hat das
+   zuverlaessig behoben. Bei kleineren Strukturen (z.B. "Scans") schien
+   reines Weglassen frueher zu funktionieren, war aber offenbar nicht
+   robust genug fuer den allgemeinen Fall - deshalb jetzt IMMER explizite
+   Excludes fuer jeden deaktivierten Ast, nicht nur bei Verdachtsfaellen.
 
 2. Ablauf pro Sync-Lauf (SICHERHEITSKRITISCH-Architektur):
 
    a) Paperless-Export: kopiert NEUE/GEAENDERTE Dokumente aus
       PAPERLESS_SOURCE_DIR (Paperless-ngx "originals" Ordner) NUR EINSEITIG
-      nach SHARE_DIR/Paperless-Export. Es wird NIE aus SHARE_DIR zurueck
-      nach Paperless kopiert, und lokal in Paperless-Export geloeschte
-      Dateien werden NICHT automatisch aus Paperless nachgeliefert-geloescht
-      (rein additiv/aktualisierend, keine Loeschungen in diese Richtung).
-      WICHTIG: der frisch angelegte Ordner existiert beim allerersten Mal
-      nur LOKAL (noch nicht auf OneDrive) - wird in main() explizit zur
-      sync_list-Ordnerliste hinzugefuegt, da sonst der Upload-Pass ihn
-      wegen der Default-Exclude-Logik von sync_list ignorieren wuerde.
+      nach SHARE_DIR/Paperless-Export.
    b) Download-Pass (--download-only): laedt NUR von OneDrive runter,
       laedt NIEMALS lokale Aenderungen hoch.
    c) Lokaler Cleanup (Dateityp-/Alters-Filter, deaktivierte Ordner
-      loeschen) - NUR lokal, NACH dem Download damit frisch geladene
-      Dateien korrekt gegen die Filter geprueft werden.
+      loeschen) - NUR lokal, NACH dem Download.
    d) Upload-Pass (--upload-only --no-remote-delete): laedt NUR neue/
-      geaenderte lokale Dateien HOCH (das umfasst auch frisch aus
-      Paperless kopierte Dokumente aus Schritt a). "--no-remote-delete"
-      verhindert explizit dass lokale LOESCHUNGEN (z.B. aus Schritt c)
-      als Loeschungen auf OneDrive ankommen.
+      geaenderte lokale Dateien HOCH. "--no-remote-delete" verhindert
+      explizit dass lokale LOESCHUNGEN als Loeschungen auf OneDrive
+      ankommen.
 
    *** NIEMALS auf einen einzelnen "--sync" Durchlauf ohne diese Trennung
    zurueckwechseln, ohne ausdrueckliche Bestaetigung des Nutzers! ***
    Am 09.07.2026 gab es einen ECHTEN DATENVERLUST-VORFALL: mit normalem
-   bidirektionalem "--sync" (kein --download-only/--upload-only) wurde
-   unser eigener lokaler Cleanup-Schritt von onedrive als "Nutzer hat
-   online geloescht" interpretiert und hochgeladen - 13 Ordner wurden
-   dadurch tatsaechlich von OneDrive geloescht (nur per OneDrive-
-   Papierkorb gerettet). Die Architektur mit --no-remote-delete auf dem
-   Upload-Pass verhindert das strukturell: der Upload-Pass kann NIEMALS
-   remote loeschen, unabhaengig davon was lokal geloescht wurde.
+   bidirektionalem "--sync" wurde unser eigener lokaler Cleanup-Schritt
+   von onedrive als "Nutzer hat online geloescht" interpretiert und
+   hochgeladen - 13 Ordner wurden dadurch tatsaechlich von OneDrive
+   geloescht (nur per OneDrive-Papierkorb gerettet). Die Architektur mit
+   --no-remote-delete auf dem Upload-Pass verhindert das strukturell.
 
    AKTIVITAETS-UEBERWACHUNG statt festem Zeit-Limit: Jede neue Zeile
    Ausgabe zaehlt als Lebenszeichen. Nur wenn STALL_TIMEOUT_SECONDS lang
@@ -79,9 +83,7 @@ PROGRESS_FILE = f"{CONFIG_DIR}/sync_progress.json"
 # Paperless-ngx Export: kopiert einseitig (nur Paperless -> OneDrive-Ordner)
 # neue/geaenderte Dokumente aus dem Paperless "originals" Verzeichnis in
 # einen dedizierten Unterordner, der dann ganz normal per Upload-Pass nach
-# OneDrive hochgeladen wird. Paperless selbst schreibt hier nie etwas
-# zurueck, und wir loeschen hier nichts automatisch (der Nutzer entfernt
-# ggf. manuell falls gewuenscht).
+# OneDrive hochgeladen wird.
 PAPERLESS_SOURCE_DIR = "/share/paperless/media/documents/originals"
 PAPERLESS_EXPORT_SUBDIR = "Paperless-Export"
 
@@ -169,17 +171,7 @@ def release_lock():
 def sync_paperless_export():
     """
     Kopiert einseitig neue/geaenderte Dateien aus PAPERLESS_SOURCE_DIR
-    (Paperless-ngx "originals") nach SHARE_DIR/Paperless-Export, damit sie
-    danach ganz normal per Upload-Pass nach OneDrive hochgeladen werden.
-    - Kopiert nur wenn Datei im Ziel fehlt ODER sich Groesse/Aenderungsdatum
-      unterscheiden (einfacher, robuster Change-Check ohne Hashing).
-    - Loescht NIE etwas - weder in Paperless noch im Export-Ordner - auch
-      wenn Paperless-seitig ein Dokument entfernt wurde. Der Nutzer hat
-      angegeben, hier i.d.R. nicht manuell einzugreifen; falls doch,
-      bleibt die Kopie im Export-Ordner einfach bestehen (keine
-      automatische Bereinigung).
-    - Erhaelt die Ordnerstruktur falls Paperless irgendwann mit
-      PAPERLESS_FILENAME_FORMAT in Unterordner organisiert.
+    nach SHARE_DIR/Paperless-Export. Loescht nie etwas.
     """
     if not os.path.isdir(PAPERLESS_SOURCE_DIR):
         log(f"[paperless] Quellordner nicht gefunden, ueberspringe: {PAPERLESS_SOURCE_DIR}")
@@ -308,16 +300,11 @@ def list_all_folders(config):
 
 def write_sync_list(config, all_folders):
     """
-    Schreibt eine onedrive sync_list Datei - NUR mit Include-Zeilen fuer
-    aktivierte Ordner (root-verankert). sync_list schliesst per Default
-    alles aus, das nicht gelistet ist.
-
-    WICHTIG (Unterordner-Granularitaet): Fuer jeden Ordner wird NUR dann
-    "/Pfad/*" (rekursiver Inhalt) geschrieben, wenn AUCH ALLE seine
-    bekannten Unterordner aktiviert sind. Hat ein Ordner deaktivierte
-    Unterordner, wird NUR "/Pfad" (der Ordner-Eintrag selbst, KEIN "/*")
-    geschrieben, und stattdessen fuer jeden aktivierten Unterordner
-    einzeln "/Pfad/Unterordner" + ggf. "/Pfad/Unterordner/*".
+    Schreibt eine onedrive sync_list Datei mit EXPLIZITEN Exclude-Zeilen
+    (zuerst) fuer jeden deaktivierten Unterordner, gefolgt von Include-
+    Zeilen fuer aktivierte Ordner (root-verankert). Reines Weglassen eines
+    deaktivierten Ordners hat sich bei grossen/tiefen Strukturen als nicht
+    zuverlaessig erwiesen - siehe Modul-Docstring.
     """
     changed = False
 
@@ -330,6 +317,7 @@ def write_sync_list(config, all_folders):
         children_of.setdefault(parent, []).append(path)
 
     includes = []
+    excludes = []
 
     def has_disabled_descendant(path):
         if not resolve_enabled(path, config):
@@ -341,6 +329,7 @@ def write_sync_list(config, all_folders):
 
     def emit(path):
         if not resolve_enabled(path, config):
+            excludes.append(f"!/{path}/*")
             return
         includes.append(f"/{path}")
         if has_disabled_descendant(path):
@@ -353,10 +342,11 @@ def write_sync_list(config, all_folders):
     for path in top_level:
         emit(path)
 
-    if all(resolve_enabled(f, config) for f in all_folders):
+    if not excludes and all(resolve_enabled(f, config) for f in all_folders):
         new_content = ""
     else:
-        new_content = "\n".join(includes) + "\n" if includes else "/__NICHTS_AKTIVIERT__\n"
+        # WICHTIG: Excludes IMMER zuerst, dann Includes.
+        new_content = "\n".join(excludes + includes) + "\n" if (excludes or includes) else "/__NICHTS_AKTIVIERT__\n"
 
     new_hash = hashlib.sha256(new_content.encode()).hexdigest()
     old_hash = None
@@ -376,7 +366,7 @@ def write_sync_list(config, all_folders):
     else:
         with open(SYNC_LIST_FILE, "w") as f:
             f.write(new_content)
-        log(f"[sync_list] {len(includes)} Einschluss-Zeilen geschrieben (praezise pro Unterordner-Ebene)")
+        log(f"[sync_list] {len(excludes)} Ausschluss-, {len(includes)} Einschluss-Zeilen geschrieben (Excludes zuerst)")
 
     if changed:
         log("[sync_list] Aenderung erkannt - dieser Sync laeuft mit --resync")
@@ -497,9 +487,7 @@ def get_effective_config(folder_path, config):
 
 def apply_filters_and_cleanup(config):
     """
-    Loescht NUR lokale Kopien (NIEMALS online - der nachfolgende Upload-
-    Pass laeuft mit --no-remote-delete, diese Loeschungen werden
-    garantiert nicht hochgeladen):
+    Loescht NUR lokale Kopien (NIEMALS online):
     - Ordner die per Konfiguration DEAKTIVIERT sind: KOMPLETT loeschen.
     - Dateien die nicht zum Filter passen oder zu alt sind: einzeln
       loeschen.
@@ -507,7 +495,6 @@ def apply_filters_and_cleanup(config):
     files_processed = 0
     files_deleted = 0
 
-    # Schritt 1: komplette deaktivierte Ordner loeschen
     for root, dirs, files in list(os.walk(SHARE_DIR)):
         rel_folder = os.path.relpath(root, SHARE_DIR)
         if rel_folder == ".":
@@ -523,7 +510,6 @@ def apply_filters_and_cleanup(config):
                 pass
             dirs[:] = []
 
-    # Schritt 2: Dateityp-/Alters-Filter innerhalb aktivierter Ordner
     for root, dirs, files in os.walk(SHARE_DIR):
         for filename in files:
             filepath = os.path.join(root, filename)
@@ -570,9 +556,6 @@ def main():
         status = load_status()
         errors = []
 
-        # 0) Paperless-Export: neue/geaenderte Dokumente einseitig in
-        #    einen dedizierten Unterordner kopieren, damit sie im
-        #    Upload-Pass automatisch nach OneDrive mitgenommen werden.
         try:
             write_progress("paperless", "Pruefe Paperless-Dokumente...")
             sync_paperless_export()
@@ -588,11 +571,6 @@ def main():
             all_folders = list_all_folders(config)
             log(f"[folders] {len(all_folders)} Ordner gefunden in {time.time()-t0:.1f}s")
 
-            # WICHTIG: Paperless-Export existiert beim allerersten Mal nur
-            # LOKAL (noch nicht auf OneDrive, da noch nie hochgeladen).
-            # Da sync_list per Default alles ausschliesst was nicht
-            # gelistet ist, wuerde der frisch angelegte Ordner sonst vom
-            # Upload-Pass ignoriert. Deshalb hier explizit ergaenzen.
             if PAPERLESS_EXPORT_SUBDIR not in all_folders and os.path.isdir(os.path.join(SHARE_DIR, PAPERLESS_EXPORT_SUBDIR)):
                 all_folders.append(PAPERLESS_EXPORT_SUBDIR)
                 all_folders.sort()
@@ -603,20 +581,14 @@ def main():
             log(f"[WARN] Konnte sync_list nicht aktualisieren: {e}")
             errors.append(f"{datetime.now().strftime('%H:%M')} sync_list Fehler: {e}")
 
-        # 1) Download-Pass: OneDrive -> lokal
         ok, err = run_download_pass(need_resync)
         if not ok:
             errors.append(f"{datetime.now().strftime('%H:%M')} {err}")
 
-        # 2) Lokaler Cleanup - NACH dem Download (frische Dateien korrekt
-        #    pruefen), VOR dem Upload (--no-remote-delete verhindert
-        #    ohnehin jede Remote-Loeschung, aber so ist die Reihenfolge
-        #    auch inhaltlich stimmig).
         write_progress("cleanup", "Filtere und raeume lokale Dateien auf...")
         files_processed, files_deleted = apply_filters_and_cleanup(config)
         log(f"[SYNC] Processed {files_processed} files, deleted {files_deleted} locally")
 
-        # 3) Upload-Pass: lokal -> OneDrive, NIE Remote-Loeschungen
         ok, err = run_upload_pass()
         if not ok:
             errors.append(f"{datetime.now().strftime('%H:%M')} {err}")
