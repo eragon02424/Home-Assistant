@@ -9,32 +9,38 @@ Fuehrt den eigentlichen Sync durch:
    Unterordner UND Include-Zeilen fuer aktivierte Ordner (root-verankert).
    Steigt NICHT in deaktivierte Aeste ohne Unterordner-Overrides hinab.
 
-1a. VORAB-CHECK (neu, 12.07.2026): Bevor der eigentliche (potenziell
-   stundenlange) Download-Pass startet, laeuft ein SCHNELLER --dry-run
-   Durchlauf. --dry-run wertet die sync_list identisch zu einem echten
-   Sync aus, laedt aber KEINE Dateiinhalte herunter - dadurch ist er
-   deutlich schneller. Die Ausgabe wird nach "Including"-Zeilen
-   durchsucht, die einen laut Konfiguration eigentlich DEAKTIVIERTEN Pfad
-   referenzieren. Wird sowas gefunden, heisst das: onedrive wuerde diesen
-   Pfad trotz Abwahl mitnehmen - EXAKT die Fehlerklasse die zuvor erst
-   nach Stunden auffiel (siehe Integritaetspruefung 1b unten). In diesem
-   Fall wird SOFORT eine Warnung geschrieben (sichtbar in der Web-UI,
-   noch bevor der lange Download ueberhaupt beginnt) UND automatisch ein
-   voller --resync fuer den nachfolgenden echten Lauf erzwungen, als
-   Selbstheilungsversuch.
+1a. VORAB-CHECK (12.07.2026, verschaerft): Bevor der eigentliche
+   (potenziell stundenlange) Download-Pass startet, laeuft ein SCHNELLER
+   --dry-run Durchlauf. --dry-run wertet die sync_list identisch zu einem
+   echten Sync aus, laedt aber KEINE Dateiinhalte herunter. Die Ausgabe
+   wird nach "Including"-Zeilen durchsucht, die einen laut Konfiguration
+   eigentlich DEAKTIVIERTEN Pfad referenzieren.
 
-1b. INTEGRITAETSPRUEFUNG (12.07.2026): Zusaetzlich, NACH dem echten
-   Download-Pass, BEVOR der Cleanup-Schritt Spuren wieder entfernt, wird
-   nochmal geprueft ob onedrive tatsaechlich das heruntergeladen hat, was
-   unsere Konfiguration vorgibt (Kontrolle des tatsaechlichen Ergebnisses,
-   nicht nur der Dry-Run-Vorhersage). GREIFT NICHT AUTOMATISCH EIN,
-   schreibt nur eine Warnung.
+   WICHTIG (Nutzerentscheidung 12.07.2026): Wird eine Diskrepanz
+   gefunden, wird der GESAMTE Sync-Lauf ABGEBROCHEN - KEIN Download, KEIN
+   Upload, gar nichts. Vorher wurde stattdessen automatisch ein
+   Selbstheilungsversuch (--resync) gestartet und der Sync trotzdem
+   durchgefuehrt - das wurde bewusst geaendert, weil es keinen Sinn
+   ergibt potenziell Gigabytes herunterzuladen wenn schon vorher bekannt
+   ist, dass etwas an der sync_list-Auswertung nicht stimmt. Stattdessen
+   nur eine klar sichtbare Fehlermeldung, der Nutzer entscheidet dann
+   bewusst ueber das weitere Vorgehen (z.B. manuell die onedrive
+   Datenbank zuruecksetzen und neu versuchen).
+
+1b. INTEGRITAETSPRUEFUNG (12.07.2026): Zusaetzlich, NACH einem
+   tatsaechlich durchgefuehrten Download-Pass, BEVOR der Cleanup-Schritt
+   Spuren wieder entfernt, wird nochmal geprueft ob onedrive tatsaechlich
+   das heruntergeladen hat, was unsere Konfiguration vorgibt (Kontrolle
+   des tatsaechlichen Ergebnisses, nicht nur der Dry-Run-Vorhersage).
+   GREIFT NICHT AUTOMATISCH EIN, schreibt nur eine Warnung (dieser Fall
+   tritt nur noch auf wenn der Vorab-Check selbst nichts fand, sich das
+   Verhalten aber zwischen Dry-Run und echtem Lauf unterscheidet).
 
 2. Ablauf pro Sync-Lauf (SICHERHEITSKRITISCH-Architektur):
 
    a) Paperless-Export: kopiert NEUE/GEAENDERTE Dokumente aus
       PAPERLESS_SOURCE_DIR NUR EINSEITIG nach SHARE_DIR/Paperless-Export.
-   b) Vorab-Check (--dry-run, siehe 1a).
+   b) Vorab-Check (--dry-run, siehe 1a). Bei Diskrepanz: ABBRUCH hier.
    c) Download-Pass (--download-only): laedt NUR von OneDrive runter,
       laedt NIEMALS lokale Aenderungen hoch.
    d) Integritaetspruefung (siehe 1b) - nur Warnung, kein Eingriff.
@@ -440,15 +446,16 @@ def _run_process_with_stall_detection(cmd):
 def preflight_check(config, need_resync):
     """
     VORAB-CHECK: Schneller --dry-run Durchlauf VOR dem echten (potenziell
-    stundenlangen) Download. --dry-run wertet sync_list identisch aus,
-    laedt aber keine Dateiinhalte herunter. Durchsucht die Ausgabe nach
-    "Including"-Zeilen die einen laut Konfiguration DEAKTIVIERTEN Pfad
-    referenzieren - genau die Fehlerklasse vom 12.07.2026, aber JETZT
-    erkannt bevor stundenlang gewartet werden muss.
+    stundenlangen) Download. Durchsucht die Ausgabe nach "Including"-
+    Zeilen die einen laut Konfiguration DEAKTIVIERTEN Pfad referenzieren.
 
-    Gibt (warnung_oder_None, need_resync) zurueck. Bei Diskrepanz wird
-    need_resync automatisch auf True gesetzt (Selbstheilungsversuch fuer
-    den nachfolgenden echten Lauf) UND eine Warnung geschrieben.
+    Gibt (should_abort: bool, warnung_oder_None) zurueck.
+    WICHTIG: Bei Diskrepanz wird should_abort=True zurueckgegeben - der
+    Aufrufer MUSS dann den kompletten Sync-Lauf abbrechen (kein Download,
+    kein Upload). Es gibt KEINEN automatischen Selbstheilungsversuch mehr
+    - der Nutzer hat sich bewusst dagegen entschieden, da es sinnlos ist
+    Gigabytes herunterzuladen wenn vorher schon klar ist dass etwas an
+    der sync_list-Auswertung nicht stimmt.
     """
     base_cmd = ["onedrive", "--confdir", ONEDRIVE_CONFIG_DIR, "--syncdir", SHARE_DIR,
                 "--sync", "--download-only", "--dry-run", "--verbose"]
@@ -460,10 +467,12 @@ def preflight_check(config, need_resync):
     ok, err, output = _run_process_with_stall_detection(base_cmd)
 
     if not ok:
-        # Vorab-Check selbst fehlgeschlagen (z.B. Netzwerkproblem) - kein
-        # Grund den echten Sync zu blockieren, nur vermerken.
-        log(f"[preflight] Vorab-Check fehlgeschlagen (wird ignoriert, echter Sync laeuft trotzdem): {err}")
-        return None, need_resync
+        # Vorab-Check selbst technisch fehlgeschlagen (z.B. Netzwerk-
+        # Timeout) - das ist kein Konfigurations-Mismatch, sondern ein
+        # anderes Problem. Hier NICHT abbrechen, der echte Lauf bzw.
+        # dessen eigene Fehlerbehandlung kuemmert sich darum.
+        log(f"[preflight] Vorab-Check selbst fehlgeschlagen (kein Konfigurations-Mismatch, wird nicht als Abbruchgrund gewertet): {err}")
+        return False, None
 
     disabled_paths = [key for key, val in config.items() if not val.get("sync", True)]
     problem_paths = set()
@@ -477,17 +486,19 @@ def preflight_check(config, need_resync):
         examples = ", ".join(sorted(problem_paths)[:5])
         more = f" (+{len(problem_paths) - 5} weitere)" if len(problem_paths) > 5 else ""
         msg = (
-            f"VORAB-WARNUNG (vor dem eigentlichen Download erkannt): Dry-Run zeigt "
-            f"dass onedrive folgende eigentlich deaktivierte Pfade trotzdem "
-            f"einschliessen wuerde: {examples}{more}. Erzwinge automatisch einen "
-            f"vollen --resync fuer diesen Lauf als Selbstheilungsversuch."
+            f"SYNC ABGEBROCHEN (Vorab-Check): Dry-Run zeigt dass onedrive folgende "
+            f"eigentlich deaktivierte Pfade trotzdem einschliessen wuerde: "
+            f"{examples}{more}. Kein Download/Upload durchgefuehrt - die sync_list-"
+            f"Auswertung von onedrive stimmt gerade nicht mit der Konfiguration "
+            f"ueberein. Bitte pruefen (z.B. items.sqlite3 in /data/onedrive/ loeschen "
+            f"und danach manuell neu synchronisieren)."
         )
         log(f"[preflight] {msg}")
-        write_progress("preflight_warning", msg)
-        return msg, True
+        write_progress("preflight_abort", msg)
+        return True, msg
 
-    log("[preflight] OK - keine Diskrepanz im Dry-Run gefunden")
-    return None, need_resync
+    log("[preflight] OK - keine Diskrepanz im Dry-Run gefunden, Sync wird fortgesetzt")
+    return False, None
 
 
 def run_download_pass(need_resync):
@@ -678,11 +689,17 @@ def main():
             log(f"[WARN] Konnte sync_list nicht aktualisieren: {e}")
             errors.append(f"{datetime.now().strftime('%H:%M')} sync_list Fehler: {e}")
 
-        # Vorab-Check: schneller --dry-run VOR dem echten Download, um
-        # Diskrepanzen sofort zu erkennen statt erst nach Stunden.
-        preflight_warning, need_resync = preflight_check(config, need_resync)
-        if preflight_warning:
+        # Vorab-Check: schneller --dry-run VOR dem echten Download. Bei
+        # Diskrepanz wird der GESAMTE Lauf abgebrochen (kein Download,
+        # kein Upload) - siehe Modul-Docstring fuer die Begruendung.
+        should_abort, preflight_warning = preflight_check(config, need_resync)
+        if should_abort:
             errors.append(f"{datetime.now().strftime('%H:%M')} {preflight_warning}")
+            status["errors"] = (status.get("errors", []) + errors)[-10:]
+            status["authenticated"] = True
+            save_status(status)
+            log(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Sync abgebrochen (Vorab-Check fand Diskrepanz).")
+            return
 
         ok, err = run_download_pass(need_resync)
         if not ok:
