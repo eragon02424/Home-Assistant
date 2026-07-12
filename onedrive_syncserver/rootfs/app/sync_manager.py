@@ -15,16 +15,27 @@ Fuehrt den eigentlichen Sync durch:
 
    WICHTIG (Bugfix 12.07.2026): Reines WEGLASSEN eines deaktivierten
    Unterordners (kein Include, aber auch kein explizites Exclude) hat bei
-   sehr grossen/tief verschachtelten Strukturen (z.B. "Dokumente/
-   Programmieren" mit tausenden Unity/Xamarin Build-Artefakten) NICHT
-   zuverlaessig funktioniert - onedrive hat diese Ordner trotzdem als
-   "included by sync_list config" behandelt, obwohl sie in keiner
-   Include-Zeile auftauchten. Erst ein EXPLIZITES "!/Pfad/*" fuer jeden
-   deaktivierten Unterordner (Excludes vor Includes in der Datei) hat das
-   zuverlaessig behoben. Bei kleineren Strukturen (z.B. "Scans") schien
-   reines Weglassen frueher zu funktionieren, war aber offenbar nicht
-   robust genug fuer den allgemeinen Fall - deshalb jetzt IMMER explizite
-   Excludes fuer jeden deaktivierten Ast, nicht nur bei Verdachtsfaellen.
+   sehr grossen/tief verschachtelten Strukturen NICHT zuverlaessig
+   funktioniert - onedrive hat solche Ordner trotzdem als "included by
+   sync_list config" behandelt. Erst ein EXPLIZITES "!/Pfad/*" fuer jeden
+   deaktivierten Unterordner (Excludes vor Includes) hat das behoben.
+
+1b. INTEGRITAETSPRUEFUNG (neu, 12.07.2026): Direkt NACH dem Download-Pass,
+   BEVOR der Cleanup-Schritt Spuren wieder entfernt, wird geprueft ob
+   onedrive tatsaechlich das heruntergeladen hat, was unsere Konfiguration
+   vorgibt. Dazu wird der lokale Ordnerbaum durchsucht und jede Datei die
+   in einem laut Konfiguration DEAKTIVIERTEN Pfad liegt gezaehlt. Findet
+   sich dort Material, bedeutet das: onedrive's interne Datenbank/
+   Interpretation der sync_list weicht von unserer Konfiguration ab -
+   genau die Fehlerklasse die am 12.07.2026 dazu fuehrte dass
+   "Dokumente/Programmieren" trotz Abwahl weiter synchronisiert wurde,
+   ohne dass irgendeine Fehlermeldung das angezeigt haette. Diese Pruefung
+   GREIFT NICHT AUTOMATISCH EIN (loescht/aendert nichts selbst - das macht
+   weiterhin ausschliesslich der normale Cleanup-Schritt danach), sondern
+   schreibt NUR eine klar sichtbare WARNUNG in die Fehlerliste, die in der
+   Web-UI auftaucht. So faellt eine erneute Diskrepanz sofort auf, statt
+   dass der Sync-Lauf stillschweigend mit falschem Ergebnis "erfolgreich"
+   durchlaeuft.
 
 2. Ablauf pro Sync-Lauf (SICHERHEITSKRITISCH-Architektur):
 
@@ -33,6 +44,7 @@ Fuehrt den eigentlichen Sync durch:
       nach SHARE_DIR/Paperless-Export.
    b) Download-Pass (--download-only): laedt NUR von OneDrive runter,
       laedt NIEMALS lokale Aenderungen hoch.
+   b2) Integritaetspruefung (siehe oben) - nur Warnung, kein Eingriff.
    c) Lokaler Cleanup (Dateityp-/Alters-Filter, deaktivierte Ordner
       loeschen) - NUR lokal, NACH dem Download.
    d) Upload-Pass (--upload-only --no-remote-delete): laedt NUR neue/
@@ -95,6 +107,7 @@ SCOPE = "Files.ReadWrite Files.ReadWrite.All Sites.ReadWrite.All offline_access"
 MAX_FOLDER_DEPTH = 10
 LOCK_STALE_SECONDS = 900
 STALL_TIMEOUT_SECONDS = 300  # 5 Minuten OHNE jede neue Ausgabe = echter Haenger
+INTEGRITY_WARN_THRESHOLD = 1  # ab wie vielen Fehltreffern gewarnt wird
 
 FILTER_EXTENSIONS = {
     "all": None,
@@ -485,6 +498,60 @@ def get_effective_config(folder_path, config):
                     effective[key] = c[key]
     return effective
 
+
+def verify_download_matches_config(config):
+    """
+    INTEGRITAETSPRUEFUNG: Vergleicht was onedrive TATSAECHLICH lokal
+    abgelegt hat mit dem was unsere Konfiguration eigentlich vorgibt.
+    Laeuft NACH dem Download-Pass, VOR dem Cleanup (der wuerde die Spuren
+    sonst wieder entfernen, bevor wir sie sehen).
+
+    Zaehlt Dateien die in einem laut Konfiguration DEAKTIVIERTEN Pfad
+    liegen. Wenn welche gefunden werden, bedeutet das: onedrive's interne
+    Interpretation der sync_list (oder deren Datenbank-Zustand) weicht von
+    unserer Konfiguration ab - ein echtes internes Inkonsistenz-Problem,
+    nicht nur "die Datei ist halt noch nicht geloescht worden".
+
+    GREIFT NICHT EIN - loescht/aendert nichts. Gibt nur eine Warnmeldung
+    zurueck (oder None wenn alles passt), die der Aufrufer in die
+    Fehlerliste schreiben kann, damit es in der Web-UI sichtbar auffaellt
+    statt dass der Sync-Lauf stillschweigend "erfolgreich" durchlaeuft
+    obwohl das Ergebnis nicht der Konfiguration entspricht.
+    """
+    mismatch_count = 0
+    mismatch_examples = []
+
+    for root, dirs, files in os.walk(SHARE_DIR):
+        if not files:
+            continue
+        rel_folder = os.path.relpath(root, SHARE_DIR)
+        if rel_folder == ".":
+            continue
+        effective = get_effective_config(rel_folder, config)
+        if not effective["sync"]:
+            mismatch_count += len(files)
+            if len(mismatch_examples) < 5:
+                mismatch_examples.append(rel_folder)
+
+    if mismatch_count >= INTEGRITY_WARN_THRESHOLD:
+        examples_str = ", ".join(mismatch_examples)
+        more = f" (+{len(mismatch_examples)} weitere Pfade)" if mismatch_count > len(mismatch_examples) else ""
+        msg = (
+            f"INTEGRITAETSWARNUNG: {mismatch_count} Datei(en) in laut Konfiguration "
+            f"deaktivierten Ordnern gefunden nach dem Download - onedrive's interner "
+            f"Zustand weicht von der sync_list/Konfiguration ab! Betroffene Pfade "
+            f"(Beispiele): {examples_str}{more}. Der lokale Cleanup-Schritt raeumt das "
+            f"zwar wie gewohnt lokal auf, aber die Diskrepanz sollte geprueft werden "
+            f"(z.B. items.sqlite3 zuruecksetzen und neu resyncen)."
+        )
+        log(f"[INTEGRITY] {msg}")
+        write_progress("integrity_warning", msg)
+        return msg
+
+    log("[INTEGRITY] OK - lokaler Zustand stimmt mit Konfiguration ueberein, keine Abweichung gefunden")
+    return None
+
+
 def apply_filters_and_cleanup(config):
     """
     Loescht NUR lokale Kopien (NIEMALS online):
@@ -584,6 +651,13 @@ def main():
         ok, err = run_download_pass(need_resync)
         if not ok:
             errors.append(f"{datetime.now().strftime('%H:%M')} {err}")
+
+        # Integritaetspruefung: NACH Download, VOR Cleanup - warnt nur,
+        # greift nicht ein. Siehe Modul-Docstring.
+        write_progress("integrity_check", "Pruefe ob Download der Konfiguration entspricht...")
+        integrity_warning = verify_download_matches_config(config)
+        if integrity_warning:
+            errors.append(f"{datetime.now().strftime('%H:%M')} {integrity_warning}")
 
         write_progress("cleanup", "Filtere und raeume lokale Dateien auf...")
         files_processed, files_deleted = apply_filters_and_cleanup(config)
