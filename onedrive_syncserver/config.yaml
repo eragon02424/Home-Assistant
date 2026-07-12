@@ -1,6 +1,6 @@
 name: "OneDrive SyncServer"
-description: "Synchronisiert Ordner zwischen Home Assistant und Microsoft OneDrive. Zwei-Pass-Architektur mit schnellem Dry-Run Vorab-Check und Integritaetspruefung nach jedem Download. Optionaler einseitiger Paperless-ngx Export. Pro-Ordner Filter und automatisches lokales Loeschen nach Zeit."
-version: "1.37.0"
+description: "Synchronisiert Ordner zwischen Home Assistant und Microsoft OneDrive. Zwei-Pass-Architektur mit Dry-Run Vorab-Check (bricht bei Diskrepanz komplett ab, kein sinnloser Download) und Integritaetspruefung nach jedem Download. Optionaler einseitiger Paperless-ngx Export. Pro-Ordner Filter und automatisches lokales Loeschen nach Zeit."
+version: "1.38.0"
 slug: "onedrive_syncserver"
 init: false
 arch:
