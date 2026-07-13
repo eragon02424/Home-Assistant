@@ -13,6 +13,23 @@ if [ ! -f "${SYNC_CONFIG}" ]; then
   echo '{}' > "${SYNC_CONFIG}"
 fi
 
+# Datei-/Ordnerrechte fuer synchronisierte Dateien: der onedrive-Client
+# verwendet standardmaessig sync_file_permissions=600 / sync_dir_permissions=700
+# (nur root lesbar). Andere Add-ons (z.B. Paperless-ngx), die im selben
+# /share-Ordner lesen muessen, kommen damit nicht an die Dateien.
+# Deshalb hier beim ersten Start auf 644/755 setzen - idempotent, ueber-
+# schreibt keine ggf. bereits manuell gesetzten Werte in der Config.
+ONEDRIVE_CONFIG_FILE="${ONEDRIVE_CONFIG_DIR}/config"
+if [ ! -f "${ONEDRIVE_CONFIG_FILE}" ]; then
+  echo 'sync_dir = "/share/onedrive"' > "${ONEDRIVE_CONFIG_FILE}"
+fi
+if ! grep -q '^sync_file_permissions' "${ONEDRIVE_CONFIG_FILE}"; then
+  echo 'sync_file_permissions = "644"' >> "${ONEDRIVE_CONFIG_FILE}"
+fi
+if ! grep -q '^sync_dir_permissions' "${ONEDRIVE_CONFIG_FILE}"; then
+  echo 'sync_dir_permissions = "755"' >> "${ONEDRIVE_CONFIG_FILE}"
+fi
+
 # Bei Container-Start ist garantiert kein Sync aktiv - ein evtl.
 # vorhandener Lock ist verwaist (z.B. weil der Container waehrend eines
 # laufenden Syncs neu gestartet wurde, etwa durch ein Add-on-Update).
