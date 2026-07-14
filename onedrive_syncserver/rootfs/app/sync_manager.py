@@ -2,8 +2,8 @@
 """OneDrive SyncServer - Sync Manager
 
 Fuehrt den eigentlichen Sync durch:
-0. Prueft eine Lock-Datei um zu verhindern dass zwei Sync-Laeufe
-   gleichzeitig laufen.
+0. Prueft eine Lock-Datei (ATOMAR, siehe acquire_lock Docstring) um zu
+   verhindern dass zwei Sync-Laeufe gleichzeitig laufen.
 1. Ermittelt Ordner per Graph API und schreibt eine sync_list Datei mit
    EXPLIZITEN Exclude-Zeilen (Excludes zuerst) fuer jeden deaktivierten
    Unterordner UND Include-Zeilen fuer aktivierte Ordner (root-verankert).
@@ -14,59 +14,31 @@ Fuehrt den eigentlichen Sync durch:
    Diskrepanz (onedrive wuerde einen deaktivierten Pfad trotzdem
    einschliessen) wird der GESAMTE Sync-Lauf ABGEBROCHEN - KEIN Download,
    KEIN Upload, KEINE gezielte Remote-Loeschung. Kein automatischer
-   Selbstheilungsversuch mehr (bewusste Nutzerentscheidung 12.07.2026):
-   es ist sinnlos Gigabytes herunterzuladen wenn schon vorher klar ist
-   dass etwas nicht stimmt.
+   Selbstheilungsversuch mehr (bewusste Nutzerentscheidung 12.07.2026).
 
 1b. INTEGRITAETSPRUEFUNG: Nach einem tatsaechlich durchgefuehrten
    Download-Pass, vor dem Cleanup, wird nochmal geprueft ob das
    tatsaechliche Ergebnis der Konfiguration entspricht. Nur Warnung.
 
 1c. GEZIELTE REMOTE-LOESCHUNG: Der normale Upload-Pass laeuft IMMER mit
-   --no-remote-delete (sicherheitskritisch, siehe unten) - lokale
-   Loeschungen werden GRUNDSAETZLICH NIE nach OneDrive uebertragen. Fuer
-   einzelne, explizit vom Nutzer markierte Ordner (Konfigurations-Flag
-   "delete_remote": true, z.B. weil Paperless-ngx Dokumente nach
-   Verarbeitung selbst loescht und die OneDrive-Kopie dann auch nicht
-   mehr gebraucht wird) gibt es eine GEZIELTE Ausnahme:
-   process_remote_delete_folders() vergleicht fuer NUR diese markierten
-   Ordner ein gespeichertes Manifest (welche Dateien beim letzten Lauf
-   dort lagen, mit ihrer OneDrive Item-ID) gegen den aktuellen lokalen
-   Stand. Fehlt eine vormals bekannte Datei jetzt lokal, wird sie GEZIELT
-   per einzelnem Graph-API DELETE-Aufruf online geloescht - komplett
-   unabhaengig vom normalen onedrive-Client-Prozess und dessen
-   --no-remote-delete Schutz, der fuer ALLE ANDEREN Ordner unveraendert
-   in vollem Umfang bestehen bleibt.
-
-   WICHTIG (Bugfix 14.07.2026): Dieser Schritt laeuft NUR NOCH NACH einem
-   tatsaechlich ERFOLGREICHEN Download-Pass, NICHT mehr davor bzw.
-   unconditional bei jedem Lauf. Vorher konnte folgendes passieren: eine
-   Datei wird online neu hinzugefuegt, der Sync-Lauf bricht aber (z.B.
-   durch den Vorab-Check wegen eines VOELLIG UNABHAENGIGEN Problems in
-   einem anderen Ordner) ab, BEVOR die neue Datei je heruntergeladen
-   wurde. Der naechste Lauf sah dann: Datei stand im letzten Manifest
-   (weil das Manifest schon VOR dem Abbruch aktualisiert wurde), ist aber
-   lokal nicht vorhanden -> wurde faelschlich als "Nutzer hat lokal
-   geloescht" interpretiert und dadurch VERSEHENTLICH ONLINE GELOESCHT,
-   obwohl real gar keine lokale Loeschung stattgefunden hatte. Da diese
-   Funktion erst NACH einem erfolgreichen Download laeuft, spiegelt der
-   lokale Stand beim Abgleich zuverlaessig den tatsaechlichen Online-
-   Stand wider.
+   --no-remote-delete (sicherheitskritisch, siehe unten). Fuer einzelne,
+   explizit vom Nutzer markierte Ordner (Konfigurations-Flag
+   "delete_remote": true) gibt es eine GEZIELTE Ausnahme via direktem
+   Graph-API DELETE, basierend auf einem Manifest-Vergleich (lokal
+   fehlende, vormals bekannte Dateien werden auch online geloescht).
+   Laeuft NUR NACH einem tatsaechlich ERFOLGREICHEN Download-Pass (Bugfix
+   14.07.2026 - siehe process_remote_delete_folders Aufruf in main()),
+   damit eine online neue aber noch nicht heruntergeladene Datei nicht
+   faelschlich als "lokal geloescht" interpretiert wird.
 
 2. Ablauf pro Sync-Lauf (SICHERHEITSKRITISCH-Architektur):
-
-   a) Paperless-Export: kopiert NEUE/GEAENDERTE Dokumente aus
-      PAPERLESS_SOURCE_DIR NUR EINSEITIG nach SHARE_DIR/Paperless-Export.
-   b) Vorab-Check (--dry-run, siehe 1a). Bei Diskrepanz: ABBRUCH hier -
-      alles Weitere (inkl. gezielter Remote-Loeschung) wird uebersprungen.
-   c) Download-Pass (--download-only): laedt NUR von OneDrive runter.
-   d) Gezielte Remote-Loeschung (siehe 1c) - NUR wenn c) erfolgreich war.
-   e) Integritaetspruefung (siehe 1b) - nur Warnung.
-   f) Lokaler Cleanup (Dateityp-/Alters-Filter, deaktivierte Ordner
-      loeschen) - NUR lokal, NACH dem Download.
-   g) Upload-Pass (--upload-only --no-remote-delete): laedt NUR neue/
-      geaenderte lokale Dateien HOCH, loescht NIE remote (ausser den
-      gezielten Ausnahmen aus Schritt d).
+   a) Paperless-Export (einseitig, siehe sync_paperless_export).
+   b) Vorab-Check (--dry-run). Bei Diskrepanz: ABBRUCH.
+   c) Download-Pass (--download-only).
+   d) Gezielte Remote-Loeschung - NUR wenn c) erfolgreich war.
+   e) Integritaetspruefung - nur Warnung.
+   f) Lokaler Cleanup (Filter/Alter, deaktivierte Ordner) - NUR lokal.
+   g) Upload-Pass (--upload-only --no-remote-delete).
 
    *** NIEMALS den globalen Upload-Pass von --no-remote-delete auf
    normales bidirektionales Loeschen umstellen, ohne ausdrueckliche
@@ -75,9 +47,7 @@ Fuehrt den eigentlichen Sync durch:
    unser eigener lokaler Cleanup-Schritt von onedrive als "Nutzer hat
    online geloescht" interpretiert und hochgeladen - 13 Ordner wurden
    dadurch tatsaechlich von OneDrive geloescht (nur per OneDrive-
-   Papierkorb gerettet). Gezielte Ausnahmen fuer einzelne Ordner laufen
-   daher ausschliesslich ueber den separaten Mechanismus in 1c, NIE durch
-   Aenderung der globalen --no-remote-delete Einstellung.
+   Papierkorb gerettet).
 
    AKTIVITAETS-UEBERWACHUNG statt festem Zeit-Limit fuer onedrive-
    Unterprozesse: jede neue Ausgabezeile zaehlt als Lebenszeichen. Nur
@@ -184,15 +154,42 @@ def clear_progress():
 
 
 def acquire_lock():
-    if os.path.exists(LOCK_FILE):
+    """
+    Atomarer Lock via os.open(O_CREAT | O_EXCL): das Betriebssystem
+    garantiert, dass die Datei-Erstellung fehlschlaegt wenn sie schon
+    existiert - im Gegensatz zu einem vorherigen "existiert die Datei? ->
+    dann schreiben" Ansatz, der eine ECHTE RACE CONDITION hatte: zwei
+    Prozesse die fast gleichzeitig starten konnten BEIDE die Pruefung
+    "Datei existiert nicht" passieren, bevor einer von beiden sie
+    tatsaechlich geschrieben hatte - der zweite ueberschrieb dann
+    einfach die Lock-Datei des ersten. Beobachtet am 14.07.2026: der
+    automatische 5-Minuten-Timer und ein manuell ausgeloester Sync
+    liefen dadurch gleichzeitig, mit zwei onedrive-Prozessen auf
+    derselben Datenbank gleichzeitig.
+    """
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
         age = time.time() - os.path.getmtime(LOCK_FILE)
         if age < LOCK_STALE_SECONDS:
             log(f"[LOCK] Ein anderer Sync laeuft bereits (Lock ist {age:.0f}s alt) - breche ab")
             return False
         log(f"[LOCK] Alter Lock ({age:.0f}s) wird als verwaist betrachtet und ueberschrieben")
-    with open(LOCK_FILE, 'w') as f:
-        f.write(str(os.getpid()))
-    return True
+        try:
+            os.remove(LOCK_FILE)
+        except FileNotFoundError:
+            pass
+        try:
+            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            log("[LOCK] Ein anderer Prozess hat den verwaisten Lock zwischenzeitlich uebernommen - breche ab")
+            return False
 
 def release_lock():
     if os.path.exists(LOCK_FILE):
@@ -782,9 +779,6 @@ def main():
             log(f"[WARN] Konnte sync_list nicht aktualisieren: {e}")
             errors.append(f"{datetime.now().strftime('%H:%M')} sync_list Fehler: {e}")
 
-        # Vorab-Check: schneller --dry-run VOR dem echten Download. Bei
-        # Diskrepanz wird der GESAMTE Lauf abgebrochen (kein Download,
-        # kein Upload, KEINE gezielte Remote-Loeschung).
         should_abort, preflight_warning = preflight_check(config, need_resync)
         if should_abort:
             errors.append(f"{datetime.now().strftime('%H:%M')} {preflight_warning}")
@@ -798,11 +792,6 @@ def main():
         if not download_ok:
             errors.append(f"{datetime.now().strftime('%H:%M')} {err}")
 
-        # Gezielte Remote-Loeschung: NUR nach erfolgreichem Download (siehe
-        # Bugfix-Hinweis 1c im Modul-Docstring - verhindert dass eine noch
-        # nicht heruntergeladene, aber online neue Datei faelschlich als
-        # "lokal geloescht" interpretiert und versehentlich online
-        # geloescht wird).
         if download_ok:
             try:
                 write_progress("delete_remote", "Pruefe gezielte Remote-Loeschungen...")
