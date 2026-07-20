@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
 """
-Minimal reverse proxy that rewrites Host and Origin headers
-so mcp-go's allowlist check passes for 127.0.0.1:8081.
+Minimal reverse proxy that strips the Origin header
+so mcp-go's origin check is skipped entirely.
 """
 import asyncio
 import aiohttp
 from aiohttp import web
 
 TARGET = "http://127.0.0.1:8081"
-FORCED_HOST = "127.0.0.1:8081"
-FORCED_ORIGIN = "http://127.0.0.1:8081"
 
 
 async def proxy(request: web.Request) -> web.StreamResponse:
-    # Build forwarded headers, overriding Host and Origin
-    headers = dict(request.headers)
-    headers["Host"] = FORCED_HOST
-    headers["Origin"] = FORCED_ORIGIN
-    # Remove hop-by-hop headers
-    for h in ("Transfer-Encoding", "Connection", "Keep-Alive", "Proxy-Authenticate",
-               "Proxy-Authorization", "TE", "Trailers", "Upgrade"):
-        headers.pop(h, None)
+    # Build forwarded headers, removing Origin and Host (will be set by aiohttp)
+    skip = {"host", "origin", "transfer-encoding", "connection",
+            "keep-alive", "proxy-authenticate", "proxy-authorization",
+            "te", "trailers", "upgrade"}
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in skip}
 
     url = TARGET + request.path_qs
     body = await request.read()
@@ -34,7 +29,6 @@ async def proxy(request: web.Request) -> web.StreamResponse:
             allow_redirects=False,
             timeout=aiohttp.ClientTimeout(total=300),
         ) as resp:
-            # Stream response back
             response = web.StreamResponse(status=resp.status, headers=dict(resp.headers))
             await response.prepare(request)
             async for chunk in resp.content.iter_chunked(8192):
