@@ -7,5 +7,7 @@ echo "Starting MCP Grafana..."
 echo "Grafana URL: ${GRAFANA_URL}"
 # Start mcp-grafana on internal port 8081
 mcp-grafana -t streamable-http -address "127.0.0.1:8081" &
-# Start nginx reverse proxy on port 8080 (rewrites Host header to localhost)
-nginx -g "daemon off;"
+# Wait for mcp-grafana to be ready
+sleep 2
+# Start Python proxy on port 8080 (rewrites Host and Origin headers)
+exec python3 /proxy.py
