@@ -1,5 +1,5 @@
 FROM python:3.12-alpine
-RUN apk add --no-cache nginx && \
+RUN apk add --no-cache nginx nginx-mod-http-headers-more && \
     pip install --no-cache-dir mcp-grafana && \
     which mcp-grafana && \
     ls -la $(which mcp-grafana)
