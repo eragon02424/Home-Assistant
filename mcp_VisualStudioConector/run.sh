@@ -27,7 +27,7 @@ export WORKSPACE_PATH=$(bashio::config 'workspace_path')
 export CLAUDE_BINARY=$(bashio::config 'claude_binary')
 export SSH_KEY_PATH="$KEY_FILE"
 
-bashio::log.info "Starting MCP Visual Studio Connector v0.1.3 on port 8768..."
+bashio::log.info "Starting MCP Visual Studio Connector v0.1.4 on port 8768..."
 bashio::log.info "SSH target: ${SSH_USER}@${SSH_HOST}:${SSH_PORT}"
 bashio::log.info "Workspace: ${WORKSPACE_PATH}"
 
