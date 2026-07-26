@@ -1,5 +1,5 @@
 """
-MCP Visual Studio Connector for Home Assistant v0.1.5
+MCP Visual Studio Connector for Home Assistant v0.1.6
 
 Startet headless Claude-Code-Jobs (claude -p ... --ide) auf einer entfernten
 Windows-Maschine (VM mit Visual Studio + firish/claude_code_vs Erweiterung)
@@ -10,23 +10,25 @@ Wichtig: Der Zielrechner ist WINDOWS, nicht Linux - alle Remote-Befehle sind
 PowerShell, nicht bash. Das unterscheidet dieses Addon von mcp_shell.
 
 Ablauf pro Job:
-  1. start_task() legt unter %TEMP%\\mcp_vs_jobs\\<job_id>\\ auf dem Windows-
-     Rechner ein Job-Verzeichnis an (prompt.txt, run.ps1) und startet dort
-     über WMI (Win32_Process.Create - NICHT Start-Process, siehe Kommentar
-     im Code) ein PowerShell-Skript, das:
-       - ins Workspace-Verzeichnis wechselt (damit .mcp.json / vs-debug /
-         vs-semantic geladen werden)
-       - den Prompt per stdin an `claude -p --output-format stream-json
-         --verbose --ide` übergibt
-       - die komplette Ausgabe nach output.jsonl umleitet
-       - nach Abschluss "DONE:<exitcode>" in status.txt schreibt
-     Der komplette Ablauf ist in try/catch gewrappt: jeder Fehler (Set-
-     Location, Get-Command claude, etc.) landet als Klartext in output.jsonl
-     UND status.txt wird immer auf DONE gesetzt - damit hängt kein Job mehr
-     unsichtbar in RUNNING fest, wenn irgendwo ein früher Fehler auftritt.
+  1. start_task() legt unter %USERPROFILE%\\mcp_vs_jobs\\<job_id>\\ auf dem
+     Windows-Rechner ein Job-Verzeichnis an und lädt vier Dateien hoch:
+     prompt.txt, run.ps1 (die eigentliche Arbeit, try/catch-abgesichert),
+     launcher.cmd (dünner Wrapper) und launch.ps1 (registriert + triggert
+     einen Windows Scheduled Task, der launcher.cmd ausführt).
+     Ein Scheduled Task ist die zuverlässigste bekannte Methode, einen
+     Prozess zu starten, der eine SSH-Sitzung übersteht: Windows' OpenSSH-
+     Server steckt Kindprozesse einer Sitzung in ein Job-Objekt und beendet
+     dieses beim Sitzungsende - das killt sowohl per Start-Process
+     "detached" als auch teils per WMI Win32_Process gestartete Prozesse.
+     Ein über den Task-Scheduler-Dienst gestarteter Prozess hängt in keinem
+     dieser Job-Objekte.
+     Der komplette Start-Mechanismus liegt in hochgeladenen Dateien statt in
+     der SSH-Kommandozeile selbst, um verschachtelte Anführungszeichen-
+     Probleme über mehrere Shell-Ebenen zu vermeiden.
   2. get_job_status() liest status.txt (oder "RUNNING" falls noch nicht da)
   3. get_job_log() liest output.jsonl (optional nur die letzten N Zeilen)
-  4. stop_task() beendet den Prozessbaum per taskkill (best effort)
+  4. stop_task() beendet den Prozess per taskkill anhand der von run.ps1
+     selbst gemeldeten PID (best effort)
 
 Job-Registry liegt zusätzlich lokal unter /data/jobs.json (einfache
 Wiederherstellung nach Addon-Neustart; kein Anspruch auf Vollständigkeit,
@@ -73,7 +75,6 @@ WORKSPACE_PATH = os.environ.get("WORKSPACE_PATH", "")
 CLAUDE_BINARY = os.environ.get("CLAUDE_BINARY", "claude")
 
 JOBS_REGISTRY_FILE = Path("/data/jobs.json")
-REMOTE_JOBS_BASE = "$env:TEMP\\mcp_vs_jobs"  # wird pro Job um \<job_id> ergänzt
 
 log.info("Token auth: %s", "enabled" if TOKEN else "disabled")
 log.info("SSH target: %s@%s:%s", SSH_USER, SSH_HOST, SSH_PORT)
@@ -169,10 +170,6 @@ def _extract_last_session_id(log_text: str) -> str | None:
     return matches[-1] if matches else None
 
 
-def _job_dir_ps(job_id: str) -> str:
-    return f"{REMOTE_JOBS_BASE}\\{job_id}"
-
-
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -213,19 +210,26 @@ async def start_task(
         extra_args += ["--allowedTools", allowed_tools]
     args_ps = " ".join(f"'{a}'" for a in extra_args)
 
-    # 1) $env:TEMP auflösen (in doppelten Anführungszeichen wird expandiert,
-    #    in einfachen NICHT - das war der ursprüngliche Bug) und Job-Verzeichnis anlegen
-    r_temp = await _run_ps("Write-Output $env:TEMP", timeout=15)
-    temp_dir = r_temp.stdout.strip()
-    if not temp_dir:
-        return {"success": False, "error": f"Konnte $env:TEMP nicht auflösen: {r_temp.stderr}"}
-    real_job_dir = f"{temp_dir}\\mcp_vs_jobs\\{job_id}"
+    # 1) Basisverzeichnis auflösen (USERPROFILE statt TEMP - TEMP kann im
+    #    Kontext mancher Prozessarten anders aufgelöst werden) und Job-
+    #    Verzeichnis anlegen
+    r_base = await _run_ps("Write-Output $env:USERPROFILE", timeout=15)
+    base_dir = r_base.stdout.strip()
+    if not base_dir:
+        return {"success": False, "error": f"Konnte $env:USERPROFILE nicht auflösen: {r_base.stderr}"}
+    real_job_dir = f"{base_dir}\\mcp_vs_jobs\\{job_id}"
 
     r = await _run_ps(f"New-Item -ItemType Directory -Force -Path '{real_job_dir}' | Out-Null")
     if r.exit_status != 0:
         return {"success": False, "error": f"Konnte Job-Verzeichnis nicht anlegen: {r.stderr}"}
 
-    # 2) prompt.txt und run.ps1 per SFTP hochladen
+    task_name = f"mcpvs_{job_id}"
+
+    # 2) prompt.txt, run.ps1, launcher.cmd und launch.ps1 per SFTP hochladen.
+    #    Der komplette Start-Mechanismus liegt in Dateien statt in der SSH-
+    #    Kommandozeile, um verschachtelte Anführungszeichen-Probleme über
+    #    mehrere Shell-Ebenen (Python -> SSH -> PowerShell -> schtasks) zu
+    #    vermeiden.
     try:
         conn = await _get_connection()
         async with conn.start_sftp_client() as sftp:
@@ -234,7 +238,8 @@ async def start_task(
 
             run_ps1 = (
                 f"try {{\n"
-                f"  'STEP: script started' | Out-File -Encoding utf8 -LiteralPath '{real_job_dir}\\output.jsonl'\n"
+                f"  $PID | Out-File -Encoding ascii -LiteralPath '{real_job_dir}\\launcher_pid.txt'\n"
+                f"  'STEP: script started, pid=' + $PID | Out-File -Encoding utf8 -LiteralPath '{real_job_dir}\\output.jsonl'\n"
                 f"  Set-Location -LiteralPath '{WORKSPACE_PATH}'\n"
                 f"  'STEP: Set-Location ok, cwd=' + (Get-Location).Path | Out-File -Append -Encoding utf8 -LiteralPath '{real_job_dir}\\output.jsonl'\n"
                 f"  $claudeCmd = Get-Command '{CLAUDE_BINARY}' -ErrorAction Stop\n"
@@ -246,47 +251,51 @@ async def start_task(
                 f"  ('FEHLER: ' + $_.Exception.Message) | Out-File -Append -Encoding utf8 -LiteralPath '{real_job_dir}\\output.jsonl'\n"
                 f"  'DONE:1' | Out-File -Encoding utf8 -LiteralPath '{real_job_dir}\\status.txt'\n"
                 f"}}\n"
+                f"schtasks /Delete /TN {task_name} /F | Out-Null\n"
             )
             async with sftp.open(f"{real_job_dir}\\run.ps1", "w", encoding="utf-8") as f:
                 await f.write(run_ps1)
+
+            launcher_cmd = (
+                f"@echo off\r\n"
+                f'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{real_job_dir}\\run.ps1"\r\n'
+            )
+            async with sftp.open(f"{real_job_dir}\\launcher.cmd", "w", encoding="utf-8") as f:
+                await f.write(launcher_cmd)
+
+            # Scheduled Task ist die zuverlässigste bekannte Methode, einen
+            # Prozess zu starten, der eine SSH-Sitzung überlebt: Windows'
+            # OpenSSH-Server steckt Kindprozesse einer Sitzung in ein Job-
+            # Objekt und beendet dieses beim Sitzungsende - das killt auch
+            # per Start-Process "detached" gestartete UND (wie sich zeigte)
+            # teils auch per WMI Win32_Process gestartete Prozesse. Ein über
+            # den Task Scheduler-Dienst gestarteter Prozess hängt in keinem
+            # dieser Job-Objekte.
+            launch_ps1 = (
+                f'schtasks /Create /TN {task_name} /TR "`"{real_job_dir}\\launcher.cmd`"" /SC ONCE /ST 23:59 /F | Out-Null\n'
+                f"schtasks /Run /TN {task_name} | Out-Null\n"
+            )
+            async with sftp.open(f"{real_job_dir}\\launch.ps1", "w", encoding="utf-8") as f:
+                await f.write(launch_ps1)
     except Exception as e:
         log.error("SFTP-Fehler beim Anlegen des Jobs: %s", e)
         return {"success": False, "error": f"SFTP error: {e}"}
 
-    # 3) status.txt initial auf RUNNING, dann Skript über WMI Win32_Process
-    #    starten (NICHT Start-Process!). Windows' OpenSSH-Server steckt alle
-    #    Kindprozesse einer SSH-Sitzung in ein Job-Objekt und beendet dieses
-    #    komplett, sobald die SSH-Sitzung schließt - auch "detached" per
-    #    Start-Process gestartete Prozesse werden dabei mitgekillt. Ein über
-    #    WMI (Win32_Process.Create) gestarteter Prozess hängt NICHT in diesem
-    #    Job-Objekt und überlebt das Sitzungsende zuverlässig.
-    inner_cmd = (
-        f"powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '{real_job_dir}\\run.ps1'"
-    )
-    inner_cmd_escaped = inner_cmd.replace("'", "''")
-    start_cmd = (
-        f"'RUNNING' | Out-File -Encoding utf8 -LiteralPath '{real_job_dir}\\status.txt'; "
-        f"$res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
-        f"-Arguments @{{ CommandLine = '{inner_cmd_escaped}' }}; "
-        f"$res.ProcessId | Out-File -Encoding ascii -LiteralPath '{real_job_dir}\\launcher_pid.txt'; "
-        f"Write-Output ('ReturnValue=' + $res.ReturnValue)"
-    )
-    r4 = await _run_ps(start_cmd, timeout=30)
-    if r4.exit_status != 0:
-        return {"success": False, "error": f"Konnte Job nicht starten: {r4.stderr}", "job_id": job_id}
+    # 3) status.txt initial auf RUNNING, dann launch.ps1 (Scheduled-Task-
+    #    Registrierung + Trigger) ausführen - eine einzige, saubere
+    #    Dateiaufruf ohne verschachtelte Quoting-Ebenen.
+    r_status = await _run_ps(f"'RUNNING' | Out-File -Encoding utf8 -LiteralPath '{real_job_dir}\\status.txt'")
+    if r_status.exit_status != 0:
+        return {"success": False, "error": f"Konnte status.txt nicht anlegen: {r_status.stderr}"}
 
-    # WMI Win32_Process.Create meldet Fehler NICHT über den PowerShell-Exit-
-    # Code, sondern über ReturnValue im Output (0 = Erfolg, alles andere =
-    # Fehlercode, z.B. 2 = Access Denied, 21 = Invalid Parameter).
-    wmi_return_value = None
-    m = re.search(r"ReturnValue=(\d+)", r4.stdout or "")
-    if m:
-        wmi_return_value = int(m.group(1))
-    if wmi_return_value != 0:
+    r4 = await _run_ps(
+        f"powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '{real_job_dir}\\launch.ps1'",
+        timeout=30,
+    )
+    if r4.exit_status != 0:
         return {
             "success": False,
-            "error": f"WMI Win32_Process.Create meldete Fehler (ReturnValue={wmi_return_value}). "
-                     f"Häufige Ursache: SSH-Benutzer hat keine ausreichenden Rechte für WMI-Prozesserstellung.",
+            "error": f"Konnte Scheduled Task nicht starten: {r4.stderr}",
             "job_id": job_id,
             "raw_output": r4.stdout,
         }
