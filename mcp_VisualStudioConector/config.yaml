@@ -1,6 +1,6 @@
 name: "MCP Visual Studio Connector"
 description: "MCP Server that starts/monitors headless Claude Code jobs (with Visual Studio IDE bridge: debugger, tests, semantic tools) on a remote Windows machine via SSH"
-version: "0.1.6"
+version: "0.1.7"
 slug: "mcp_visualstudioconector"
 init: false
 arch:
