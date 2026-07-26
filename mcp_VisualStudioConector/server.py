@@ -1,5 +1,5 @@
 """
-MCP Visual Studio Connector for Home Assistant v0.1.6
+MCP Visual Studio Connector for Home Assistant v0.1.7
 
 Startet headless Claude-Code-Jobs (claude -p ... --ide) auf einer entfernten
 Windows-Maschine (VM mit Visual Studio + firish/claude_code_vs Erweiterung)
@@ -16,15 +16,8 @@ Ablauf pro Job:
      launcher.cmd (dünner Wrapper) und launch.ps1 (registriert + triggert
      einen Windows Scheduled Task, der launcher.cmd ausführt).
      Ein Scheduled Task ist die zuverlässigste bekannte Methode, einen
-     Prozess zu starten, der eine SSH-Sitzung übersteht: Windows' OpenSSH-
-     Server steckt Kindprozesse einer Sitzung in ein Job-Objekt und beendet
-     dieses beim Sitzungsende - das killt sowohl per Start-Process
-     "detached" als auch teils per WMI Win32_Process gestartete Prozesse.
-     Ein über den Task-Scheduler-Dienst gestarteter Prozess hängt in keinem
-     dieser Job-Objekte.
-     Der komplette Start-Mechanismus liegt in hochgeladenen Dateien statt in
-     der SSH-Kommandozeile selbst, um verschachtelte Anführungszeichen-
-     Probleme über mehrere Shell-Ebenen zu vermeiden.
+     Prozess zu starten, der eine SSH-Sitzung übersteht - VERIFIZIERT
+     funktionierend am 2026-07-26 inkl. vs-debug/vs-semantic IDE-Bridge.
   2. get_job_status() liest status.txt (oder "RUNNING" falls noch nicht da)
   3. get_job_log() liest output.jsonl (optional nur die letzten N Zeilen)
   4. stop_task() beendet den Prozess per taskkill anhand der von run.ps1
@@ -245,7 +238,7 @@ async def start_task(
                 f"  $claudeCmd = Get-Command '{CLAUDE_BINARY}' -ErrorAction Stop\n"
                 f"  'STEP: resolved claude to ' + $claudeCmd.Source | Out-File -Append -Encoding utf8 -LiteralPath '{real_job_dir}\\output.jsonl'\n"
                 f"  Get-Content -Raw -LiteralPath '{real_job_dir}\\prompt.txt' "
-                f"| & $claudeCmd.Source -p {args_ps} *>> '{real_job_dir}\\output.jsonl'\n"
+                f"| & $claudeCmd.Source -p {args_ps} 2>&1 | Out-File -Append -Encoding utf8 -LiteralPath '{real_job_dir}\\output.jsonl'\n"
                 f"  \"DONE:$LASTEXITCODE\" | Out-File -Encoding utf8 -LiteralPath '{real_job_dir}\\status.txt'\n"
                 f"}} catch {{\n"
                 f"  ('FEHLER: ' + $_.Exception.Message) | Out-File -Append -Encoding utf8 -LiteralPath '{real_job_dir}\\output.jsonl'\n"
