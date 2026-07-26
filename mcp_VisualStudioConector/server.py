@@ -1,5 +1,5 @@
 """
-MCP Visual Studio Connector for Home Assistant v0.1.4
+MCP Visual Studio Connector for Home Assistant v0.1.5
 
 Startet headless Claude-Code-Jobs (claude -p ... --ide) auf einer entfernten
 Windows-Maschine (VM mit Visual Studio + firish/claude_code_vs Erweiterung)
@@ -20,6 +20,10 @@ Ablauf pro Job:
          --verbose --ide` übergibt
        - die komplette Ausgabe nach output.jsonl umleitet
        - nach Abschluss "DONE:<exitcode>" in status.txt schreibt
+     Der komplette Ablauf ist in try/catch gewrappt: jeder Fehler (Set-
+     Location, Get-Command claude, etc.) landet als Klartext in output.jsonl
+     UND status.txt wird immer auf DONE gesetzt - damit hängt kein Job mehr
+     unsichtbar in RUNNING fest, wenn irgendwo ein früher Fehler auftritt.
   2. get_job_status() liest status.txt (oder "RUNNING" falls noch nicht da)
   3. get_job_log() liest output.jsonl (optional nur die letzten N Zeilen)
   4. stop_task() beendet den Prozessbaum per taskkill (best effort)
@@ -229,10 +233,19 @@ async def start_task(
                 await f.write(prompt)
 
             run_ps1 = (
-                f"Set-Location -LiteralPath '{WORKSPACE_PATH}'\n"
-                f"Get-Content -Raw -LiteralPath '{real_job_dir}\\prompt.txt' "
-                f"| & '{CLAUDE_BINARY}' -p {args_ps} *> '{real_job_dir}\\output.jsonl'\n"
-                f"\"DONE:$LASTEXITCODE\" | Out-File -Encoding utf8 -LiteralPath '{real_job_dir}\\status.txt'\n"
+                f"try {{\n"
+                f"  'STEP: script started' | Out-File -Encoding utf8 -LiteralPath '{real_job_dir}\\output.jsonl'\n"
+                f"  Set-Location -LiteralPath '{WORKSPACE_PATH}'\n"
+                f"  'STEP: Set-Location ok, cwd=' + (Get-Location).Path | Out-File -Append -Encoding utf8 -LiteralPath '{real_job_dir}\\output.jsonl'\n"
+                f"  $claudeCmd = Get-Command '{CLAUDE_BINARY}' -ErrorAction Stop\n"
+                f"  'STEP: resolved claude to ' + $claudeCmd.Source | Out-File -Append -Encoding utf8 -LiteralPath '{real_job_dir}\\output.jsonl'\n"
+                f"  Get-Content -Raw -LiteralPath '{real_job_dir}\\prompt.txt' "
+                f"| & $claudeCmd.Source -p {args_ps} *>> '{real_job_dir}\\output.jsonl'\n"
+                f"  \"DONE:$LASTEXITCODE\" | Out-File -Encoding utf8 -LiteralPath '{real_job_dir}\\status.txt'\n"
+                f"}} catch {{\n"
+                f"  ('FEHLER: ' + $_.Exception.Message) | Out-File -Append -Encoding utf8 -LiteralPath '{real_job_dir}\\output.jsonl'\n"
+                f"  'DONE:1' | Out-File -Encoding utf8 -LiteralPath '{real_job_dir}\\status.txt'\n"
+                f"}}\n"
             )
             async with sftp.open(f"{real_job_dir}\\run.ps1", "w", encoding="utf-8") as f:
                 await f.write(run_ps1)
