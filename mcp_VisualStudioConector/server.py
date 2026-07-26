@@ -1,5 +1,5 @@
 """
-MCP Visual Studio Connector for Home Assistant v0.1.0
+MCP Visual Studio Connector for Home Assistant v0.1.1
 
 Startet headless Claude-Code-Jobs (claude -p ... --ide) auf einer entfernten
 Windows-Maschine (VM mit Visual Studio + firish/claude_code_vs Erweiterung)
@@ -62,7 +62,7 @@ TOKEN = os.environ.get("MCP_TOKEN", "")
 SSH_HOST = os.environ.get("SSH_HOST", "")
 SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
 SSH_USER = os.environ.get("SSH_USER", "")
-SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", "/data/ssh_key/mcp_vs_key")
+SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", "/config/mcp_vs_ssh/mcp_vs_key")
 SSH_PASSWORD = os.environ.get("SSH_PASSWORD", "")  # optionaler Fallback
 WORKSPACE_PATH = os.environ.get("WORKSPACE_PATH", "")
 CLAUDE_BINARY = os.environ.get("CLAUDE_BINARY", "claude")
