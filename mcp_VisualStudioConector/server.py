@@ -1,5 +1,5 @@
 """
-MCP Visual Studio Connector for Home Assistant v0.1.2
+MCP Visual Studio Connector for Home Assistant v0.1.3
 
 Startet headless Claude-Code-Jobs (claude -p ... --ide) auf einer entfernten
 Windows-Maschine (VM mit Visual Studio + firish/claude_code_vs Erweiterung)
@@ -11,8 +11,9 @@ PowerShell, nicht bash. Das unterscheidet dieses Addon von mcp_shell.
 
 Ablauf pro Job:
   1. start_task() legt unter %TEMP%\\mcp_vs_jobs\\<job_id>\\ auf dem Windows-
-     Rechner ein Job-Verzeichnis an (prompt.txt, run.ps1) und startet dort per
-     Start-Process (detached, WindowStyle Hidden) ein PowerShell-Skript, das:
+     Rechner ein Job-Verzeichnis an (prompt.txt, run.ps1) und startet dort
+     über WMI (Win32_Process.Create - NICHT Start-Process, siehe Kommentar
+     im Code) ein PowerShell-Skript, das:
        - ins Workspace-Verzeichnis wechselt (damit .mcp.json / vs-debug /
          vs-semantic geladen werden)
        - den Prompt per stdin an `claude -p --output-format stream-json
@@ -239,13 +240,23 @@ async def start_task(
         log.error("SFTP-Fehler beim Anlegen des Jobs: %s", e)
         return {"success": False, "error": f"SFTP error: {e}"}
 
-    # 3) status.txt initial auf RUNNING, dann Skript detached starten
+    # 3) status.txt initial auf RUNNING, dann Skript über WMI Win32_Process
+    #    starten (NICHT Start-Process!). Windows' OpenSSH-Server steckt alle
+    #    Kindprozesse einer SSH-Sitzung in ein Job-Objekt und beendet dieses
+    #    komplett, sobald die SSH-Sitzung schließt - auch "detached" per
+    #    Start-Process gestartete Prozesse werden dabei mitgekillt. Ein über
+    #    WMI (Win32_Process.Create) gestarteter Prozess hängt NICHT in diesem
+    #    Job-Objekt und überlebt das Sitzungsende zuverlässig.
+    inner_cmd = (
+        f"powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '{real_job_dir}\\run.ps1'"
+    )
+    inner_cmd_escaped = inner_cmd.replace("'", "''")
     start_cmd = (
         f"'RUNNING' | Out-File -Encoding utf8 -LiteralPath '{real_job_dir}\\status.txt'; "
-        f"$p = Start-Process -FilePath 'powershell.exe' -ArgumentList "
-        f"'-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File','{real_job_dir}\\run.ps1' "
-        f"-WindowStyle Hidden -PassThru; "
-        f"$p.Id | Out-File -Encoding ascii -LiteralPath '{real_job_dir}\\launcher_pid.txt'"
+        f"$res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+        f"-Arguments @{{ CommandLine = '{inner_cmd_escaped}' }}; "
+        f"$res.ProcessId | Out-File -Encoding ascii -LiteralPath '{real_job_dir}\\launcher_pid.txt'; "
+        f"Write-Output ('ReturnValue=' + $res.ReturnValue)"
     )
     r4 = await _run_ps(start_cmd, timeout=30)
     if r4.exit_status != 0:
