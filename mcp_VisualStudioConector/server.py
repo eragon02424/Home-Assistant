@@ -1,5 +1,5 @@
 """
-MCP Visual Studio Connector for Home Assistant v0.1.3
+MCP Visual Studio Connector for Home Assistant v0.1.4
 
 Startet headless Claude-Code-Jobs (claude -p ... --ide) auf einer entfernten
 Windows-Maschine (VM mit Visual Studio + firish/claude_code_vs Erweiterung)
@@ -261,6 +261,22 @@ async def start_task(
     r4 = await _run_ps(start_cmd, timeout=30)
     if r4.exit_status != 0:
         return {"success": False, "error": f"Konnte Job nicht starten: {r4.stderr}", "job_id": job_id}
+
+    # WMI Win32_Process.Create meldet Fehler NICHT über den PowerShell-Exit-
+    # Code, sondern über ReturnValue im Output (0 = Erfolg, alles andere =
+    # Fehlercode, z.B. 2 = Access Denied, 21 = Invalid Parameter).
+    wmi_return_value = None
+    m = re.search(r"ReturnValue=(\d+)", r4.stdout or "")
+    if m:
+        wmi_return_value = int(m.group(1))
+    if wmi_return_value != 0:
+        return {
+            "success": False,
+            "error": f"WMI Win32_Process.Create meldete Fehler (ReturnValue={wmi_return_value}). "
+                     f"Häufige Ursache: SSH-Benutzer hat keine ausreichenden Rechte für WMI-Prozesserstellung.",
+            "job_id": job_id,
+            "raw_output": r4.stdout,
+        }
 
     async with _jobs_lock:
         _jobs[job_id] = {
