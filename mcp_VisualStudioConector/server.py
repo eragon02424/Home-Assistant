@@ -1,5 +1,5 @@
 """
-MCP Visual Studio Connector for Home Assistant v0.1.1
+MCP Visual Studio Connector for Home Assistant v0.1.2
 
 Startet headless Claude-Code-Jobs (claude -p ... --ide) auf einer entfernten
 Windows-Maschine (VM mit Visual Studio + firish/claude_code_vs Erweiterung)
@@ -198,7 +198,6 @@ async def start_task(
         return {"success": False, "error": "WORKSPACE_PATH ist nicht konfiguriert (Add-on-Optionen prüfen)."}
 
     job_id = uuid.uuid4().hex[:12]
-    job_dir = _job_dir_ps(job_id)
 
     log.info("start_task job=%s resume=%s prompt=%s", job_id, resume_session_id or "-", prompt[:120])
 
@@ -209,9 +208,15 @@ async def start_task(
         extra_args += ["--allowedTools", allowed_tools]
     args_ps = " ".join(f"'{a}'" for a in extra_args)
 
-    # 1) Job-Verzeichnis anlegen
-    mkdir_cmd = f"New-Item -ItemType Directory -Force -Path '{job_dir}' | Out-Null"
-    r = await _run_ps(mkdir_cmd)
+    # 1) $env:TEMP auflösen (in doppelten Anführungszeichen wird expandiert,
+    #    in einfachen NICHT - das war der ursprüngliche Bug) und Job-Verzeichnis anlegen
+    r_temp = await _run_ps("Write-Output $env:TEMP", timeout=15)
+    temp_dir = r_temp.stdout.strip()
+    if not temp_dir:
+        return {"success": False, "error": f"Konnte $env:TEMP nicht auflösen: {r_temp.stderr}"}
+    real_job_dir = f"{temp_dir}\\mcp_vs_jobs\\{job_id}"
+
+    r = await _run_ps(f"New-Item -ItemType Directory -Force -Path '{real_job_dir}' | Out-Null")
     if r.exit_status != 0:
         return {"success": False, "error": f"Konnte Job-Verzeichnis nicht anlegen: {r.stderr}"}
 
@@ -219,12 +224,6 @@ async def start_task(
     try:
         conn = await _get_connection()
         async with conn.start_sftp_client() as sftp:
-            # PowerShell nutzt $env:TEMP als Basis (REMOTE_JOBS_BASE) - für
-            # SFTP brauchen wir den tatsächlich expandierten Pfad:
-            r3 = await _run_ps("Write-Output $env:TEMP", timeout=15)
-            temp_dir = r3.stdout.strip()
-            real_job_dir = f"{temp_dir}\\mcp_vs_jobs\\{job_id}"
-
             async with sftp.open(f"{real_job_dir}\\prompt.txt", "w", encoding="utf-8") as f:
                 await f.write(prompt)
 
