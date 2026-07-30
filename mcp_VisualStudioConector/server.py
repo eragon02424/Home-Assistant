@@ -1,5 +1,5 @@
 """
-MCP Visual Studio Connector for Home Assistant v0.1.9
+MCP Visual Studio Connector for Home Assistant v0.1.10
 
 Startet headless Claude-Code-Jobs (claude -p ... --ide) auf einer entfernten
 Windows-Maschine (VM mit Visual Studio + firish/claude_code_vs Erweiterung)
@@ -24,16 +24,33 @@ Ablauf pro Job:
   4. stop_task() beendet den Prozess per taskkill anhand der von run.ps1
      selbst gemeldeten PID (best effort)
 
-WICHTIG (seit v0.1.8): Der Workspace liegt zwingend unter einem UNC-Pfad
-(zum Beispiel einer VMware-Shared-Folder-Freigabe), weil SSH-Sitzungen
-keine per net-use/VMware zugewiesenen Laufwerksbuchstaben (Z: o.ae.) sehen
-- das ist sitzungsgebunden und wurde mehrfach verifiziert (Get-PSDrive in
-einer frischen SSH-Sitzung zeigt kein Z:). Claude Code stuft Lese-/Glob-
-Zugriffe auf UNC-Pfade als potenziellen Netzwerkzugriff ein und fragt
-dafuer nach - eine Rueckfrage, die im Headless-Betrieb NIE beantwortet
-werden kann und den Job fuer immer unsichtbar in RUNNING haengen laesst.
-Deshalb ist der Default fuer permission_mode "bypassPermissions", nicht
-"acceptEdits".
+WORKSPACE-PFAD (seit v0.1.10 empfohlen: LOKALER Pfad, z.B. ein lokaler
+Git-Klon unter C:\\Users\\<user>\\Desktop\\...): Ursprünglich lief der
+Workspace über einen VMware-Shared-Folder-UNC-Pfad
+(\\\\vmware-host\\Shared Folders\\...). Das funktionierte technisch, hatte
+aber zwei echte Nachteile, die am 2026-07-30 durch Umzug auf einen lokalen
+Git-Klon behoben wurden:
+  - Der VMware-HGFS-Treiber unterstützt kein echtes fchmod, wodurch Claude
+    Codes natives Write/Edit-Tool dort fehlschlug und auf einen langsameren
+    PowerShell-Fallback auswich (Mehrkosten pro Datei-Edit, kein
+    Funktionsverlust, aber unnötiger Overhead).
+  - Git-CLI-Befehle (add/commit/push) sind auf einem reinen Host-Mount oft
+    gar nicht sinnvoll nutzbar, weil das Repository dort ohnehin meist nur
+    zum Lesen gedacht ist. Auf einem lokalen Git-Klon funktioniert
+    `git status`/`commit`/`push` direkt aus einem Claude-Code-Job heraus.
+  Falls doch ein UNC-Pfad genutzt wird: SSH-Sitzungen sehen KEINE per
+  net-use/VMware zugewiesenen Laufwerksbuchstaben (Z: o.ae.) - das ist
+  sitzungsgebunden (verifiziert mit Get-PSDrive in einer frischen SSH-
+  Sitzung: kein Z:). Dann zwingend den UNC-Pfad statt Z:\\... verwenden.
+
+WARUM permission_mode DEFAULT "bypassPermissions" IST: Unabhängig vom
+Pfad-Typ gilt generell im Headless-Betrieb: JEDE interaktive Rückfrage
+(z.B. bei potenziell riskanten Bash-Befehlen oder - wie beim alten
+UNC-Setup - bei vermeintlichen Netzwerkzugriffen) kann von niemandem
+beantwortet werden und lässt den Job für immer unsichtbar in RUNNING
+hängen. Deshalb bleibt bypassPermissions der sichere Default, auch wenn
+das UNC-spezifische Rückfrageproblem seit dem Umzug auf lokale Pfade
+nicht mehr auftritt.
 
 Job-Registry liegt zusätzlich lokal unter /data/jobs.json (einfache
 Wiederherstellung nach Addon-Neustart; kein Anspruch auf Vollständigkeit,
@@ -196,14 +213,12 @@ async def start_task(
             --allowedTools (e.g. "mcp__vs-debug__*,Read,Edit"). Empty = all
             tools available in the project are permitted.
         permission_mode: --permission-mode value (default "bypassPermissions").
-            Default ist bewusst bypassPermissions, NICHT acceptEdits: der
-            Workspace liegt zwingend unter einem UNC-Pfad (SSH-Sitzungen
-            sehen keine Laufwerksbuchstaben wie Z: - siehe README), und
-            Claude Code stuft UNC-Pfad-Zugriffe (Read/Glob) als potenziellen
-            Netzwerkzugriff ein und fragt dafür nach - eine Rückfrage, die
-            im Headless-Betrieb nie beantwortet werden kann und den Job für
-            immer in RUNNING hängen lässt. Nur auf ein engeres Mode
-            zurückstellen, wenn ganz bewusst mehr Kontrolle gewünscht ist.
+            Default ist bewusst bypassPermissions, NICHT acceptEdits: im
+            Headless-Betrieb kann JEDE interaktive Rückfrage von Claude Code
+            (z.B. bei potenziell riskanten Bash-Befehlen) niemals beantwortet
+            werden und lässt den Job für immer unsichtbar in RUNNING hängen.
+            Nur auf ein engeres Mode zurückstellen, wenn ganz bewusst mehr
+            Kontrolle gewünscht ist (z.B. via allowed_tools eingrenzen).
 
     Returns:
         dict with job_id to use for get_job_status/get_job_log/stop_task.
