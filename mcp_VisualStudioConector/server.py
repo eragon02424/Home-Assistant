@@ -1,5 +1,5 @@
 """
-MCP Visual Studio Connector for Home Assistant v0.1.8
+MCP Visual Studio Connector for Home Assistant v0.1.9
 
 Startet headless Claude-Code-Jobs (claude -p ... --ide) auf einer entfernten
 Windows-Maschine (VM mit Visual Studio + firish/claude_code_vs Erweiterung)
@@ -17,21 +17,23 @@ Ablauf pro Job:
      einen Windows Scheduled Task, der launcher.cmd ausführt).
      Ein Scheduled Task ist die zuverlässigste bekannte Methode, einen
      Prozess zu starten, der eine SSH-Sitzung übersteht - VERIFIZIERT
-     funktionierend am 2026-07-26 inkl. vs-debug/vs-semantic IDE-Bridge.
+     funktionierend am 2026-07-26 inkl. vs-debug/vs-semantic IDE-Bridge,
+     und erneut nach VM-Neuinstallation am 2026-07-30.
   2. get_job_status() liest status.txt (oder "RUNNING" falls noch nicht da)
   3. get_job_log() liest output.jsonl (optional nur die letzten N Zeilen)
   4. stop_task() beendet den Prozess per taskkill anhand der von run.ps1
      selbst gemeldeten PID (best effort)
 
 WICHTIG (seit v0.1.8): Der Workspace liegt zwingend unter einem UNC-Pfad
-(z.B. \\vmware-host\Shared Folders\...), weil SSH-Sitzungen keine per
-net-use/VMware zugewiesenen Laufwerksbuchstaben (Z: o.ä.) sehen - das ist
-sitzungsgebunden und wurde mehrfach verifiziert (Get-PSDrive in einer
-frischen SSH-Sitzung zeigt kein Z:). Claude Code stuft Lese-/Glob-Zugriffe
-auf UNC-Pfade als potenziellen Netzwerkzugriff ein und fragt dafür nach -
-eine Rückfrage, die im Headless-Betrieb NIE beantwortet werden kann und den
-Job für immer unsichtbar in RUNNING hängen lässt. Deshalb ist der Default
-für permission_mode "bypassPermissions", nicht "acceptEdits".
+(zum Beispiel einer VMware-Shared-Folder-Freigabe), weil SSH-Sitzungen
+keine per net-use/VMware zugewiesenen Laufwerksbuchstaben (Z: o.ae.) sehen
+- das ist sitzungsgebunden und wurde mehrfach verifiziert (Get-PSDrive in
+einer frischen SSH-Sitzung zeigt kein Z:). Claude Code stuft Lese-/Glob-
+Zugriffe auf UNC-Pfade als potenziellen Netzwerkzugriff ein und fragt
+dafuer nach - eine Rueckfrage, die im Headless-Betrieb NIE beantwortet
+werden kann und den Job fuer immer unsichtbar in RUNNING haengen laesst.
+Deshalb ist der Default fuer permission_mode "bypassPermissions", nicht
+"acceptEdits".
 
 Job-Registry liegt zusätzlich lokal unter /data/jobs.json (einfache
 Wiederherstellung nach Addon-Neustart; kein Anspruch auf Vollständigkeit,
