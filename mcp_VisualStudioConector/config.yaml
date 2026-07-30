@@ -1,6 +1,6 @@
 name: "MCP Visual Studio Connector"
 description: "MCP Server that starts/monitors headless Claude Code jobs (with Visual Studio IDE bridge: debugger, tests, semantic tools) on a remote Windows machine via SSH"
-version: "0.1.9"
+version: "0.1.10"
 slug: "mcp_visualstudioconector"
 init: false
 arch:
@@ -15,7 +15,7 @@ options:
   ssh_host: "192.168.178.111"
   ssh_port: 22
   ssh_user: "User"
-  workspace_path: "\\\\vmware-host\\Shared Folders\\01 Data\\C#\\Maschiene\\OpennessBaumstrucktur20211209"
+  workspace_path: "C:\\Users\\User\\Desktop\\OpennessNeu"
   claude_binary: "claude"
 schema:
   ssh_host: "str"
