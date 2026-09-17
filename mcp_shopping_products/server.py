@@ -1,4 +1,15 @@
-"""MCP Shopping Products for Home Assistant v3.9.0
+"""MCP Shopping Products for Home Assistant v3.10.0
+
+v3.10.0 changes:
+- New tool queue_product_image_job(product_id, image_url): lets Claude queue
+  a product image job from ANY direct image URL (e.g. found via web search),
+  not just OpenFoodFacts. Reuses the exact same image_jobs pipeline/worker as
+  the OFF results (type="product_image"), so download, retry, failure and
+  needs_user_decision handling all behave identically.
+- image_jobs now carry a "source" field ("off" for the automatic OpenFoodFacts
+  pipeline, "claude_web" for manually queued jobs) so list_image_jobs() /
+  get_image_job() show where a picture came from. Existing OFF call sites
+  updated to tag their jobs with source="off".
 
 v3.9.0 changes:
 - New tool get_recipe_type_options(): reads the allowed values of the
@@ -20,7 +31,7 @@ v3.8.0 changes:
 - api_shopping_list now returns "pending_delete" array with hours_left per item.
 
 v3.7.0: shopping list tab, grouped by category, hard delete on swipe
-v3.6.0: upload_recipe_picture_base64 tool (bypasses OneDrive for recipe pics)
+v3.6.0: upload_recipe_picture_base64 tool (bypasses OneDrive entirely)
 v3.5.0: needs_user_decision is informational only, worker always retries
 
 v3.4.0: image worker iterates through all active jobs until one succeeds
@@ -117,6 +128,7 @@ def add_image_job(job: dict):
     job.setdefault("failed_attempts", 0)
     job.setdefault("needs_user_decision", False)
     job.setdefault("last_error", None)
+    job.setdefault("source", "off")
     jobs.append(job)
     save_image_jobs(jobs)
 
@@ -336,7 +348,8 @@ def _run_off_lookup_tick():
         r = results[0]
         print(f"[OFF] Eindeutig {product_id}: '{r['name']}' → image_job")
         add_image_job({"id": make_job_id(), "type": "product_image", "grocy_id": product_id,
-                       "image_url": r["image_url"], "queued_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+                       "image_url": r["image_url"], "source": "off",
+                       "queued_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
         return
     print(f"[OFF] {len(results)} Treffer für {product_id} → lookup_done")
     done = load_lookup_done()
@@ -580,6 +593,12 @@ mcp = FastMCP(
         "  When you see needs_user_decision=true: inform the user of the error and\n"
         "  the bildname, so they can upload the file to OneDrive.\n"
         "  dismiss_failed_image_job(job_id) only removes a job if user explicitly asks.\n\n"
+        "MANUAL PRODUCT IMAGES: if OFF has no good match, Claude can web_search /\n"
+        "  web_fetch a product page, extract a direct image URL (og:image or <img src>,\n"
+        "  must end in .jpg/.png/.webp - not a webpage link), then call\n"
+        "  queue_product_image_job(product_id, image_url). The add-on downloads and\n"
+        "  attaches it exactly like an OFF result - Claude never handles image bytes.\n"
+        "  These jobs are tagged source='claude_web' vs 'off' so their origin stays visible.\n\n"
         "RECIPE PICTURES: prefer upload_recipe_picture_base64() when the user shares\n"
         "  an image directly with Claude - bypasses OneDrive entirely.\n\n"
         "RECIPE CATEGORIZATION: call get_recipe_type_options() to see the current list of\n"
@@ -758,7 +777,7 @@ async def get_products_pending_lookup() -> dict:
                             "grocy_name": j["grocy_name"]} for j in no_results],
         "image_download_pending": len(product_image_jobs),
         "needs_attention": [{"job_id": j["id"], "type": j["type"], "grocy_id": j["grocy_id"],
-                             "bildname": j.get("bildname"),
+                             "bildname": j.get("bildname"), "source": j.get("source", "off"),
                              "failed_attempts": j.get("failed_attempts", 0),
                              "last_error": j.get("last_error")} for j in needs_attention],
     }
@@ -796,6 +815,7 @@ async def set_lookup_decision(job_id: str, decision_index: int) -> dict:
             save_lookup_done(done)
             add_image_job({"id": make_job_id(), "type": "product_image",
                            "grocy_id": job["product_id"], "image_url": chosen["image_url"],
+                           "source": "off",
                            "queued_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
             remove_lookup_done(job_id)
             return {"success": True, "job_id": job_id, "product_id": job["product_id"],
@@ -817,6 +837,9 @@ async def list_image_jobs() -> dict:
     """List all pending image jobs.
     Jobs with needs_user_decision=true have failed 3+ times but are still
     retried every minute. The worker does NOT block on these.
+    Each job's "source" field is "off" (automatic OpenFoodFacts pipeline) or
+    "claude_web" (Claude queued it manually via queue_product_image_job after
+    a web search) so it stays visible where a picture came from.
     Use dismiss_failed_image_job() only if the user explicitly wants to remove a job."""
     jobs = load_image_jobs()
     needs_attention = [j for j in jobs if j.get("needs_user_decision")]
@@ -860,9 +883,40 @@ async def queue_recipe_image_job(recipe_id: int, bildname: str) -> dict:
     if not bildname or not recipe_id:
         return {"success": False, "error": "recipe_id und bildname Pflicht"}
     job = {"id": make_job_id(), "type": "rezept", "grocy_id": recipe_id,
-           "bildname": bildname, "queued_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+           "bildname": bildname, "source": "off",
+           "queued_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
     add_image_job(job)
     return {"success": True, "job_id": job["id"]}
+
+
+@mcp.tool()
+async def queue_product_image_job(product_id: int, image_url: str) -> dict:
+    """Queue a product image job from a direct image URL that Claude found itself
+    (e.g. via web_search + web_fetch on a retailer/manufacturer page), for cases
+    where OpenFoodFacts has no usable match (raw produce, cleaning products,
+    regional brands, etc.).
+
+    image_url MUST be a direct link to the image file itself (ends in
+    .jpg/.jpeg/.png/.webp - e.g. an og:image meta tag or an <img src> found by
+    fetching a product page), NOT a link to a webpage that merely displays the
+    image. Claude only ever passes the URL - the actual download and upload to
+    Grocy happens in this add-on's existing image worker, exactly like the
+    OpenFoodFacts pipeline. Claude never receives or handles the image bytes.
+
+    The job is tagged source="claude_web" (vs "off" for automatic OFF jobs) so
+    list_image_jobs()/get_image_job() always show whether a picture came from
+    the automatic pipeline or was manually sourced and confirmed by Claude."""
+    if not product_id or not image_url:
+        return {"success": False, "error": "product_id und image_url Pflicht"}
+    if not image_url.split("?")[0].lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+        return {"success": False,
+                "error": "image_url sieht nicht wie ein direkter Bildlink aus "
+                         "(muss auf .jpg/.jpeg/.png/.webp enden, kein Webseiten-Link)"}
+    job = {"id": make_job_id(), "type": "product_image", "grocy_id": product_id,
+           "image_url": image_url, "source": "claude_web",
+           "queued_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    add_image_job(job)
+    return {"success": True, "job_id": job["id"], "product_id": product_id, "source": "claude_web"}
 
 
 @mcp.tool()
