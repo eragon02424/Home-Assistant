@@ -1,4 +1,8 @@
-"""MCP Shopping Products for Home Assistant v3.10.0
+"""MCP Shopping Products for Home Assistant v3.11.0
+
+v3.11.0 changes:
+- Migrated to MCP Python SDK 2.x (FastMCP -> MCPServer). Tool names, schemas
+  and results unchanged; tool error messages stay visible to the model.
 
 v3.10.0 changes:
 - New tool queue_product_image_job(product_id, image_url): lets Claude queue
@@ -52,9 +56,9 @@ import urllib.parse
 import urllib.request
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.server.fastmcp.utilities.types import Image as MCPImage
+from mcp.server.mcpserver.utilities.types import Image as MCPImage
 from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
@@ -578,7 +582,8 @@ def start_auto_queue_worker():
 
 # ── MCP tools ───────────────────────────────────────────────
 
-mcp = FastMCP(
+mcp = MCPServer(
+    version="3.11.0",
     name="MCP Shopping Products",
     instructions=(
         "Tools for Grocy products, recipes, shopping lists, product groups and data maintenance.\n\n"
@@ -606,7 +611,47 @@ mcp = FastMCP(
         "HELPERS: list_locations(), list_product_groups(), search_quantity_units()"
     ),
 )
-mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+# ── MCP SDK 2.x: Fehlermeldungen von Tools wie in 1.x an das Modell durchreichen ──
+# In 2.x sieht das Modell bei normalen Exceptions nur "Error executing tool <name>".
+# Dieser Wrapper macht aus jeder Exception einen ToolError mit der Originalmeldung.
+import functools as _functools
+import inspect as _inspect
+from mcp.server.mcpserver.exceptions import ToolError as _ToolError
+from mcp.shared.exceptions import MCPError as _MCPError
+
+
+def _visible_errors(fn):
+    if _inspect.iscoroutinefunction(fn):
+        @_functools.wraps(fn)
+        async def _wrapper(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except (_ToolError, _MCPError):
+                raise
+            except Exception as e:
+                raise _ToolError(str(e) or type(e).__name__) from e
+    else:
+        @_functools.wraps(fn)
+        def _wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except (_ToolError, _MCPError):
+                raise
+            except Exception as e:
+                raise _ToolError(str(e) or type(e).__name__) from e
+    return _wrapper
+
+
+_mcp_tool_orig = mcp.tool
+
+
+def _mcp_tool(*args, **kwargs):
+    decorator = _mcp_tool_orig(*args, **kwargs)
+    return lambda fn: decorator(_visible_errors(fn))
+
+
+mcp.tool = _mcp_tool
 
 
 @mcp.tool()
@@ -1496,7 +1541,11 @@ async def api_shopping_list_restore(request: Request):
 
 # ── App assembly ─────────────────────────────────────────
 
-mcp_app = mcp.streamable_http_app()
+# DNS-Rebinding-Schutz aus, damit Anfragen über LAN-IP/Proxy akzeptiert werden
+mcp_app = mcp.streamable_http_app(
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    host="0.0.0.0",
+)
 
 app = Starlette(
     routes=[
