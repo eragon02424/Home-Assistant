@@ -1,5 +1,5 @@
 """
-MCP Second Brain Server for Home Assistant v1.0.0
+MCP Second Brain Server for Home Assistant v2.0.0 (MCP Python SDK 2.x)
 
 Exposes exactly ONE folder (the "Second Brain", default /share/second_brain)
 to MCP clients. Every path is relative to that root; nothing outside it is
@@ -12,14 +12,15 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 import uvicorn
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 # ── Config from environment ──────────────────────────────────────────────────
 
@@ -52,10 +53,7 @@ INSTRUCTIONS = (
     "unklar zuzuordnendes in 00_Inbox. Keine Passwörter, Tokens oder Zugangsdaten speichern."
 )
 
-mcp = FastMCP(name="Second Brain", instructions=INSTRUCTIONS)
-mcp.settings.transport_security = TransportSecuritySettings(
-    enable_dns_rebinding_protection=False
-)
+mcp = MCPServer(name="Second Brain", instructions=INSTRUCTIONS, version=VERSION)
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -72,22 +70,22 @@ def _resolve(path: str) -> Path:
     path = path.lstrip("/")
     resolved = (ROOT / path).resolve()
     if resolved != ROOT and ROOT not in resolved.parents:
-        raise PermissionError(f"Pfad '{path}' liegt außerhalb des Second Brain.")
+        raise ToolError(f"Pfad '{path}' liegt außerhalb des Second Brain.")
     return resolved
 
 
 def _check_file(path: str) -> Path:
     p = _resolve(path)
     if p == ROOT:
-        raise ValueError("Pfad zeigt auf den Stammordner, nicht auf eine Datei.")
+        raise ToolError("Pfad zeigt auf den Stammordner, nicht auf eine Datei.")
     if p.suffix.lower() not in ALLOWED_EXT:
-        raise ValueError(f"Dateityp '{p.suffix}' nicht erlaubt. Erlaubt: {sorted(ALLOWED_EXT)}")
+        raise ToolError(f"Dateityp '{p.suffix}' nicht erlaubt. Erlaubt: {sorted(ALLOWED_EXT)}")
     return p
 
 
 def _check_writable() -> None:
     if READ_ONLY:
-        raise PermissionError("Second Brain ist im Nur-Lese-Modus (Option read_only).")
+        raise ToolError("Second Brain ist im Nur-Lese-Modus (Option read_only).")
 
 
 def _in_trash(p: Path) -> bool:
@@ -109,7 +107,7 @@ def _mtime(p: Path) -> str:
 
 def _check_size(content: str) -> None:
     if len(content.encode("utf-8")) > MAX_FILE_BYTES:
-        raise ValueError(f"Inhalt größer als {MAX_FILE_BYTES // 1024} KB.")
+        raise ToolError(f"Inhalt größer als {MAX_FILE_BYTES // 1024} KB.")
 
 # ── Tools: read ───────────────────────────────────────────────────────────────
 
@@ -203,7 +201,7 @@ def sb_write(path: str, content: str, overwrite: bool = False) -> dict:
     _check_writable()
     p = _check_file(path)
     if _in_trash(p):
-        raise PermissionError("In .trash kann nicht geschrieben werden.")
+        raise ToolError("In .trash kann nicht geschrieben werden.")
     _check_size(content)
     if p.exists() and not overwrite:
         return {"success": False, "error": "Datei existiert bereits. sb_append/sb_edit nutzen oder overwrite=true."}
@@ -220,7 +218,7 @@ def sb_append(path: str, content: str, heading: str = "") -> dict:
     _check_writable()
     p = _check_file(path)
     if _in_trash(p):
-        raise PermissionError("In .trash kann nicht geschrieben werden.")
+        raise ToolError("In .trash kann nicht geschrieben werden.")
     old = p.read_text(encoding="utf-8") if p.exists() else ""
     block = content.rstrip("\n") + "\n"
 
@@ -314,7 +312,11 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
         return Response("Unauthorized", status_code=401)
 
 
-app = mcp.streamable_http_app()
+# DNS-Rebinding-Schutz aus: Anfragen kommen über LAN-IP / MCP-Proxy mit fremdem Host-Header
+app = mcp.streamable_http_app(
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    host="0.0.0.0",
+)
 app.add_middleware(TokenAuthMiddleware)
 
 if __name__ == "__main__":

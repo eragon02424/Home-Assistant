@@ -1,6 +1,6 @@
 name: "MCP Second Brain"
 description: "MCP Server mit Lese-/Schreibzugriff ausschließlich auf den Second-Brain-Ordner"
-version: "1.0.1"
+version: "2.0.0"
 slug: "mcp_second_brain"
 url: "https://github.com/eragon02424/Home-Assistant"
 init: false
