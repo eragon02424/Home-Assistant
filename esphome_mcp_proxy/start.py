@@ -5,7 +5,7 @@ This addon installs the mcp_proxy webhook custom integration into HA Core
 and proxies remote MCP requests to the configured MCP Server addons.
 
 Features:
-  1. Up to 10 configurable MCP server slots
+  1. Up to 20 configurable MCP server slots
   2. OAuth 2.1 protected webhooks (Nabu Casa / reverse proxy compatible)
   3. Auto-installs and updates the mcp_proxy custom integration
   4. Per-slot OAuth credentials and webhook IDs persisted across restarts
@@ -559,7 +559,7 @@ def _probe_oauth_active() -> bool:
 
 def _load_servers(config: dict) -> list[dict]:
     servers = []
-    for i in range(1, 11):
+    for i in range(1, 21):
         enabled = bool(config.get(f"server_{i}_enabled", False))
         url = str(config.get(f"server_{i}_url", "")).strip()
         token = str(config.get(f"server_{i}_token", "")).strip()

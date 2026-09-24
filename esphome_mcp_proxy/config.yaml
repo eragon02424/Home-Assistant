@@ -1,7 +1,7 @@
 name: MCP Proxy
-version: "3.3.0"
+version: "3.4.0"
 slug: mcp_proxy_esphome
-description: Proxies MCP requests to up to 10 MCP Server addons via OAuth-protected webhooks (Nabu Casa / reverse proxy compatible).
+description: Proxies MCP requests to up to 20 MCP Server addons via OAuth-protected webhooks (Nabu Casa / reverse proxy compatible).
 url: https://github.com/eragon02424/Home-Assistant
 arch:
   - aarch64
@@ -46,6 +46,36 @@ options:
   server_10_enabled: false
   server_10_url: ""
   server_10_token: ""
+  server_11_enabled: false
+  server_11_url: ""
+  server_11_token: ""
+  server_12_enabled: false
+  server_12_url: ""
+  server_12_token: ""
+  server_13_enabled: false
+  server_13_url: ""
+  server_13_token: ""
+  server_14_enabled: false
+  server_14_url: ""
+  server_14_token: ""
+  server_15_enabled: false
+  server_15_url: ""
+  server_15_token: ""
+  server_16_enabled: false
+  server_16_url: ""
+  server_16_token: ""
+  server_17_enabled: false
+  server_17_url: ""
+  server_17_token: ""
+  server_18_enabled: false
+  server_18_url: ""
+  server_18_token: ""
+  server_19_enabled: false
+  server_19_url: ""
+  server_19_token: ""
+  server_20_enabled: false
+  server_20_url: ""
+  server_20_token: ""
 schema:
   remote_url: str
   server_1_enabled: bool
@@ -78,3 +108,33 @@ schema:
   server_10_enabled: bool
   server_10_url: str
   server_10_token: str
+  server_11_enabled: bool
+  server_11_url: str
+  server_11_token: str
+  server_12_enabled: bool
+  server_12_url: str
+  server_12_token: str
+  server_13_enabled: bool
+  server_13_url: str
+  server_13_token: str
+  server_14_enabled: bool
+  server_14_url: str
+  server_14_token: str
+  server_15_enabled: bool
+  server_15_url: str
+  server_15_token: str
+  server_16_enabled: bool
+  server_16_url: str
+  server_16_token: str
+  server_17_enabled: bool
+  server_17_url: str
+  server_17_token: str
+  server_18_enabled: bool
+  server_18_url: str
+  server_18_token: str
+  server_19_enabled: bool
+  server_19_url: str
+  server_19_token: str
+  server_20_enabled: bool
+  server_20_url: str
+  server_20_token: str
