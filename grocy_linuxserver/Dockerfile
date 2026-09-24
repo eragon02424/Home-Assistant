@@ -1,4 +1,5 @@
 FROM lscr.io/linuxserver/grocy:latest
+ARG BUILD_VERSION
 
 # nginx-patch: schreibt default.conf mit allen GROCY_* Werten als fastcgi_param
 # (custom-cont-init.d läuft nach ls.io-init, wenn default.conf bereits existiert)
