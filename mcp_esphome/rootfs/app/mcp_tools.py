@@ -34,15 +34,56 @@ get_asgi_app()).
 import logging
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
 _LOGGER = logging.getLogger("mcp_esphome.mcp_tools")
 
-mcp = FastMCP(
-    "ESPHome MCP Server",
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+mcp = MCPServer(
+    version="0.22.0",
+    name="ESPHome MCP Server",
 )
+
+# ── MCP SDK 2.x: Fehlermeldungen von Tools wie in 1.x an das Modell durchreichen ──
+# In 2.x sieht das Modell bei normalen Exceptions nur "Error executing tool <name>".
+# Dieser Wrapper macht aus jeder Exception einen ToolError mit der Originalmeldung.
+import functools as _functools
+import inspect as _inspect
+from mcp.server.mcpserver.exceptions import ToolError as _ToolError
+from mcp.shared.exceptions import MCPError as _MCPError
+
+
+def _visible_errors(fn):
+    if _inspect.iscoroutinefunction(fn):
+        @_functools.wraps(fn)
+        async def _wrapper(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except (_ToolError, _MCPError):
+                raise
+            except Exception as e:
+                raise _ToolError(str(e) or type(e).__name__) from e
+    else:
+        @_functools.wraps(fn)
+        def _wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except (_ToolError, _MCPError):
+                raise
+            except Exception as e:
+                raise _ToolError(str(e) or type(e).__name__) from e
+    return _wrapper
+
+
+_mcp_tool_orig = mcp.tool
+
+
+def _mcp_tool(*args, **kwargs):
+    decorator = _mcp_tool_orig(*args, **kwargs)
+    return lambda fn: decorator(_visible_errors(fn))
+
+
+mcp.tool = _mcp_tool
 
 _device_manager = None
 _log_manager = None
@@ -285,7 +326,11 @@ def get_asgi_app():
     """Returns the Streamable HTTP ASGI app, wrapped with the same
     Bearer-token check as the REST API.
     """
-    inner_app = mcp.streamable_http_app()
+    # DNS-Rebinding-Schutz aus, damit Anfragen über LAN-IP/Proxy akzeptiert werden
+    inner_app = mcp.streamable_http_app(
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        host="0.0.0.0",
+    )
     token = _bearer_token
 
     async def app(scope, receive, send):
