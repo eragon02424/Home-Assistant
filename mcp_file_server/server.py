@@ -7,7 +7,7 @@ import os
 import shutil
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -26,7 +26,8 @@ print(f"[MCP File Server] Token auth: {'enabled' if TOKEN else 'disabled'}")
 
 # ── FastMCP server ────────────────────────────────────────────────────────────
 
-mcp = FastMCP(
+mcp = MCPServer(
+    version="1.7.0",
     name="MCP File Server",
     instructions=(
         "File system access for Home Assistant host. "
@@ -35,10 +36,47 @@ mcp = FastMCP(
     ),
 )
 
-# DNS Rebinding Protection deaktivieren damit externe Hosts akzeptiert werden
-mcp.settings.transport_security = TransportSecuritySettings(
-    enable_dns_rebinding_protection=False
-)
+# ── MCP SDK 2.x: Fehlermeldungen von Tools wie in 1.x an das Modell durchreichen ──
+# In 2.x sieht das Modell bei normalen Exceptions nur "Error executing tool <name>".
+# Dieser Wrapper macht aus jeder Exception einen ToolError mit der Originalmeldung.
+import functools as _functools
+import inspect as _inspect
+from mcp.server.mcpserver.exceptions import ToolError as _ToolError
+from mcp.shared.exceptions import MCPError as _MCPError
+
+
+def _visible_errors(fn):
+    if _inspect.iscoroutinefunction(fn):
+        @_functools.wraps(fn)
+        async def _wrapper(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except (_ToolError, _MCPError):
+                raise
+            except Exception as e:
+                raise _ToolError(str(e) or type(e).__name__) from e
+    else:
+        @_functools.wraps(fn)
+        def _wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except (_ToolError, _MCPError):
+                raise
+            except Exception as e:
+                raise _ToolError(str(e) or type(e).__name__) from e
+    return _wrapper
+
+
+_mcp_tool_orig = mcp.tool
+
+
+def _mcp_tool(*args, **kwargs):
+    decorator = _mcp_tool_orig(*args, **kwargs)
+    return lambda fn: decorator(_visible_errors(fn))
+
+
+mcp.tool = _mcp_tool
+
 
 # ── Path security helpers ─────────────────────────────────────────────────────
 
@@ -176,7 +214,11 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
 
 # ── App assembly ──────────────────────────────────────────────────────────────
 
-app = mcp.streamable_http_app()
+# DNS-Rebinding-Schutz aus, damit Anfragen über LAN-IP/Proxy akzeptiert werden
+app = mcp.streamable_http_app(
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    host="0.0.0.0",
+)
 app.add_middleware(TokenAuthMiddleware)
 
 if __name__ == "__main__":
