@@ -66,7 +66,7 @@ import uuid
 from pathlib import Path
 
 import asyncssh
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -166,7 +166,8 @@ async def _run_ps(command: str, timeout: int = 30) -> asyncssh.SSHCompletedProce
 
 # ── FastMCP server ────────────────────────────────────────────────────────────
 
-mcp = FastMCP(
+mcp = MCPServer(
+    version="0.2.0",
     name="MCP Visual Studio Connector",
     instructions=(
         "Starts and monitors headless Claude Code jobs on a remote Windows "
@@ -178,9 +179,47 @@ mcp = FastMCP(
     ),
 )
 
-mcp.settings.transport_security = TransportSecuritySettings(
-    enable_dns_rebinding_protection=False
-)
+# ── MCP SDK 2.x: Fehlermeldungen von Tools wie in 1.x an das Modell durchreichen ──
+# In 2.x sieht das Modell bei normalen Exceptions nur "Error executing tool <name>".
+# Dieser Wrapper macht aus jeder Exception einen ToolError mit der Originalmeldung.
+import functools as _functools
+import inspect as _inspect
+from mcp.server.mcpserver.exceptions import ToolError as _ToolError
+from mcp.shared.exceptions import MCPError as _MCPError
+
+
+def _visible_errors(fn):
+    if _inspect.iscoroutinefunction(fn):
+        @_functools.wraps(fn)
+        async def _wrapper(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except (_ToolError, _MCPError):
+                raise
+            except Exception as e:
+                raise _ToolError(str(e) or type(e).__name__) from e
+    else:
+        @_functools.wraps(fn)
+        def _wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except (_ToolError, _MCPError):
+                raise
+            except Exception as e:
+                raise _ToolError(str(e) or type(e).__name__) from e
+    return _wrapper
+
+
+_mcp_tool_orig = mcp.tool
+
+
+def _mcp_tool(*args, **kwargs):
+    decorator = _mcp_tool_orig(*args, **kwargs)
+    return lambda fn: decorator(_visible_errors(fn))
+
+
+mcp.tool = _mcp_tool
+
 
 # ── Helper ────────────────────────────────────────────────────────────────────
 
@@ -441,7 +480,11 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
 
 # ── App assembly ──────────────────────────────────────────────────────────────
 
-app = mcp.streamable_http_app()
+# DNS-Rebinding-Schutz aus, damit Anfragen über LAN-IP/Proxy akzeptiert werden
+app = mcp.streamable_http_app(
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    host="0.0.0.0",
+)
 app.add_middleware(TokenAuthMiddleware)
 
 if __name__ == "__main__":
