@@ -255,31 +255,46 @@ document.getElementById('btnCancel').onclick = () => startScanning();
 
 // ── Shopping list tab ──────────────────────────────────────────────
 
-async function loadShoppingList() {
+// keepScroll=true: Refresh nach Swipe. Die alte Liste bleibt stehen, bis die
+// neue fertig ist, und wird dann in einem Schritt ersetzt. Vorher wurde erst
+// "Lade..." eingesetzt -> Seite kurz fast leer -> Browser setzt Scroll auf 0.
+async function loadShoppingList(keepScroll) {
   const wrap = document.getElementById('shoppingListWrap');
-  wrap.innerHTML = '<div id="slLoading">Lade Einkaufsliste...</div>';
+  const scroller = document.scrollingElement || document.documentElement;
+  const savedScroll = scroller.scrollTop;
+  if (!keepScroll) {
+    wrap.innerHTML = '<div id="slLoading">Lade Einkaufsliste...</div>';
+  }
+  const replaceWith = (nodeOrHtml) => {
+    if (typeof nodeOrHtml === 'string') {
+      wrap.innerHTML = nodeOrHtml;
+    } else {
+      wrap.replaceChildren(nodeOrHtml);
+    }
+    if (keepScroll) scroller.scrollTop = savedScroll;
+  };
   try {
     const res = await fetch('api/shopping-list');
     const data = await res.json();
     if (data.error) {
-      wrap.innerHTML = '<div id="slEmpty">Fehler: ' + data.error + '</div>';
+      replaceWith('<div id="slEmpty">Fehler: ' + data.error + '</div>');
       return;
     }
     const hasGroups = data.groups && data.groups.length > 0;
     const hasPending = data.pending_delete && data.pending_delete.length > 0;
     if (!hasGroups && !hasPending) {
-      wrap.innerHTML = '<div id="slEmpty">Einkaufsliste ist leer 🎉</div>';
+      replaceWith('<div id="slEmpty">Einkaufsliste ist leer 🎉</div>');
       return;
     }
-    wrap.innerHTML = '';
+    const frag = document.createDocumentFragment();
     for (const group of (data.groups || [])) {
       const catEl = document.createElement('div');
       catEl.className = 'sl-category';
       catEl.textContent = group.category;
-      wrap.appendChild(catEl);
+      frag.appendChild(catEl);
 
       for (const item of group.items) {
-        wrap.appendChild(buildShoppingListRow(item, false));
+        frag.appendChild(buildShoppingListRow(item, false));
       }
     }
 
@@ -287,14 +302,15 @@ async function loadShoppingList() {
       const header = document.createElement('div');
       header.className = 'sl-pending-header';
       header.textContent = 'Bald löschen';
-      wrap.appendChild(header);
+      frag.appendChild(header);
 
       for (const item of data.pending_delete) {
-        wrap.appendChild(buildShoppingListRow(item, true));
+        frag.appendChild(buildShoppingListRow(item, true));
       }
     }
+    replaceWith(frag);
   } catch (err) {
-    wrap.innerHTML = '<div id="slEmpty">Netzwerk-Fehler: ' + err + '</div>';
+    replaceWith('<div id="slEmpty">Netzwerk-Fehler: ' + err + '</div>');
   }
 }
 
@@ -405,7 +421,7 @@ async function removeShoppingListItem(listItemId, outerEl) {
     });
     const data = await res.json();
     if (data.status === 'ok') {
-      collapseAndRemove(outerEl, () => loadShoppingList());
+      collapseAndRemove(outerEl, () => loadShoppingList(true));
     } else {
       alert('Fehler beim Entfernen: ' + data.message);
       outerEl.querySelector('.sl-item').style.transform = 'translateX(0)';
@@ -425,7 +441,7 @@ async function restoreShoppingListItem(listItemId, outerEl) {
     });
     const data = await res.json();
     if (data.status === 'ok') {
-      collapseAndRemove(outerEl, () => loadShoppingList());
+      collapseAndRemove(outerEl, () => loadShoppingList(true));
     } else {
       alert('Fehler beim Wiederherstellen: ' + data.message);
       outerEl.querySelector('.sl-item').style.transform = 'translateX(0)';
