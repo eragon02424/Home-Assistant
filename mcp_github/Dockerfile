@@ -1,4 +1,5 @@
 FROM alpine:3.19
+ARG BUILD_VERSION
 
 RUN apk add --no-cache curl tar python3
 
