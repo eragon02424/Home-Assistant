@@ -18,7 +18,7 @@ mkdir -p "$SB_ROOT"
 # Grundstruktur nur anlegen, wenn der Ordner noch leer ist (nie überschreiben)
 if bashio::config.true 'create_structure' && [ -z "$(ls -A "$SB_ROOT" 2>/dev/null)" ]; then
     bashio::log.info "Leerer Ordner – lege Grundstruktur an..."
-    cp -rn /skeleton/. "$SB_ROOT"/
+    cp -r /skeleton/. "$SB_ROOT"/
 fi
 
 bashio::log.info "Starte MCP Second Brain auf Port 8773, Ordner: ${SB_ROOT}"
