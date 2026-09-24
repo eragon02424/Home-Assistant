@@ -1,6 +1,6 @@
 #!/usr/bin/with-contenv bashio
 
-bashio::log.info "Starting MCP Serial HomeAssistant v1.0.1..."
+bashio::log.info "Starting MCP Serial HomeAssistant v1.1.0..."
 
 PORT=$(bashio::config 'port')
 export SERIAL_PORT_CONFIG=$(bashio::config 'port')

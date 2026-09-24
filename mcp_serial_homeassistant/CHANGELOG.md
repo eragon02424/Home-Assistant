@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.0
+- fastmcp 3.x -> 4.x (pinned >=4.0.8,<5; pulls MCP Python SDK 2.x). No code changes needed;
+  tool schemas and results identical, tools now additionally carry a title.
+
 ## 1.0.0
 - Initial release
 - Persistent USB-CDC listener for ESP32-S2 (pyudev auto-reconnect)

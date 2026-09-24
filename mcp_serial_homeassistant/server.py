@@ -409,7 +409,7 @@ def serial_status() -> dict:
 
 if __name__ == "__main__":
     threading.Thread(target=serial_loop, daemon=True).start()
-    log.info("MCP Serial HomeAssistant v1.0.7 gestartet auf Port %d", MCP_PORT)
+    log.info("MCP Serial HomeAssistant v1.1.0 gestartet auf Port %d", MCP_PORT)
     log.info("Auto-Detect: ttyACM* bevorzugt, Burst-Splitter aktiv, Flash-Mode-Filter aktiv (303a:0002 blockiert)")
     app = mcp.http_app()
     uvicorn.run(app, host="0.0.0.0", port=MCP_PORT, log_level="warning")
