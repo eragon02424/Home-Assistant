@@ -1,6 +1,6 @@
 aiohttp
 zeroconf
-aioesphomeapi>=45.5,<46
+aioesphomeapi
 esptool
-mcp>=2.2.0,<3
+mcp>=2.2.0
 uvicorn
