@@ -1,6 +1,6 @@
 name: "MCP Second Brain"
-description: "MCP Server mit Lese-/Schreibzugriff ausschließlich auf den Second-Brain-Ordner"
-version: "2.0.0"
+description: "MCP Server für getrennte Second Brains (LLM-Wiki: privat, beruf) - Zugriff ausschließlich auf den Second-Brain-Ordner"
+version: "3.0.0"
 slug: "mcp_second_brain"
 url: "https://github.com/eragon02424/Home-Assistant"
 init: false
@@ -18,11 +18,16 @@ map:
     read_only: false
 options:
   folder: /share/second_brain
+  brains: "privat,beruf"
   read_only: false
   max_file_kb: 512
-  create_structure: true
+  max_upload_mb: 50
+  import_dir: ""
 schema:
   folder: match(^/share/.+)
+  brains: match(^[a-z0-9_-]+(,[a-z0-9_-]+)*$)
   read_only: bool
   max_file_kb: int(16,4096)
-  create_structure: bool
+  max_upload_mb: int(1,500)
+  import_dir: str?
+  create_structure: bool?
