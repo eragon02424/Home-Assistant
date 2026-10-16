@@ -26,6 +26,9 @@ Fuehrt den eigentlichen Sync durch:
    "delete_remote": true) gibt es eine GEZIELTE Ausnahme via direktem
    Graph-API DELETE, basierend auf einem Manifest-Vergleich (lokal
    fehlende, vormals bekannte Dateien werden auch online geloescht).
+   Seit v1.42.0 gilt das Flag rekursiv fuer den ganzen Unterbaum (vererbt
+   wie sync/filter, Ausnahme per "delete_remote": false) und hat
+   Sicherungen (Notbremse, Trockenlauf) - Details in remote_delete.py.
    Laeuft NUR NACH einem tatsaechlich ERFOLGREICHEN Download-Pass (Bugfix
    14.07.2026 - siehe process_remote_delete_folders Aufruf in main()),
    damit eine online neue aber noch nicht heruntergeladene Datei nicht
@@ -68,6 +71,8 @@ import urllib.parse
 from datetime import datetime
 
 import requests
+
+import remote_delete
 
 CONFIG_DIR = "/data"
 SYNC_CONFIG = f"{CONFIG_DIR}/sync_config.json"
@@ -326,85 +331,29 @@ def list_all_folders(config):
     return sorted(folders)
 
 
-def _manifest_file_for(path):
-    safe_name = hashlib.sha256(path.encode()).hexdigest()[:16]
-    return os.path.join(DELETE_MANIFEST_DIR, f"{safe_name}.json")
-
-
 def process_remote_delete_folders(config):
     """
     GEZIELTE REMOTE-LOESCHUNG (siehe Modul-Docstring 1c). Wird nur nach
-    einem erfolgreichen Download-Pass aufgerufen (siehe main()).
+    einem erfolgreichen Download-Pass aufgerufen (siehe main()). Die
+    eigentliche Logik (rekursiv, mit Sicherungen) steht in remote_delete.py.
+    Rueckgabe: (Anzahl online geloeschter Dateien, Liste von Warnungen).
     """
-    delete_remote_paths = [p for p, c in config.items() if c.get("delete_remote")]
-    if not delete_remote_paths:
-        return 0
+    if not remote_delete.find_roots(config):
+        return 0, []
 
-    os.makedirs(DELETE_MANIFEST_DIR, exist_ok=True)
     session = requests.Session()
     try:
-        token = get_access_token(session)
-    except Exception as e:
-        log(f"[delete_remote] Konnte nicht authentifizieren, ueberspringe: {e}")
-        return 0
-    session.headers.update({"Authorization": f"Bearer {token}"})
-
-    total_deleted = 0
-    for path in delete_remote_paths:
-        write_progress("delete_remote", f"Pruefe Ordner fuer gezielte Remote-Loeschung: {path}")
-        manifest_path = _manifest_file_for(path)
-        old_manifest = {}
-        if os.path.exists(manifest_path):
-            try:
-                with open(manifest_path) as f:
-                    old_manifest = json.load(f)
-            except Exception:
-                old_manifest = {}
-
-        local_dir = os.path.join(SHARE_DIR, path)
-        local_files = set(os.listdir(local_dir)) if os.path.isdir(local_dir) else set()
-
-        # Dateien die beim letzten Lauf bekannt waren, aber jetzt lokal
-        # fehlen -> wurden lokal geloescht (z.B. von Paperless nach
-        # Verarbeitung) -> gezielt auch online loeschen.
-        missing = set(old_manifest.keys()) - local_files
-        for filename in missing:
-            item_id = old_manifest[filename]
-            try:
-                resp = session.delete(f"{GRAPH_BASE}/me/drive/items/{item_id}", timeout=30)
-                if resp.status_code in (204, 404):
-                    log(f"[delete_remote] Online geloescht (war lokal in '{path}' entfernt worden): {filename}")
-                    total_deleted += 1
-                else:
-                    log(f"[delete_remote] Konnte '{filename}' nicht online loeschen (Status {resp.status_code}): {resp.text[:200]}")
-            except Exception as e:
-                log(f"[delete_remote] Fehler beim Loeschen von '{filename}': {e}")
-
-        # Manifest fuer naechsten Lauf aktualisieren: aktuelle Remote-
-        # Kinder dieses Ordners abfragen (Datei -> Item-ID).
         try:
-            encoded_path = urllib.parse.quote(path)
-            resp = session.get(
-                f"{GRAPH_BASE}/me/drive/root:/{encoded_path}:/children",
-                params={"$select": "id,name,folder"}, timeout=30
-            )
-            if resp.status_code == 200:
-                new_manifest = {
-                    item["name"]: item["id"]
-                    for item in resp.json().get("value", [])
-                    if "folder" not in item
-                }
-                with open(manifest_path, "w") as f:
-                    json.dump(new_manifest, f)
-            else:
-                log(f"[delete_remote] Konnte Ordnerinhalt fuer Manifest-Update nicht abrufen ('{path}', Status {resp.status_code})")
+            token = get_access_token(session)
         except Exception as e:
-            log(f"[delete_remote] Manifest-Update fuer '{path}' fehlgeschlagen: {e}")
-
-    session.close()
-    if total_deleted:
-        log(f"[delete_remote] {total_deleted} Datei(en) gezielt online geloescht")
-    return total_deleted
+            log(f"[delete_remote] Konnte nicht authentifizieren, ueberspringe: {e}")
+            return 0, []
+        session.headers.update({"Authorization": f"Bearer {token}"})
+        return remote_delete.process_roots(
+            session, config, SHARE_DIR, DELETE_MANIFEST_DIR, GRAPH_BASE,
+            get_effective_config, log, progress=write_progress)
+    finally:
+        session.close()
 
 
 def write_sync_list(config, all_folders):
@@ -632,7 +581,9 @@ def get_effective_config(folder_path, config):
         "delete_after": "never",
         "custom_local_path": None,
         "custom_extensions": "",
-        "delete_remote": False
+        "delete_remote": False,
+        "delete_remote_dry_run": False,
+        "delete_remote_max": None
     }
     for i in range(1, len(parts) + 1):
         ancestor = '/'.join(parts[:i])
@@ -795,7 +746,9 @@ def main():
         if download_ok:
             try:
                 write_progress("delete_remote", "Pruefe gezielte Remote-Loeschungen...")
-                process_remote_delete_folders(config)
+                _deleted, delete_warnings = process_remote_delete_folders(config)
+                for warning in delete_warnings:
+                    errors.append(f"{datetime.now().strftime('%H:%M')} Remote-Loeschung: {warning}")
             except Exception as e:
                 log(f"[WARN] Gezielte Remote-Loeschung fehlgeschlagen: {e}")
                 errors.append(f"{datetime.now().strftime('%H:%M')} Remote-Loeschung Fehler: {e}")
