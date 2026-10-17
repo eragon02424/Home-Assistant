@@ -35,13 +35,15 @@ Fuehrt den eigentlichen Sync durch:
    faelschlich als "lokal geloescht" interpretiert wird.
 
 2. Ablauf pro Sync-Lauf (SICHERHEITSKRITISCH-Architektur):
-   a) Paperless-Export (einseitig, siehe sync_paperless_export).
-   b) Vorab-Check (--dry-run). Bei Diskrepanz: ABBRUCH.
-   c) Download-Pass (--download-only).
-   d) Gezielte Remote-Loeschung - NUR wenn c) erfolgreich war.
-   e) Integritaetspruefung - nur Warnung.
-   f) Lokaler Cleanup (Filter/Alter, deaktivierte Ordner) - NUR lokal.
-   g) Upload-Pass (--upload-only --no-remote-delete).
+   a) Vorab-Check (--dry-run). Bei Diskrepanz: ABBRUCH.
+   b) Download-Pass (--download-only).
+   c) Gezielte Remote-Loeschung - NUR wenn b) erfolgreich war.
+   d) Integritaetspruefung - nur Warnung.
+   e) Lokaler Cleanup (Filter/Alter, deaktivierte Ordner) - NUR lokal.
+   f) Upload-Pass (--upload-only --no-remote-delete).
+
+   Der Export von Paperless nach OneDrive laeuft NICHT hier, sondern ueber
+   das Home-Assistant-Skript paperless_export_spiegeln.py (shell_command).
 
    *** NIEMALS den globalen Upload-Pass von --no-remote-delete auf
    normales bidirektionales Loeschen umstellen, ohne ausdrueckliche
@@ -84,13 +86,6 @@ SHARE_DIR = "/share/onedrive"
 STATUS_FILE = f"{CONFIG_DIR}/sync_status.json"
 PROGRESS_FILE = f"{CONFIG_DIR}/sync_progress.json"
 DELETE_MANIFEST_DIR = f"{CONFIG_DIR}/delete_remote_manifests"
-
-# Paperless-ngx Export: kopiert einseitig (nur Paperless -> OneDrive-Ordner)
-# neue/geaenderte Dokumente aus dem Paperless "originals" Verzeichnis in
-# einen dedizierten Unterordner, der dann ganz normal per Upload-Pass nach
-# OneDrive hochgeladen wird.
-PAPERLESS_SOURCE_DIR = "/share/paperless/media/documents/originals"
-PAPERLESS_EXPORT_SUBDIR = "Paperless-Export"
 
 CLIENT_ID = "d50ca740-c83f-4d1b-b616-12c519384f0c"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
@@ -199,45 +194,6 @@ def acquire_lock():
 def release_lock():
     if os.path.exists(LOCK_FILE):
         os.remove(LOCK_FILE)
-
-
-def sync_paperless_export():
-    """
-    Kopiert einseitig neue/geaenderte Dateien aus PAPERLESS_SOURCE_DIR
-    nach SHARE_DIR/Paperless-Export. Loescht nie etwas.
-    """
-    if not os.path.isdir(PAPERLESS_SOURCE_DIR):
-        log(f"[paperless] Quellordner nicht gefunden, ueberspringe: {PAPERLESS_SOURCE_DIR}")
-        return 0
-
-    dest_root = os.path.join(SHARE_DIR, PAPERLESS_EXPORT_SUBDIR)
-    os.makedirs(dest_root, exist_ok=True)
-
-    copied = 0
-    for root, dirs, files in os.walk(PAPERLESS_SOURCE_DIR):
-        rel_dir = os.path.relpath(root, PAPERLESS_SOURCE_DIR)
-        dest_dir = dest_root if rel_dir == "." else os.path.join(dest_root, rel_dir)
-        for filename in files:
-            src_path = os.path.join(root, filename)
-            dest_path = os.path.join(dest_dir, filename)
-
-            needs_copy = True
-            if os.path.exists(dest_path):
-                src_stat = os.stat(src_path)
-                dst_stat = os.stat(dest_path)
-                if src_stat.st_size == dst_stat.st_size and int(src_stat.st_mtime) <= int(dst_stat.st_mtime):
-                    needs_copy = False
-
-            if needs_copy:
-                os.makedirs(dest_dir, exist_ok=True)
-                shutil.copy2(src_path, dest_path)
-                copied += 1
-                log(f"[paperless] Kopiert: {filename}")
-                write_progress("paperless", f"Kopiere: {filename}")
-
-    if copied:
-        log(f"[paperless] {copied} neue/geaenderte Dokumente nach {PAPERLESS_EXPORT_SUBDIR}/ kopiert")
-    return copied
 
 
 # --- Graph API Hilfsfunktionen (requests.Session fuer Connection-Reuse) ---
@@ -705,13 +661,6 @@ def main():
         status = load_status()
         errors = []
 
-        try:
-            write_progress("paperless", "Pruefe Paperless-Dokumente...")
-            sync_paperless_export()
-        except Exception as e:
-            log(f"[WARN] Paperless-Export fehlgeschlagen: {e}")
-            errors.append(f"{datetime.now().strftime('%H:%M')} Paperless-Export Fehler: {e}")
-
         need_resync = False
         try:
             log("[folders] Ermittle Ordnerstruktur per Graph API...")
@@ -719,11 +668,6 @@ def main():
             t0 = time.time()
             all_folders = list_all_folders(config)
             log(f"[folders] {len(all_folders)} Ordner gefunden in {time.time()-t0:.1f}s")
-
-            if PAPERLESS_EXPORT_SUBDIR not in all_folders and os.path.isdir(os.path.join(SHARE_DIR, PAPERLESS_EXPORT_SUBDIR)):
-                all_folders.append(PAPERLESS_EXPORT_SUBDIR)
-                all_folders.sort()
-                log(f"[folders] '{PAPERLESS_EXPORT_SUBDIR}' lokal vorhanden aber noch nicht auf OneDrive - zur sync_list hinzugefuegt")
 
             need_resync = write_sync_list(config, all_folders)
         except Exception as e:
