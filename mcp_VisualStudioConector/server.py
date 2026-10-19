@@ -1,5 +1,5 @@
 """
-MCP Visual Studio Connector for Home Assistant v0.1.10
+MCP Visual Studio Connector for Home Assistant v0.2.1
 
 Startet headless Claude-Code-Jobs (claude -p ... --ide) auf einer entfernten
 Windows-Maschine (VM mit Visual Studio + firish/claude_code_vs Erweiterung)
@@ -51,6 +51,16 @@ beantwortet werden und lässt den Job für immer unsichtbar in RUNNING
 hängen. Deshalb bleibt bypassPermissions der sichere Default, auch wenn
 das UNC-spezifische Rückfrageproblem seit dem Umzug auf lokale Pfade
 nicht mehr auftritt.
+
+ZWEITLAUF-SCHUTZ (seit v0.2.1): schtasks /Create verlangt bei /SC ONCE eine
+Startzeit; bisher stand dort fest 23:59. Da run.ps1 die Aufgabe am Ende
+nicht löschen kann (die Aufgabe wird über die SSH-Sitzung mit erhöhten
+Rechten angelegt, der Job läuft nicht erhöht -> "Zugriff verweigert"), lief
+jeder Job um 23:59 seines Anlagetags ein zweites Mal (befunden 17.10.2026,
+Aufgabe 162). Jetzt: launch.ps1 deaktiviert die Aufgabe direkt nach dem
+Start (laufende Instanz läuft weiter), räumt Aufgaben beendeter Jobs ab,
+und get_job_status/stop_task löschen die Aufgabe über die (erhöhte)
+SSH-Sitzung.
 
 Job-Registry liegt zusätzlich lokal unter /data/jobs.json (einfache
 Wiederherstellung nach Addon-Neustart; kein Anspruch auf Vollständigkeit,
@@ -167,7 +177,7 @@ async def _run_ps(command: str, timeout: int = 30) -> asyncssh.SSHCompletedProce
 # ── FastMCP server ────────────────────────────────────────────────────────────
 
 mcp = MCPServer(
-    version="0.2.0",
+    version="0.2.1",
     name="MCP Visual Studio Connector",
     instructions=(
         "Starts and monitors headless Claude Code jobs on a remote Windows "
@@ -305,7 +315,7 @@ async def start_task(
             run_ps1 = (
                 f"try {{\n"
                 f"  $PID | Out-File -Encoding ascii -LiteralPath '{real_job_dir}\\launcher_pid.txt'\n"
-                f"  'STEP: script started, pid=' + $PID | Out-File -Encoding utf8 -LiteralPath '{real_job_dir}\\output.jsonl'\n"
+                f"  'STEP: script started, pid=' + $PID | Out-File -Append -Encoding utf8 -LiteralPath '{real_job_dir}\\output.jsonl'\n"
                 f"  Set-Location -LiteralPath '{WORKSPACE_PATH}'\n"
                 f"  'STEP: Set-Location ok, cwd=' + (Get-Location).Path | Out-File -Append -Encoding utf8 -LiteralPath '{real_job_dir}\\output.jsonl'\n"
                 f"  $claudeCmd = Get-Command '{CLAUDE_BINARY}' -ErrorAction Stop\n"
@@ -337,9 +347,21 @@ async def start_task(
             # teils auch per WMI Win32_Process gestartete Prozesse. Ein über
             # den Task Scheduler-Dienst gestarteter Prozess hängt in keinem
             # dieser Job-Objekte.
+            # Zweitlauf-Schutz: /SC ONCE braucht eine Startzeit (23:59);
+            # Aufgabe wird nach dem Start deaktiviert (laufende Instanz läuft
+            # weiter); vorher werden Aufgaben beendeter Jobs entfernt.
             launch_ps1 = (
+                f"Get-ScheduledTask -TaskName 'mcpvs_*' -ErrorAction SilentlyContinue | ForEach-Object {{\n"
+                f"  $d = Join-Path $env:USERPROFILE ('mcp_vs_jobs\\' + $_.TaskName.Substring(6))\n"
+                f"  $st = Join-Path $d 'status.txt'\n"
+                f"  if ((Test-Path -LiteralPath $st) -and ((Get-Content -Raw -LiteralPath $st) -like 'DONE*')) {{\n"
+                f"    Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue\n"
+                f"  }}\n"
+                f"}}\n"
                 f'schtasks /Create /TN {task_name} /TR "`"{real_job_dir}\\launcher.cmd`"" /SC ONCE /ST 23:59 /F | Out-Null\n'
                 f"schtasks /Run /TN {task_name} | Out-Null\n"
+                f"for ($i = 0; $i -lt 30; $i++) {{ if (Test-Path -LiteralPath '{real_job_dir}\\launcher_pid.txt') {{ break }}; Start-Sleep -Milliseconds 500 }}\n"
+                f"schtasks /Change /TN {task_name} /DISABLE | Out-Null\n"
             )
             async with sftp.open(f"{real_job_dir}\\launch.ps1", "w", encoding="utf-8") as f:
                 await f.write(launch_ps1)
@@ -378,6 +400,14 @@ async def start_task(
     return {"success": True, "job_id": job_id}
 
 
+async def _delete_task(job_id: str) -> None:
+    """Löscht die geplante Aufgabe eines Jobs (best effort)."""
+    try:
+        await _run_ps(f"schtasks /Delete /TN mcpvs_{job_id} /F 2>$null | Out-Null", timeout=15)
+    except Exception as e:
+        log.warning("Konnte Aufgabe mcpvs_%s nicht löschen: %s", job_id, e)
+
+
 @mcp.tool()
 async def get_job_status(job_id: str) -> dict:
     """
@@ -404,6 +434,8 @@ async def get_job_status(job_id: str) -> dict:
     result = {"success": True, "job_id": job_id}
     if status_raw.startswith("DONE:"):
         result["status"] = "DONE"
+        # Zweitlauf-Schutz: Aufgabe über die (erhöhte) SSH-Sitzung löschen
+        await _delete_task(job_id)
         result["exit_code"] = int(status_raw.split(":", 1)[1] or -1)
         # Session-ID fürs Resume aus dem Log ziehen
         log_r = await _run_ps(f"Get-Content -LiteralPath '{remote_dir}\\output.jsonl'", timeout=20)
@@ -454,6 +486,7 @@ async def stop_task(job_id: str) -> dict:
         f"taskkill /PID $procId /T /F }} else {{ Write-Output 'no pid file' }}",
         timeout=15,
     )
+    await _delete_task(job_id)
     return {"success": r.exit_status == 0, "output": r.stdout, "error": r.stderr}
 
 

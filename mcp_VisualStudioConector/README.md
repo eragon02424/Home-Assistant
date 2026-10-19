@@ -120,3 +120,9 @@ Git-Klon ebenfalls am 2026-07-30.
   Pfad: behebt `fchmod`-Fehler beim nativen Write/Edit-Tool und
   ermöglicht Git-CLI-Nutzung (`git status`/`commit`/`push`) direkt aus
   Claude-Code-Jobs heraus.
+- 0.2.1 - Zweitlauf-Schutz: Die geplante Aufgabe (`/SC ONCE /ST 23:59`)
+  startete jeden Job um 23:59 ein zweites Mal, weil run.ps1 sie mangels
+  Rechten nicht löschen konnte. launch.ps1 deaktiviert die Aufgabe jetzt
+  direkt nach dem Start und räumt Aufgaben beendeter Jobs ab;
+  `get_job_status` (bei DONE) und `stop_task` löschen die Aufgabe über die
+  SSH-Sitzung.
