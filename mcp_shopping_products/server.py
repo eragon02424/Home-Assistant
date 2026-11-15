@@ -1,4 +1,11 @@
-"""MCP Shopping Products for Home Assistant v3.11.0
+"""MCP Shopping Products for Home Assistant v3.12.0
+
+v3.12.0 changes:
+- queue_recipe_image_job(recipe_id, bildname="", image_url="") accepts a direct
+  image URL as alternative to the OneDrive filename. The image worker downloads
+  the URL and sets it as recipe picture (same pipeline, retry and
+  needs_user_decision handling as before). URL jobs are tagged
+  source="claude_web"; the OneDrive path is unchanged.
 
 v3.11.0 changes:
 - Migrated to MCP Python SDK 2.x (FastMCP -> MCPServer). Tool names, schemas
@@ -83,6 +90,10 @@ DOWNLOAD_DIR = "/share/onedrive_downloads"
 PENDING_DELETE_HOURS = 2  # Items sit here before being permanently removed from Grocy
 
 OFF_USER_AGENT = "GrocyMCP/3.5 (home-assistant-addon; contact=eragon02424)"
+# Rezeptseiten/CDNs blocken oft nicht-browserartige Clients, daher eigener User-Agent für Rezeptbilder
+RECIPE_IMAGE_USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+RECIPE_IMAGE_MAX_BYTES = 5_000_000
 OFF_SEARCH_URL = "https://search.openfoodfacts.org/search"
 OFF_EAN_URL = "https://world.openfoodfacts.org/api/v2/product/{ean}.json"
 
@@ -430,9 +441,33 @@ async def _process_one_image_job(job: dict) -> tuple[bool, str | None]:
             return True, None
         return False, "Grocy Upload fehlgeschlagen"
     if job_type == "rezept":
+        image_url = job.get("image_url")
+        if image_url:
+            # Bild-Link: direkt herunterladen (kein OneDrive nötig)
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    r = await client.get(image_url, headers={"User-Agent": RECIPE_IMAGE_USER_AGENT},
+                                         follow_redirects=True)
+                if not r.is_success:
+                    return False, f"HTTP {r.status_code} beim Bilddownload"
+                if "text/html" in r.headers.get("content-type", "").lower():
+                    return False, "Link liefert eine Webseite statt eines Bildes"
+                image_bytes = r.content
+            except Exception as e:
+                return False, f"Download Fehler: {e}"
+            if len(image_bytes) > RECIPE_IMAGE_MAX_BYTES:
+                return False, f"Bild zu groß ({len(image_bytes)} bytes)"
+            ext = image_url.split(".")[-1].split("?")[0].lower()
+            if ext not in ("jpg", "jpeg", "png", "webp"):
+                ext = "jpg"
+            success = await _upload_recipe_picture(grocy_id, image_bytes, ext)
+            if success:
+                print(f"[Image] Rezeptbild per Link gesetzt recipe_id={grocy_id}")
+                return True, None
+            return False, "Grocy Upload fehlgeschlagen"
         bildname = job.get("bildname")
         if not bildname:
-            return False, "Kein bildname im Job"
+            return False, "Kein bildname und keine image_url im Job"
         local_path = os.path.join(DOWNLOAD_DIR, bildname)
         if not os.path.exists(local_path):
             try:
@@ -583,7 +618,7 @@ def start_auto_queue_worker():
 # ── MCP tools ───────────────────────────────────────────────
 
 mcp = MCPServer(
-    version="3.11.0",
+    version="3.12.0",
     name="MCP Shopping Products",
     instructions=(
         "Tools for Grocy products, recipes, shopping lists, product groups and data maintenance.\n\n"
@@ -605,7 +640,9 @@ mcp = MCPServer(
         "  attaches it exactly like an OFF result - Claude never handles image bytes.\n"
         "  These jobs are tagged source='claude_web' vs 'off' so their origin stays visible.\n\n"
         "RECIPE PICTURES: prefer upload_recipe_picture_base64() when the user shares\n"
-        "  an image directly with Claude - bypasses OneDrive entirely.\n\n"
+        "  an image directly with Claude - bypasses OneDrive entirely.\n"
+        "  For a picture found on the web use queue_recipe_image_job(recipe_id, image_url=...)\n"
+        "  with a direct link (.jpg/.jpeg/.png/.webp); the add-on downloads it later.\n\n"
         "RECIPE CATEGORIZATION: call get_recipe_type_options() to see the current list of\n"
         "  allowed 'Rezeptart' values, then pass one as create_or_update_recipe(rezeptart=...).\n\n"
         "HELPERS: list_locations(), list_product_groups(), search_quantity_units()"
@@ -822,7 +859,8 @@ async def get_products_pending_lookup() -> dict:
                             "grocy_name": j["grocy_name"]} for j in no_results],
         "image_download_pending": len(product_image_jobs),
         "needs_attention": [{"job_id": j["id"], "type": j["type"], "grocy_id": j["grocy_id"],
-                             "bildname": j.get("bildname"), "source": j.get("source", "off"),
+                             "bildname": j.get("bildname"), "image_url": j.get("image_url"),
+                             "source": j.get("source", "off"),
                              "failed_attempts": j.get("failed_attempts", 0),
                              "last_error": j.get("last_error")} for j in needs_attention],
     }
@@ -923,15 +961,29 @@ async def get_image_job(job_id: str) -> dict:
 
 
 @mcp.tool()
-async def queue_recipe_image_job(recipe_id: int, bildname: str) -> dict:
-    """Queue a recipe image job (OneDrive source)."""
-    if not bildname or not recipe_id:
-        return {"success": False, "error": "recipe_id und bildname Pflicht"}
+async def queue_recipe_image_job(recipe_id: int, bildname: str = "", image_url: str = "") -> dict:
+    """Queue a recipe image job. Two sources, give exactly one of them:
+    - bildname: filename of a photo in the OneDrive handy upload (as before).
+    - image_url: direct link to the image file itself (ends in .jpg/.jpeg/.png/.webp,
+      e.g. og:image of the recipe page), NOT a link to a webpage. The add-on image
+      worker downloads it later and sets it as the recipe picture; Claude never
+      handles image bytes. These jobs are tagged source="claude_web".
+    If both are given, image_url wins."""
+    if not recipe_id or not (bildname or image_url):
+        return {"success": False, "error": "recipe_id und bildname ODER image_url Pflicht"}
+    if image_url and not image_url.split("?")[0].lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+        return {"success": False,
+                "error": "image_url sieht nicht wie ein direkter Bildlink aus "
+                         "(muss auf .jpg/.jpeg/.png/.webp enden, kein Webseiten-Link)"}
     job = {"id": make_job_id(), "type": "rezept", "grocy_id": recipe_id,
-           "bildname": bildname, "source": "off",
+           "source": "claude_web" if image_url else "off",
            "queued_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    if bildname:
+        job["bildname"] = bildname
+    if image_url:
+        job["image_url"] = image_url
     add_image_job(job)
-    return {"success": True, "job_id": job["id"]}
+    return {"success": True, "job_id": job["id"], "recipe_id": recipe_id, "source": job["source"]}
 
 
 @mcp.tool()
