@@ -1,4 +1,4 @@
-"""MCP Video-Auswertung für Home Assistant v0.1.0
+"""MCP Video-Auswertung für Home Assistant v0.1.1
 
 Wertet ein Video per Link aus und liefert Beschreibung, Transkript mit
 Zeitstempeln und Bilder bei Szenenwechsel. Die Auswertung läuft als Job im
@@ -38,7 +38,11 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 try:
-    import audioop
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)  # audioop ist ab 3.11 veraltet
+        import audioop
 
     def Rms(Chunk):
         return audioop.rms(Chunk, 2)
@@ -356,7 +360,7 @@ async def CleanupLoop():
 # ── MCP-Tools ───────────────────────────────────────────────
 
 mcp = MCPServer(
-    version="0.1.0",
+    version="0.1.1",
     name="MCP Video-Auswertung",
     instructions=(
         "Analyses a video from a link (YouTube etc.). Evaluation takes minutes.\n"
@@ -368,6 +372,35 @@ mcp = MCPServer(
         f"Results are kept for {RetentionDays} days."
     ),
 )
+
+
+# ── MCP SDK 2.x: Fehlermeldungen von Tools wie in 1.x an das Modell durchreichen ──
+# In 2.x sieht das Modell bei normalen Exceptions nur "Error executing tool <name>".
+# Dieser Wrapper macht aus jeder Exception einen ToolError mit der Originalmeldung.
+import functools as _functools
+from mcp.shared.exceptions import MCPError as _MCPError
+
+_ToolOriginal = mcp.tool
+
+
+def _VisibleErrors(Function):
+    @_functools.wraps(Function)
+    async def _Wrapper(*Args, **Kwargs):
+        try:
+            return await Function(*Args, **Kwargs)
+        except (ToolError, _MCPError):
+            raise
+        except Exception as Error:  # noqa: BLE001
+            raise ToolError(str(Error) or type(Error).__name__) from Error
+    return _Wrapper
+
+
+def _ToolDecorator(*Args, **Kwargs):
+    Decorator = _ToolOriginal(*Args, **Kwargs)
+    return lambda Function: Decorator(_VisibleErrors(Function))
+
+
+mcp.tool = _ToolDecorator
 
 
 @mcp.tool()
