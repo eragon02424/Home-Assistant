@@ -1,4 +1,4 @@
-"""MCP Video-Auswertung für Home Assistant v0.1.1
+"""MCP Video-Auswertung für Home Assistant v0.1.2
 
 Wertet ein Video per Link aus und liefert Beschreibung, Transkript mit
 Zeitstempeln und Bilder bei Szenenwechsel. Die Auswertung läuft als Job im
@@ -121,6 +121,11 @@ def AllJobs():
 def Update(Job, **Fields):
     Job.update(Fields)
     SaveJob(Job)
+
+
+def HasSpeech(Words, Duration):
+    """Sprache gilt nur als erkannt, wenn genug Wörter pro Minute zusammenkommen."""
+    return Words >= max(5, (Duration or 0) / 60 * 15)
 
 
 async def RunProcess(Cmd, Timeout=1800):
@@ -320,11 +325,16 @@ async def RunJob(JobId):
         Update(Job, Stage="speech", Progress=f"Sprache 0/{len(Segments)}")
         Transcript = await Transcribe(Job, Segments)
         Text = "\n".join(f"[{Clock(S['Start'])}] {S['Text']}" for S in Transcript)
+        # Bei Musik liefert die Erkennung vereinzelte Fantasiewörter: Sprache gilt nur
+        # als erkannt, wenn genug Wörter pro Minute zusammenkommen
+        Words = sum(len(S["Text"].split()) for S in Transcript)
+        SpeechDetected = HasSpeech(Words, Job.get("Duration"))
         (Dir / "result.json").write_text(
             json.dumps({"Frames": Frames, "Transcript": Transcript, "TranscriptText": Text},
                        ensure_ascii=False, indent=1), encoding="utf-8")
         Update(Job, Status="done", Stage="done", Progress="fertig", FinishedAt=time.time(),
-               FrameCount=len(Frames), SegmentCount=len(Transcript))
+               FrameCount=len(Frames), SegmentCount=len(Transcript), WordCount=Words,
+               SpeechDetected=SpeechDetected)
     except Exception as Error:  # noqa: BLE001
         Update(Job, Status="failed", Stage="failed", Progress="Fehler",
                Error=str(Error) or type(Error).__name__, FinishedAt=time.time())
@@ -360,7 +370,7 @@ async def CleanupLoop():
 # ── MCP-Tools ───────────────────────────────────────────────
 
 mcp = MCPServer(
-    version="0.1.1",
+    version="0.1.2",
     name="MCP Video-Auswertung",
     instructions=(
         "Analyses a video from a link (YouTube etc.). Evaluation takes minutes.\n"
@@ -368,6 +378,7 @@ mcp = MCPServer(
         "2. ListVideoJobs() shows active jobs; GetVideoResult(JobId) shows progress or the result.\n"
         "Result: Description (the written text of the uploader, often contains amounts/steps),\n"
         "TranscriptText (spoken text with [mm:ss] timestamps, speech recognition errors are possible,\n"
+        "SpeechDetected=false means mostly music: do not trust the transcript,\n"
         "especially technical terms) and Frames (timestamps of extracted images).\n"
         f"Results are kept for {RetentionDays} days."
     ),
@@ -422,9 +433,12 @@ async def StartVideoAnalysis(Url: str) -> dict:
 
 
 @mcp.tool()
-async def GetVideoResult(JobId: str, IncludeDescription: bool = True) -> dict:
+async def GetVideoResult(JobId: str, IncludeDescription: bool = True, IncludeSegments: bool = False) -> dict:
     """Return status/progress of a job, or the full result when it is done
-    (Title, Description, TranscriptText with [mm:ss], Transcript segments, Frames)."""
+    (Title, Description, TranscriptText with [mm:ss], Frames, SpeechDetected).
+    IncludeSegments=True adds the transcript as segments with Start/End seconds.
+    If SpeechDetected is false the video has hardly any speech (music): rely on
+    the Description and the Frames instead of the transcript."""
     Job = LoadJob(re.sub(r"[^0-9a-f]", "", JobId))
     if not Job:
         raise ToolError("Job unbekannt oder abgelaufen")
@@ -440,10 +454,15 @@ async def GetVideoResult(JobId: str, IncludeDescription: bool = True) -> dict:
         "Title": Job.get("Title"), "Uploader": Job.get("Uploader"),
         "DurationSeconds": Job.get("Duration"),
         "ExpiresAt": Iso((Job.get("FinishedAt") or 0) + RetentionDays * 86400),
+        "SpeechDetected": Job["SpeechDetected"] if "SpeechDetected" in Job else HasSpeech(
+            sum(len(S["Text"].split()) for S in Result["Transcript"]), Job.get("Duration")),
         "TranscriptText": Result["TranscriptText"],
-        "Transcript": Result["Transcript"],
         "Frames": Result["Frames"],
     })
+    if not Info["SpeechDetected"]:
+        Info["Hint"] = "Kaum Sprache erkannt (vermutlich Musik): Text ist unzuverlässig, Beschreibung und Bilder nutzen"
+    if IncludeSegments:
+        Info["Transcript"] = Result["Transcript"]
     if IncludeDescription:
         Info["Description"] = Job.get("Description", "")
     return Info
@@ -484,7 +503,7 @@ async def Lifespan(App):
     JobQueue = asyncio.Queue()
     DataDir.mkdir(parents=True, exist_ok=True)
     # Unterbrochene Jobs (Neustart) von vorn starten
-    for Job in sorted(AllJobs(), key=lambda J: J.get("CreatedAt", 0)):
+    for Job in sorted(AllJobs(), key=lambda J: J.get("CreatedAt", 0), reverse=False):
         if Job["Status"] in ("queued", "running"):
             Update(Job, Status="queued", Stage="queued", Progress="wartet")
             await JobQueue.put(Job["JobId"])

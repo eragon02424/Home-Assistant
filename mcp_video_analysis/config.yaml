@@ -1,6 +1,6 @@
 name: "Video-Auswertung"
 description: "Wertet Videos per Link aus (Beschreibung, Sprache mit Zeitstempeln, Bilder bei Szenenwechsel) und stellt das Ergebnis per MCP bereit"
-version: "0.1.1"
+version: "0.1.2"
 slug: "mcp_video_analysis"
 init: false
 arch:
