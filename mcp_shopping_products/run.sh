@@ -7,4 +7,4 @@ export GROCY_QU_STOCK=$(bashio::config 'qu_id_stock')
 
 bashio::log.info "Starting MCP Shopping Products on port 8770, Grocy host: ${GROCY_HOST}"
 
-exec python3 /server.py
+exec python3 /main.py
