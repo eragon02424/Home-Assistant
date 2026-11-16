@@ -22,7 +22,7 @@
   #productPic { max-width:100%; border-radius:8px; margin:8px 0; display:none; }
 
   /* Tab bar */
-  #tabbar { position:fixed; bottom:0; left:0; right:0; display:flex; background:#1a1a1a; border-top:1px solid #333; }
+  #tabbar { position:fixed; bottom:0; left:0; right:0; display:flex; background:#1a1a1a; border-top:1px solid #333; z-index:20; }
   #tabbar button { flex:1; margin:0; border-radius:0; background:transparent; color:#888; padding:14px 0; font-size:1em; }
   #tabbar button.active { color:#2a6; font-weight:bold; }
 
@@ -46,14 +46,35 @@
   .sl-pending-item .sl-item { background:#231717; opacity:0.8; }
   .sl-pending-item .sl-item-bg { background:#2a6; }
   .sl-hours-left { color:#c99; font-size:0.8em; margin-top:2px; }
+
+  /* Rezepte */
+  #rcFilter { position:sticky; top:0; z-index:10; background:#111; padding:10px 0 8px; display:flex; flex-wrap:wrap; gap:8px; }
+  .rc-chip { width:auto; margin:0; padding:8px 14px; font-size:0.95em; border-radius:20px; background:#2a2a2a; color:#bbb; border:1px solid #3a3a3a; }
+  .rc-chip.on { background:#2a6; color:#fff; border-color:#2a6; }
+  .rc-chip .cnt { opacity:0.7; font-size:0.85em; margin-left:4px; }
+  #rcCount { color:#888; font-size:0.9em; margin:4px 0 10px; }
+  #rcGrid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:10px; padding-bottom:16px; }
+  .rc-tile { position:relative; aspect-ratio:1/1; border-radius:10px; overflow:hidden; background:#222; cursor:pointer; }
+  .rc-tile img { width:100%; height:100%; object-fit:cover; display:block; }
+  .rc-tile .rc-ph { width:100%; height:100%; box-sizing:border-box; padding:10px; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; color:#999; font-size:0.9em; gap:6px; }
+  .rc-tile .rc-ph span { font-size:2em; }
+  #rcEmpty, #rcLoading { text-align:center; color:#777; margin-top:40px; }
+
+  #rcOverlay { display:none; position:fixed; inset:0; z-index:30; background:rgba(0,0,0,0.92); overflow-y:auto; -webkit-overflow-scrolling:touch; }
+  #rcOverlay.open { display:block; }
+  #rcOverlay .rc-box { max-width:700px; margin:0 auto; padding:16px 16px 40px; }
+  #rcOverlay img { width:100%; border-radius:10px; background:#222; display:block; }
+  #rcOverlay .rc-noimg { width:100%; aspect-ratio:4/3; border-radius:10px; background:#222; display:flex; align-items:center; justify-content:center; font-size:4em; color:#555; }
+  #rcOverlay .rc-name { font-size:1.4em; margin:14px 0 4px; }
+  #rcOverlay .rc-meta { color:#999; font-size:1em; }
 </style>
 </head>
 <body>
 
-<h2 id="pageTitle">Grocy Schnellscan</h2>
+<h2 id="pageTitle">Einkaufsliste</h2>
 <div id="status"></div>
 
-<div id="step-video" class="step active">
+<div id="step-video" class="step">
   <video id="livestream" muted playsinline></video>
 </div>
 
@@ -75,17 +96,32 @@
   <button id="btnCapture">Foto aufnehmen &amp; Produkt anlegen</button>
 </div>
 
-<div id="step-shoppinglist" class="step">
+<div id="step-shoppinglist" class="step active">
   <div id="shoppingListWrap">
     <div id="slLoading">Lade Einkaufsliste...</div>
+  </div>
+</div>
+
+<div id="step-recipes" class="step">
+  <div id="rcFilter"></div>
+  <div id="rcCount"></div>
+  <div id="rcGrid"></div>
+</div>
+
+<div id="rcOverlay">
+  <div class="rc-box">
+    <div id="rcOverlayImg"></div>
+    <div class="rc-name" id="rcOverlayName"></div>
+    <div class="rc-meta" id="rcOverlayMeta"></div>
   </div>
 </div>
 
 <canvas id="captureCanvas" style="display:none;"></canvas>
 
 <div id="tabbar">
-  <button id="tabScan" class="active">Scan</button>
-  <button id="tabList">Einkaufsliste</button>
+  <button id="tabList" class="active">Einkaufsliste</button>
+  <button id="tabScan">Scan</button>
+  <button id="tabRecipes">Rezepte</button>
 </div>
 
 <script>
@@ -107,7 +143,7 @@ hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
 const reader = new ZXing.BrowserMultiFormatReader(hints);
 
 let pendingBarcode = null;
-let currentTab = 'scan';
+let currentTab = 'list';
 
 function showStep(id) {
   document.querySelectorAll('.step').forEach(e => e.classList.remove('active'));
@@ -452,30 +488,156 @@ async function restoreShoppingListItem(listItemId, outerEl) {
   }
 }
 
+// ── Rezepte tab ─────────────────────────────────────────────────────
+
+let rcData = null;            // { recipes: [...], categories: [...] }
+let rcLoadedAt = 0;
+const rcSelected = new Set(); // ausgewaehlte Rezeptarten (leer = alle)
+
+async function loadRecipes(force) {
+  const grid = document.getElementById('rcGrid');
+  if (rcData && !force && Date.now() - rcLoadedAt < 60000) {
+    renderRecipes();
+    return;
+  }
+  if (!rcData) {
+    grid.innerHTML = '<div id="rcLoading">Lade Rezepte...</div>';
+  }
+  try {
+    const res = await fetch('api/recipes');
+    const data = await res.json();
+    if (data.error) {
+      grid.innerHTML = '<div id="rcEmpty">Fehler: ' + data.error + '</div>';
+      return;
+    }
+    rcData = data;
+    rcLoadedAt = Date.now();
+    // Auswahl bereinigen, falls eine Rezeptart nicht mehr existiert
+    const known = new Set(data.categories.map(c => c.name));
+    for (const c of Array.from(rcSelected)) if (!known.has(c)) rcSelected.delete(c);
+    renderRecipes();
+  } catch (err) {
+    grid.innerHTML = '<div id="rcEmpty">Netzwerk-Fehler: ' + err + '</div>';
+  }
+}
+
+function renderRecipeFilter() {
+  const box = document.getElementById('rcFilter');
+  box.replaceChildren();
+  const all = document.createElement('button');
+  all.className = 'rc-chip' + (rcSelected.size === 0 ? ' on' : '');
+  all.textContent = 'Alle';
+  const cntAll = document.createElement('span');
+  cntAll.className = 'cnt';
+  cntAll.textContent = rcData.recipes.length;
+  all.appendChild(cntAll);
+  all.onclick = () => { rcSelected.clear(); renderRecipes(); };
+  box.appendChild(all);
+  for (const cat of rcData.categories) {
+    const chip = document.createElement('button');
+    chip.className = 'rc-chip' + (rcSelected.has(cat.name) ? ' on' : '');
+    chip.textContent = cat.name;
+    const cnt = document.createElement('span');
+    cnt.className = 'cnt';
+    cnt.textContent = cat.count;
+    chip.appendChild(cnt);
+    chip.onclick = () => {
+      if (rcSelected.has(cat.name)) rcSelected.delete(cat.name); else rcSelected.add(cat.name);
+      renderRecipes();
+    };
+    box.appendChild(chip);
+  }
+}
+
+function renderRecipes() {
+  renderRecipeFilter();
+  const grid = document.getElementById('rcGrid');
+  const list = rcData.recipes.filter(r => rcSelected.size === 0 || rcSelected.has(r.category));
+  document.getElementById('rcCount').textContent =
+    list.length + (list.length === 1 ? ' Rezept' : ' Rezepte');
+  if (list.length === 0) {
+    grid.innerHTML = '<div id="rcEmpty">Keine Rezepte in dieser Auswahl</div>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const r of list) {
+    const tile = document.createElement('div');
+    tile.className = 'rc-tile';
+    if (r.picture_file_name) {
+      const img = document.createElement('img');
+      img.loading = 'lazy';
+      img.alt = r.name;
+      img.src = 'api/recipe-picture/' + encodeURIComponent(r.picture_file_name) + '?w=500';
+      tile.appendChild(img);
+    } else {
+      const ph = document.createElement('div');
+      ph.className = 'rc-ph';
+      const ic = document.createElement('span');
+      ic.textContent = '🍽';
+      ph.appendChild(ic);
+      ph.appendChild(document.createTextNode(r.name));
+      tile.appendChild(ph);
+    }
+    tile.onclick = () => openRecipe(r);
+    frag.appendChild(tile);
+  }
+  grid.replaceChildren(frag);
+}
+
+function openRecipe(r) {
+  const imgBox = document.getElementById('rcOverlayImg');
+  imgBox.replaceChildren();
+  if (r.picture_file_name) {
+    const img = document.createElement('img');
+    img.alt = r.name;
+    img.src = 'api/recipe-picture/' + encodeURIComponent(r.picture_file_name) + '?w=1000';
+    imgBox.appendChild(img);
+  } else {
+    const no = document.createElement('div');
+    no.className = 'rc-noimg';
+    no.textContent = '🍽';
+    imgBox.appendChild(no);
+  }
+  document.getElementById('rcOverlayName').textContent = r.name;
+  document.getElementById('rcOverlayMeta').textContent = 'ID ' + r.id + ' · ' + r.category;
+  document.getElementById('rcOverlay').classList.add('open');
+}
+
+document.getElementById('rcOverlay').onclick = () => {
+  document.getElementById('rcOverlay').classList.remove('open');
+};
+
 // ── Tab switching ───────────────────────────────────────────────────
 
 function switchTab(tab) {
   currentTab = tab;
-  document.getElementById('tabScan').classList.toggle('active', tab === 'scan');
   document.getElementById('tabList').classList.toggle('active', tab === 'list');
+  document.getElementById('tabScan').classList.toggle('active', tab === 'scan');
+  document.getElementById('tabRecipes').classList.toggle('active', tab === 'recipes');
+  document.getElementById('rcOverlay').classList.remove('open');
   clearStatus();
+  stopAllStreams();
 
   if (tab === 'scan') {
     document.getElementById('pageTitle').textContent = 'Grocy Schnellscan';
-    document.getElementById('step-shoppinglist').classList.remove('active');
     startScanning();
+  } else if (tab === 'recipes') {
+    document.getElementById('pageTitle').textContent = 'Rezepte';
+    showStep('step-recipes');
+    loadRecipes();
   } else {
-    stopAllStreams();
     document.getElementById('pageTitle').textContent = 'Einkaufsliste';
     showStep('step-shoppinglist');
     loadShoppingList();
   }
 }
 
-document.getElementById('tabScan').onclick = () => switchTab('scan');
 document.getElementById('tabList').onclick = () => switchTab('list');
+document.getElementById('tabScan').onclick = () => switchTab('scan');
+document.getElementById('tabRecipes').onclick = () => switchTab('recipes');
 
-startScanning();
+// Startseite ist die Einkaufsliste, die Kamera startet erst im Reiter Scan.
+switchTab('list');
 </script>
 </body>
 </html>
