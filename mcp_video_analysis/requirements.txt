@@ -1,0 +1,5 @@
+mcp[cli]>=2.2.0,<3
+starlette
+uvicorn
+aiohttp
+yt-dlp[default]
