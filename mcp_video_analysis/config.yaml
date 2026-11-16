@@ -1,6 +1,6 @@
 name: "Video-Auswertung"
 description: "Wertet Videos per Link aus (Beschreibung, Sprache mit Zeitstempeln, Bilder bei Szenenwechsel) und stellt das Ergebnis per MCP bereit"
-version: "0.1.2"
+version: "0.2.0"
 slug: "mcp_video_analysis"
 init: false
 arch:
@@ -18,8 +18,10 @@ options:
   retention_days: 10
   scene_threshold: 0.15
   max_duration_minutes: 30
+  frame_base_url: "http://192.168.178.76:8771"
 schema:
   stt_pipeline_name: str
   retention_days: int(1,365)
   scene_threshold: float(0.01,1)
   max_duration_minutes: int(1,180)
+  frame_base_url: str

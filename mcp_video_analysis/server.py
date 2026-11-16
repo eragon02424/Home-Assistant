@@ -1,4 +1,4 @@
-"""MCP Video-Auswertung für Home Assistant v0.1.2
+"""MCP Video-Auswertung für Home Assistant v0.2.0
 
 Wertet ein Video per Link aus und liefert Beschreibung, Transkript mit
 Zeitstempeln und Bilder bei Szenenwechsel. Die Auswertung läuft als Job im
@@ -8,6 +8,7 @@ MCP-Tools:
 - StartVideoAnalysis(Url)   legt einen Job an und gibt die JobId zurück
 - GetVideoResult(JobId)     Status bzw. fertiges Ergebnis
 - ListVideoJobs(ActiveOnly) aktive (oder alle gespeicherten) Jobs
+- GetVideoFrames(JobId, ...) Standbilder zum Ansehen (inkl. Abruf-URL für Grocy)
 
 Ablauf je Job: yt-dlp (Download + Beschreibung) -> ffmpeg (Bilder, Ton) ->
 Sprechpausen-Teilung -> HA-Cloud-Spracherkennung über den Supervisor-Proxy.
@@ -32,9 +33,10 @@ import aiohttp
 import uvicorn
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.mcpserver.utilities.types import Image as McpImage
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse
+from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
 try:
@@ -62,6 +64,8 @@ SttPipelineName = os.environ.get("SttPipelineName", "Home Assistant Cloud")
 RetentionDays = int(os.environ.get("RetentionDays", "10"))
 SceneThreshold = float(os.environ.get("SceneThreshold", "0.15"))
 MaxDurationMinutes = int(os.environ.get("MaxDurationMinutes", "30"))
+# Adresse, unter der andere Add-ons (z. B. Grocy-Bild-Worker) die Bilder abrufen
+FrameBaseUrl = os.environ.get("FrameBaseUrl", "http://192.168.178.76:8771").rstrip("/")
 
 FrameMinGapSeconds = 3      # Mindestabstand zwischen zwei Szenenwechsel-Bildern
 FrameFallbackSeconds = 20   # spätestens alle X Sekunden ein Bild
@@ -121,6 +125,11 @@ def AllJobs():
 def Update(Job, **Fields):
     Job.update(Fields)
     SaveJob(Job)
+
+
+def FrameUrl(JobId, Frame):
+    """Abrufadresse eines Standbilds (für Grocy-Bild-Jobs: endet auf .jpg)."""
+    return f"{FrameBaseUrl}/jobs/{JobId}/{Frame['File']}"
 
 
 def HasSpeech(Words, Duration):
@@ -370,7 +379,7 @@ async def CleanupLoop():
 # ── MCP-Tools ───────────────────────────────────────────────
 
 mcp = MCPServer(
-    version="0.1.2",
+    version="0.2.0",
     name="MCP Video-Auswertung",
     instructions=(
         "Analyses a video from a link (YouTube etc.). Evaluation takes minutes.\n"
@@ -380,6 +389,8 @@ mcp = MCPServer(
         "TranscriptText (spoken text with [mm:ss] timestamps, speech recognition errors are possible,\n"
         "SpeechDetected=false means mostly music: do not trust the transcript,\n"
         "especially technical terms) and Frames (timestamps of extracted images).\n"
+        "GetVideoFrames(JobId, FromSeconds, ToSeconds, MaxCount) shows stills so you can look at them;\n"
+        "each still has a Url usable as image_url for Grocy recipe pictures.\n"
         f"Results are kept for {RetentionDays} days."
     ),
 )
@@ -457,7 +468,7 @@ async def GetVideoResult(JobId: str, IncludeDescription: bool = True, IncludeSeg
         "SpeechDetected": Job["SpeechDetected"] if "SpeechDetected" in Job else HasSpeech(
             sum(len(S["Text"].split()) for S in Result["Transcript"]), Job.get("Duration")),
         "TranscriptText": Result["TranscriptText"],
-        "Frames": Result["Frames"],
+        "Frames": [{"Time": F["Time"], "Url": FrameUrl(Job["JobId"], F)} for F in Result["Frames"]],
     })
     if not Info["SpeechDetected"]:
         Info["Hint"] = "Kaum Sprache erkannt (vermutlich Musik): Text ist unzuverlässig, Beschreibung und Bilder nutzen"
@@ -466,6 +477,33 @@ async def GetVideoResult(JobId: str, IncludeDescription: bool = True, IncludeSeg
     if IncludeDescription:
         Info["Description"] = Job.get("Description", "")
     return Info
+
+
+@mcp.tool()
+async def GetVideoFrames(JobId: str, FromSeconds: float = 0, ToSeconds: float = 1000000, MaxCount: int = 6):
+    """Show still images of a finished job (taken at scene changes, one at least every 20 s).
+    Only images between FromSeconds and ToSeconds are returned, at most MaxCount (1-12,
+    evenly thinned out). The first part is a text listing Time and Url of every image in the
+    same order as the images that follow; the Url can be passed to the recipe tool
+    queue_recipe_image_job(recipe_id, image_url=...) to use a still as recipe picture."""
+    Job = LoadJob(re.sub(r"[^0-9a-f]", "", JobId))
+    if not Job:
+        raise ToolError("Job unbekannt oder abgelaufen")
+    if Job["Status"] != "done":
+        raise ToolError(f"Job ist noch nicht fertig (Status {Job['Status']})")
+    Result = json.loads((JobDir(Job["JobId"]) / "result.json").read_text(encoding="utf-8"))
+    Selected = [F for F in Result["Frames"] if FromSeconds <= F["Time"] <= ToSeconds]
+    MaxCount = max(1, min(MaxCount, 12))
+    if len(Selected) > MaxCount:
+        Step = (len(Selected) - 1) / (MaxCount - 1) if MaxCount > 1 else 0
+        Selected = [Selected[round(I * Step)] for I in range(MaxCount)] if MaxCount > 1 else [Selected[len(Selected) // 2]]
+    if not Selected:
+        raise ToolError("Keine Bilder in diesem Zeitbereich")
+    Listing = [{"Time": F["Time"], "Url": FrameUrl(Job["JobId"], F)} for F in Selected]
+    Parts = [json.dumps(Listing, ensure_ascii=False)]
+    for Frame in Selected:
+        Parts.append(McpImage(data=(JobDir(Job["JobId"]) / Frame["File"]).read_bytes(), format="jpeg"))
+    return Parts
 
 
 @mcp.tool()
@@ -489,6 +527,18 @@ async def ListVideoJobs(ActiveOnly: bool = True) -> dict:
 
 async def Health(Request):
     return JSONResponse({"status": "ok", "queued": JobQueue.qsize() if JobQueue else 0})
+
+
+async def FrameFile(Request):
+    """Liefert ein Standbild als JPEG (nur Jobs/Bilder mit streng geprüften Namen)."""
+    JobId = Request.path_params["JobId"]
+    Name = Request.path_params["Name"]
+    if not re.fullmatch(r"[0-9a-f]{12}", JobId) or not re.fullmatch(r"t_\d{5,}\.\d{2}\.jpg", Name):
+        return Response(status_code=404)
+    File = JobDir(JobId) / "frames" / Name
+    if not File.is_file():
+        return Response(status_code=404)
+    return FileResponse(File, media_type="image/jpeg")
 
 
 McpApp = mcp.streamable_http_app(
@@ -516,7 +566,10 @@ async def Lifespan(App):
                 Task.cancel()
 
 
-app = Starlette(routes=[Route("/health", Health)] + McpApp.routes, lifespan=Lifespan)
+app = Starlette(
+    routes=[Route("/health", Health), Route("/jobs/{JobId}/frames/{Name}", FrameFile)] + McpApp.routes,
+    lifespan=Lifespan,
+)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8771)
