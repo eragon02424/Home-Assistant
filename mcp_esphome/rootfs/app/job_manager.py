@@ -40,6 +40,14 @@ earlier version of this file (every completion event overwrote
 job.status unconditionally, making an "install" job appear "completed"
 the moment compile alone finished, before the flash phase had even
 started).
+
+RACE FIX (0.22.2): the job_queued events (own compile job AND chained
+upload job) arrive on the event listener connection while the
+one-shot command connection is still being answered/closed. The Job
+therefore has to be registered BEFORE the command is sent
+(_unclaimed / _pending_installs), otherwise those events are dropped
+and the Job never sees its upload phase (it then wrongly adopts the
+upload job of the NEXT install of the same configuration).
 """
 import asyncio
 import logging
@@ -72,9 +80,10 @@ class Job:
     output: list = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     completed_at: Optional[float] = None
-    # ESPHome's own job_id for the compile phase (set immediately) and,
-    # for install jobs, the chained upload phase (set once discovered
-    # via its job_queued event). Used to tell which completion event is
+    # ESPHome's own job_id for the compile phase (set as soon as its
+    # job_queued event or the command response arrives) and, for
+    # install jobs, the chained upload phase (set once discovered via
+    # its job_queued event). Used to tell which completion event is
     # the FINAL, authoritative one for this Job's overall status.
     compile_job_id: Optional[str] = None
     upload_job_id: Optional[str] = None
@@ -97,6 +106,9 @@ class JobManager:
         # Maps ESPHome's own job_id -> our Job object, for BOTH the
         # compile job_id and (once discovered) the chained upload job_id.
         self._esphome_job_map: dict[str, Job] = {}
+        # Jobs that have been started but whose own ESPHome job_id is
+        # not known yet, keyed by configuration filename.
+        self._unclaimed: dict[str, Job] = {}
         # Installs whose chained upload job hasn't been seen yet, keyed
         # by configuration filename (e.g. "heizreglerv1.yaml"), since
         # that's what the chained job's job_queued event carries.
@@ -145,6 +157,14 @@ class JobManager:
                     pass
             await asyncio.sleep(5)
 
+    def _claim_own_job(self, job: Job, esphome_job_id: str):
+        """Maps the job's own (compile) ESPHome job_id to our Job."""
+        if job.compile_job_id is None:
+            job.compile_job_id = esphome_job_id
+        self._esphome_job_map[esphome_job_id] = job
+        if self._unclaimed.get(job.configuration) is job:
+            self._unclaimed.pop(job.configuration, None)
+
     def _handle_event(self, msg: dict):
         event = msg.get("event")
         data = msg.get("data", {})
@@ -161,13 +181,22 @@ class JobManager:
             job_id = job_info.get("job_id")
             job_type = job_info.get("job_type")
             configuration = job_info.get("configuration")
-            if job_type == "upload" and configuration in self._pending_installs:
-                job = self._pending_installs.pop(configuration)
-                job.upload_job_id = job_id
-                self._esphome_job_map[job_id] = job
-                job.flash_output_start_index = len(job.output)
-                _LOGGER.info("Discovered chained upload job for %s: %s",
-                             job.device_name, job_id)
+            if job_id in self._esphome_job_map:
+                return
+            if job_type == "upload":
+                if configuration in self._pending_installs:
+                    job = self._pending_installs.pop(configuration)
+                    job.upload_job_id = job_id
+                    self._esphome_job_map[job_id] = job
+                    job.flash_output_start_index = len(job.output)
+                    _LOGGER.info("Discovered chained upload job for %s: %s",
+                                 job.device_name, job_id)
+            else:
+                job = self._unclaimed.get(configuration)
+                if job is not None:
+                    self._claim_own_job(job, job_id)
+                    _LOGGER.info("Claimed own job id for %s via event: %s",
+                                 job.device_name, job_id)
             return
 
         if event in ("job_completed", "job_failed"):
@@ -246,52 +275,50 @@ class JobManager:
             await ws.close()
             await session.close()
 
+    async def _start_job(self, device_name: str, job_type: str, command: str,
+                         extra_args: Optional[dict] = None) -> str:
+        """Registers the Job BEFORE sending the command (so the
+        job_queued events cannot be missed), then sends it.
+        Returns OUR OWN job_id.
+        """
+        configuration = f"{device_name}.yaml"
+        our_job_id = uuid.uuid4().hex[:12]
+        job = Job(
+            job_id=our_job_id,
+            device_name=device_name,
+            job_type=job_type,
+            configuration=configuration,
+        )
+        self.jobs[our_job_id] = job
+        self._unclaimed[configuration] = job
+        if job_type == "install":
+            self._pending_installs[configuration] = job
+        try:
+            esphome_job_id = await self._send_job_command(command, configuration, extra_args)
+        except Exception:
+            self._unclaimed.pop(configuration, None)
+            self._pending_installs.pop(configuration, None)
+            self.jobs.pop(our_job_id, None)
+            raise
+        self._claim_own_job(job, esphome_job_id)
+        _LOGGER.info("%s started for %s: our_job_id=%s esphome_job_id=%s",
+                     command, device_name, our_job_id, esphome_job_id)
+        return our_job_id
+
     async def start_compile(self, device_name: str) -> str:
         """Starts firmware/compile. Output/status are collected purely
         via the persistent subscribe_events listener from here on.
         Returns OUR OWN job_id.
         """
-        configuration = f"{device_name}.yaml"
-        esphome_job_id = await self._send_job_command("firmware/compile", configuration)
-
-        our_job_id = uuid.uuid4().hex[:12]
-        job = Job(
-            job_id=our_job_id,
-            device_name=device_name,
-            job_type="compile",
-            configuration=configuration,
-            compile_job_id=esphome_job_id,
-        )
-        self.jobs[our_job_id] = job
-        self._esphome_job_map[esphome_job_id] = job
-        _LOGGER.info("Compile started for %s: our_job_id=%s esphome_job_id=%s",
-                     device_name, our_job_id, esphome_job_id)
-        return our_job_id
+        return await self._start_job(device_name, "compile", "firmware/compile")
 
     async def start_install(self, device_name: str) -> str:
         """Starts firmware/install with port=OTA (WiFi). The chained
         upload job is discovered automatically by the event listener
         via _pending_installs. Returns OUR OWN job_id.
         """
-        configuration = f"{device_name}.yaml"
-        esphome_job_id = await self._send_job_command(
-            "firmware/install", configuration, extra_args={"port": "OTA"}
-        )
-
-        our_job_id = uuid.uuid4().hex[:12]
-        job = Job(
-            job_id=our_job_id,
-            device_name=device_name,
-            job_type="install",
-            configuration=configuration,
-            compile_job_id=esphome_job_id,
-        )
-        self.jobs[our_job_id] = job
-        self._esphome_job_map[esphome_job_id] = job
-        self._pending_installs[configuration] = job
-        _LOGGER.info("Install (OTA) started for %s: our_job_id=%s esphome_compile_job_id=%s",
-                     device_name, our_job_id, esphome_job_id)
-        return our_job_id
+        return await self._start_job(device_name, "install", "firmware/install",
+                                     extra_args={"port": "OTA"})
 
     async def _send_job_command(self, command: str, configuration: str,
                                   extra_args: Optional[dict] = None) -> str:
