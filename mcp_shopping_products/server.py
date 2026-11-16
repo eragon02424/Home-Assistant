@@ -1,4 +1,12 @@
-"""MCP Shopping Products for Home Assistant v3.12.0
+"""MCP Shopping Products for Home Assistant v3.13.0
+
+v3.13.0 changes:
+- New tool get_product(product_id): reads one product with group, location,
+  stock/purchase unit, best-before days, stock amount and search_term, so
+  update_product_full() can be called without guessing current values.
+- New tool find_recipes_by_product(product_id): lists all recipes (with
+  recipe_pos_id, amount, unit) that use a product, e.g. before changing the
+  stock unit of a product.
 
 v3.12.0 changes:
 - queue_recipe_image_job(recipe_id, bildname="", image_url="") accepts a direct
@@ -106,7 +114,7 @@ _lookup_trigger = threading.Event()
 _last_image_result: dict = {}
 
 
-# ── File helpers ─────────────────────────────────────────────
+# ── File helpers ──────────────────────────────────────────────
 
 def _load_json(path: str, default):
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -151,7 +159,7 @@ def remove_image_job(job_id: str):
     save_image_jobs([j for j in load_image_jobs() if j.get("id") != job_id])
 
 
-# ── lookup helpers ────────────────────────────────────────────
+# ── lookup helpers ─────────────────────────────────────────────
 
 def load_lookup_pending() -> list:
     return _load_json(LOOKUP_PENDING_FILE, [])
@@ -194,7 +202,7 @@ def set_search_term_local(product_id: int, term: str):
     save_search_terms(terms)
 
 
-# ── shopping list pending-delete helpers ────────────────────────
+# ── shopping list pending-delete helpers ────────────────────────────
 
 def load_shopping_pending_delete() -> list:
     return _load_json(SHOPPING_PENDING_DELETE_FILE, [])
@@ -268,7 +276,7 @@ def start_shopping_purge_worker():
     print("[ShoppingList] Purge-Worker gestartet (Pruefung alle 5min)")
 
 
-# ── Grocy HTTP helpers ─────────────────────────────────────────
+# ── Grocy HTTP helpers ─────────────────────────────────────────────
 
 async def grocy_get(client, path, params=None):
     return await client.get(f"{GROCY_BASE}{path}", params=params)
@@ -295,7 +303,7 @@ def text_to_html(text: str) -> str:
     )
 
 
-# ── OpenFoodFacts helpers ──────────────────────────────────────
+# ── OpenFoodFacts helpers ──────────────────────────────────────────────
 
 def off_lookup_ean(ean: str) -> list:
     try:
@@ -335,7 +343,7 @@ def off_search_text(search_term: str) -> list:
     return []
 
 
-# ── Worker: OFF lookup (1/min) ────────────────────────────────────
+# ── Worker: OFF lookup (1/min) ─────────────────────────────────────────────
 
 def _run_off_lookup_tick():
     pending = load_lookup_pending()
@@ -387,7 +395,7 @@ def start_off_lookup_worker():
     print("[OFF] Lookup-Worker gestartet (1/min)")
 
 
-# ── Worker: image download (1/min) ────────────────────────────────
+# ── Worker: image download (1/min) ─────────────────────────────────────────────
 
 async def _upload_product_picture(grocy_id: int, image_bytes: bytes, ext: str = "jpg") -> bool:
     filename = f"product_{grocy_id}.{ext}"
@@ -564,7 +572,7 @@ def start_image_worker():
     print("[Image] Image-Worker gestartet (1/min)")
 
 
-# ── Auto-queue worker (every 5min) ──────────────────────────────
+# ── Auto-queue worker (every 5min) ──────────────────────────────────────
 
 async def _auto_queue_products_for_lookup():
     try:
@@ -615,10 +623,10 @@ def start_auto_queue_worker():
     print("[AutoQ] Auto-Queue-Worker gestartet (alle 5min)")
 
 
-# ── MCP tools ───────────────────────────────────────────────
+# ── MCP tools ─────────────────────────────────────────────────────
 
 mcp = MCPServer(
-    version="3.12.0",
+    version="3.13.0",
     name="MCP Shopping Products",
     instructions=(
         "Tools for Grocy products, recipes, shopping lists, product groups and data maintenance.\n\n"
@@ -645,6 +653,9 @@ mcp = MCPServer(
         "  with a direct link (.jpg/.jpeg/.png/.webp); the add-on downloads it later.\n\n"
         "RECIPE CATEGORIZATION: call get_recipe_type_options() to see the current list of\n"
         "  allowed 'Rezeptart' values, then pass one as create_or_update_recipe(rezeptart=...).\n\n"
+        "CHANGING A PRODUCT UNIT: get_product(product_id) shows the current values (use them\n"
+        "  for update_product_full), find_recipes_by_product(product_id) lists every recipe\n"
+        "  position that must be adjusted afterwards with update_recipe_ingredient().\n\n"
         "HELPERS: list_locations(), list_product_groups(), search_quantity_units()"
     ),
 )
@@ -1195,6 +1206,59 @@ async def search_products(query: str) -> dict:
 
 
 @mcp.tool()
+async def get_product(product_id: int) -> dict:
+    """Read one product with group, location, stock/purchase unit (id and name),
+    best-before days, current stock amount, description and the locally stored
+    search_term. Use it before update_product_full() so no value has to be guessed."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await grocy_get(client, f"/objects/products/{product_id}")
+        if r.status_code != 200:
+            return {"found": False, "error": f"Grocy returned {r.status_code}"}
+        p = r.json()
+        units_r = await grocy_get(client, "/objects/quantity_units")
+        unit_names = {u["id"]: u.get("name") for u in units_r.json()} if units_r.status_code == 200 else {}
+        stock_amount = None
+        sr = await grocy_get(client, f"/stock/products/{product_id}")
+        if sr.status_code == 200:
+            stock_amount = sr.json().get("stock_amount")
+        return {
+            "found": True, "product_id": p["id"], "name": p.get("name"),
+            "description": p.get("description"),
+            "product_group_id": p.get("product_group_id"),
+            "location_id": p.get("location_id"),
+            "qu_id_stock": p.get("qu_id_stock"),
+            "qu_stock_name": unit_names.get(p.get("qu_id_stock")),
+            "qu_id_purchase": p.get("qu_id_purchase"),
+            "qu_purchase_name": unit_names.get(p.get("qu_id_purchase")),
+            "default_best_before_days": p.get("default_best_before_days", 0),
+            "picture_file_name": p.get("picture_file_name"),
+            "stock_amount": stock_amount,
+            "search_term": load_search_terms().get(str(product_id)),
+        }
+
+
+@mcp.tool()
+async def find_recipes_by_product(product_id: int) -> dict:
+    """List all recipe positions that use a product (recipe_id, recipe name,
+    recipe_pos_id, amount, unit). Use it to adjust recipes after changing the
+    unit of a product (then update_recipe_ingredient on each recipe_pos_id)."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        pr = await grocy_get(client, "/objects/recipes_pos",
+                             params={"query[]": f"product_id={product_id}"})
+        if pr.status_code != 200:
+            return {"results": [], "error": f"Grocy returned {pr.status_code}"}
+        recipes_r = await grocy_get(client, "/objects/recipes")
+        recipe_names = {rec["id"]: rec.get("name") for rec in recipes_r.json()} if recipes_r.status_code == 200 else {}
+        units_r = await grocy_get(client, "/objects/quantity_units")
+        unit_names = {u["id"]: u.get("name") for u in units_r.json()} if units_r.status_code == 200 else {}
+        results = [{"recipe_id": pos["recipe_id"], "recipe_name": recipe_names.get(pos["recipe_id"]),
+                    "recipe_pos_id": pos["id"], "amount": pos["amount"],
+                    "qu_id": pos.get("qu_id"), "unit_name": unit_names.get(pos.get("qu_id"))}
+                   for pos in pr.json()]
+        return {"count": len(results), "results": results}
+
+
+@mcp.tool()
 async def create_product_simple(name: str) -> dict:
     """Create a new product with just a name."""
     async with httpx.AsyncClient(timeout=15) as client:
@@ -1400,7 +1464,7 @@ async def add_recipe_to_shopping_list(recipe_id: int, multiplier: float = 1) -> 
         return {"success": True, "added": added}
 
 
-# ── Ingress web UI ─────────────────────────────────────────
+# ── Ingress web UI ────────────────────────────────────────────────
 
 async def index(request: Request):
     with open("/static/index.html") as f:
@@ -1591,7 +1655,7 @@ async def api_shopping_list_restore(request: Request):
     return JSONResponse({"status": "ok", "list_item_id": list_item_id})
 
 
-# ── App assembly ─────────────────────────────────────────
+# ── App assembly ─────────────────────────────────────────────────
 
 # DNS-Rebinding-Schutz aus, damit Anfragen über LAN-IP/Proxy akzeptiert werden
 mcp_app = mcp.streamable_http_app(
