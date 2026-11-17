@@ -1,0 +1,19 @@
+name: "MCP OneDrive"
+description: "MCP-Server fuer den OneDrive-Bildabruf: Dateien in festen OneDrive-Ordnern per Dateiname suchen und einen Download-Auftrag stellen. Jeder Download braucht die Freigabe des Besitzers auf der Seite des OneDrive SyncServers in Home Assistant. Der Server wartet nie und liefert bei fertigen Auftraegen einen Download-Link fuer Programme mit Shell (z. B. Claude Code)."
+version: "0.1.0"
+slug: "mcp_onedrive"
+init: false
+arch:
+  - aarch64
+  - amd64
+startup: services
+boot: auto
+host_network: true
+ports:
+  8775/tcp: 8775
+options:
+  syncserver_api_url: "http://192.168.178.76:8776"
+  endpoint_token: ""
+schema:
+  syncserver_api_url: "str"
+  endpoint_token: "password?"
