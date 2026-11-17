@@ -26,6 +26,13 @@ Enthaelt:
   - Worker mit Lebenszeichen-Pruefung: ohne Byte-Fortschritt seit 2 Minuten
     wird der Download einmal neu gestartet; nach 60 Minuten gesamt gilt der
     Auftrag als fehlgeschlagen.
+
+Suche (schnell): Ein Ordner mit sehr vielen Dateien (Eigene Aufnahmen) wuerde
+beim seitenweisen Durchlesen rund 30 Sekunden brauchen. Deshalb (1) direkter
+Treffer-Abruf je Ordner ueber den Pfad (frisch, ohne Suchindex, unter einer
+Sekunde) und (2) nur wenn dort nichts gefunden wird (oder deep=true), live
+suchen in den Unterordnern. Die Unterordner-Liste pflegt ein Hintergrund-
+Thread (alle 15 Minuten).
 """
 
 import calendar
@@ -45,7 +52,7 @@ import urllib.request
 
 from flask import Blueprint, Flask, Response, jsonify, request, send_file
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PAGE_FILE = os.path.join(APP_DIR, "bildabruf_page.html")
@@ -65,8 +72,10 @@ FETCHED_KEEP = 600              # Endzustand nach einmaligem Abholen noch 10 Min
 MAX_WAITING_PER_ENDPOINT = 50
 MAX_PARALLEL = 2
 MAX_FOLDER_REQUESTS = 300       # Obergrenze Graph-Aufrufe je Suche
+MAX_TREE_REQUESTS = 2000        # Obergrenze Graph-Aufrufe fuer die Unterordner-Liste
 SEARCH_TIME_LIMIT = 40
 GALLERY_INTERVAL = 900
+TREE_INTERVAL = 900
 CHUNK = 256 * 1024
 
 MODES = ("blocked", "always", "confirm")
@@ -89,6 +98,7 @@ _endpoints = {}
 _running = set()
 _cancel = set()
 _options = {}
+_tree = {}
 _gallery = {"updated": None, "refreshing": False, "error": None, "items": []}
 _get_token = None
 _graph_get = None
@@ -238,40 +248,98 @@ def _children_pages(token, folder_path, select="id,name,size,folder,file,lastMod
         path = nxt.replace(_graph_base, "", 1) if nxt else None
 
 
-def _search(endpoint, filename):
-    """Sucht einen Dateinamen rekursiv in den festen Ordnern (direkt bei OneDrive, ohne Suchindex)."""
+def _list_subfolders(token, root):
+    """Alle Unterordner (rekursiv) eines Ordners; es werden nur Ordner vermerkt, keine Dateien."""
+    found, queue, used = [], [root], 0
+    while queue and used < MAX_TREE_REQUESTS:
+        current = queue.pop(0)
+        used += 1
+        try:
+            for item in _children_pages(token, current, select="id,name,folder"):
+                if "folder" in item:
+                    path = f"{current}/{item['name']}"
+                    found.append(path)
+                    queue.append(path)
+        except Exception as e:
+            if not _is_404(e):
+                raise
+    return found
+
+
+def _tree_refresh():
+    """Pflegt die Unterordner-Liste aller Endpunkt-Ordner (im Hintergrund, best effort)."""
+    try:
+        token = _get_token()
+        folders = sorted({f.strip("/") for ep in _endpoints.values() for f in ep["folders"]})
+        for folder in folders:
+            started = _now()
+            subs = _list_subfolders(token, folder)
+            with _lock:
+                _tree[folder] = {"subfolders": subs, "updated": _now()}
+            log(f"Unterordner von '{folder}': {len(subs)} (in {_now() - started:.0f} s)")
+    except Exception as e:
+        log(f"Unterordner-Abgleich fehlgeschlagen: {e}")
+
+
+def _tree_loop():
+    while True:
+        _tree_refresh()
+        time.sleep(TREE_INTERVAL)
+
+
+def _hit(item, path):
+    return {
+        "path": path,
+        "name": item.get("name"),
+        "size": item.get("size", 0),
+        "modified": item.get("lastModifiedDateTime"),
+    }
+
+
+def _search(endpoint, filename, deep=False):
+    """
+    Sucht einen Dateinamen in den festen Ordnern. Gibt (Treffer, unvollstaendig,
+    Anzahl Graph-Aufrufe, Unterordner-Liste noch nicht fertig) zurueck.
+    """
     token = _get_token()
     needle = filename.lower()
-    found = {}
-    requests_used = 0
+    folders = [f.strip("/") for f in endpoint["folders"]]
+    found, used, incomplete, pending = {}, 0, False, False
     started = _now()
-    truncated = False
-    for folder in endpoint["folders"]:
-        folder = folder.strip("/")
-        queue = [folder]
-        while queue:
-            if requests_used >= MAX_FOLDER_REQUESTS or _now() - started > SEARCH_TIME_LIMIT:
-                truncated = True
-                break
-            current = queue.pop(0)
-            requests_used += 1
-            try:
-                for item in _children_pages(token, current):
-                    name = item.get("name", "")
-                    if "folder" in item:
-                        queue.append(f"{current}/{name}")
-                    elif name.lower() == needle and item["id"] not in found:
-                        found[item["id"]] = {
-                            "path": f"{current}/{name}",
-                            "name": name,
-                            "size": item.get("size", 0),
-                            "modified": item.get("lastModifiedDateTime"),
-                        }
-            except Exception as e:
-                if _is_404(e):
-                    continue
+    # 1) direkter Treffer je Ordner (frisch, ohne Suchindex, ein Aufruf)
+    for folder in folders:
+        used += 1
+        try:
+            item = _graph_get(token, f"/me/drive/root:/{_q(folder + '/' + filename)}")
+            if "file" in item:
+                found[item["id"]] = _hit(item, f"{folder}/{item.get('name', filename)}")
+        except Exception as e:
+            if not _is_404(e):
                 raise
-    return list(found.values()), truncated, requests_used
+    if found and not deep:
+        return list(found.values()), False, used, False
+    # 2) Unterordner (Liste aus dem Hintergrund, Inhalt live)
+    for folder in folders:
+        with _lock:
+            cache = _tree.get(folder)
+        if cache is None:
+            pending = True
+            continue
+        for sub in cache["subfolders"]:
+            if used >= MAX_FOLDER_REQUESTS or _now() - started > SEARCH_TIME_LIMIT:
+                incomplete = True
+                break
+            used += 1
+            try:
+                for item in _children_pages(token, sub):
+                    if "folder" not in item and item.get("name", "").lower() == needle and item["id"] not in found:
+                        found[item["id"]] = _hit(item, f"{sub}/{item['name']}")
+            except Exception as e:
+                if not _is_404(e):
+                    raise
+        if incomplete:
+            break
+    return list(found.values()), incomplete, used, pending
 
 
 # ── Auftraege ─────────────────────────────────────────────────────────────────────
@@ -663,15 +731,19 @@ def _make_api_app():
         ep_id, ep = auth
         if ep["permissions"].get("list") != "always":
             return _err("Ansehen ist fuer diesen Endpunkt gesperrt", 403)
-        name = _clean_name((request.get_json(silent=True) or {}).get("filename"))
+        data = request.get_json(silent=True) or {}
+        name = _clean_name(data.get("filename"))
         if not name:
             return _err("filename fehlt oder ist ungueltig (kein Pfad erlaubt)", 400)
         try:
-            locations, truncated, used = _search(ep, name)
+            locations, incomplete, used, pending = _search(ep, name, bool(data.get("deep")))
         except Exception as e:
             log(f"Suche fehlgeschlagen: {e}")
             return _err(f"OneDrive-Abfrage fehlgeschlagen: {e}", 502)
-        return jsonify({"success": True, "found": len(locations), "locations": locations, "search_incomplete": truncated, "folders_searched": used})
+        return jsonify({
+            "success": True, "found": len(locations), "locations": locations,
+            "search_incomplete": incomplete or pending, "subfolders_pending": pending, "folders_searched": used,
+        })
 
     @api.route("/v1/jobs", methods=["POST"])
     def create_job():
@@ -804,7 +876,8 @@ def ui_state():
             })
         endpoints = [{"id": i, "name": e["name"], "folders": e["folders"], "permissions": e["permissions"]} for i, e in _endpoints.items()]
         gallery = dict(_gallery)
-    return jsonify({"now": _now(), "approval_timeout": APPROVAL_TIMEOUT, "jobs": jobs, "endpoints": endpoints, "gallery": gallery, "modes": MODES})
+        tree = {k: len(v["subfolders"]) for k, v in _tree.items()}
+    return jsonify({"now": _now(), "approval_timeout": APPROVAL_TIMEOUT, "jobs": jobs, "endpoints": endpoints, "gallery": gallery, "modes": MODES, "subfolders": tree})
 
 
 @bp.route("/bildabruf/preview/<job_id>")
@@ -900,6 +973,6 @@ def setup(ui_app, get_access_token, graph_get, graph_base):
         target=lambda: api.run(host="0.0.0.0", port=api_port, debug=False, threaded=True, use_reloader=False),
         daemon=True,
     ).start()
-    for fn in (_worker_loop, _watchdog_loop, _cleanup_loop, _gallery_loop):
+    for fn in (_worker_loop, _watchdog_loop, _cleanup_loop, _gallery_loop, _tree_loop):
         threading.Thread(target=fn, daemon=True).start()
     log(f"Bildabruf {VERSION} gestartet (Token-API Port {api_port}, Ingress-Seite /bildabruf)")
