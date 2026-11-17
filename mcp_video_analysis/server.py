@@ -1,31 +1,40 @@
-"""MCP Video-Auswertung für Home Assistant v0.2.0
+"""MCP Video-Auswertung für Home Assistant v0.3.0
 
 Wertet ein Video per Link aus und liefert Beschreibung, Transkript mit
-Zeitstempeln und Bilder bei Szenenwechsel. Die Auswertung läuft als Job im
+Zeitstempeln und Bilder im festen Raster von 500 Millisekunden. Die Auswertung läuft als Job im
 Hintergrund (dauert Minuten), das Ergebnis bleibt RetentionDays Tage erhalten.
 
 MCP-Tools:
-- StartVideoAnalysis(Url)   legt einen Job an und gibt die JobId zurück
+- StartVideoAnalysis(Url, ForceNew)  legt einen Job an und gibt die JobId zurück
 - GetVideoResult(JobId)     Status bzw. fertiges Ergebnis
 - ListVideoJobs(ActiveOnly) aktive (oder alle gespeicherten) Jobs
 - GetVideoFrames(JobId, ...) Standbilder zum Ansehen (inkl. Abruf-URL für Grocy)
 
-Ablauf je Job: yt-dlp (Download + Beschreibung) -> ffmpeg (Bilder, Ton) ->
-Sprechpausen-Teilung -> HA-Cloud-Spracherkennung über den Supervisor-Proxy.
+HTTP-Abrufe (Heimnetz, ohne Anmeldung):
+- /jobs/<JobId>/frames/<Name>.jpg   einzelnes Bild
+- /jobs/<JobId>/frames.zip          alle Bilder als ZIP (wird beim Abruf erzeugt)
+- /jobs/<JobId>/transcript.txt      Transkript als Textdatei mit [mm:ss]
+
+Ablauf je Job: Speicherprüfung -> yt-dlp (Download + Beschreibung) -> ffmpeg (alle
+500 ms ein Bild) -> YouTube-Untertitel, sonst Ton -> Sprechpausen-Teilung ->
+HA-Cloud-Spracherkennung über den Supervisor-Proxy.
 """
 
 import array
 import asyncio
 import contextlib
 import glob
+import html
 import json
 import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 import uuid
 import wave
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,7 +45,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver.utilities.types import Image as McpImage
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.background import BackgroundTask
+from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
 try:
@@ -62,16 +72,18 @@ except ImportError:  # Python >= 3.13
 DataDir = Path("/data/jobs")
 SttPipelineName = os.environ.get("SttPipelineName", "Home Assistant Cloud")
 RetentionDays = int(os.environ.get("RetentionDays", "10"))
-SceneThreshold = float(os.environ.get("SceneThreshold", "0.15"))
 MaxDurationMinutes = int(os.environ.get("MaxDurationMinutes", "30"))
+MinFreeGb = float(os.environ.get("MinFreeGb", "20"))
 # Adresse, unter der andere Add-ons (z. B. Grocy-Bild-Worker) die Bilder abrufen
 FrameBaseUrl = os.environ.get("FrameBaseUrl", "http://192.168.178.76:8771").rstrip("/")
 
-FrameMinGapSeconds = 3      # Mindestabstand zwischen zwei Szenenwechsel-Bildern
-FrameFallbackSeconds = 20   # spätestens alle X Sekunden ein Bild
+FrameIntervalSeconds = 0.5  # festes Raster: ein Bild alle 500 Millisekunden
 FrameWidth = 640
+FrameBytesEstimate = 60 * 1024  # vorsichtige Schätzung je Bild (gemessen 20 bis 50 KB)
 SegmentMaxSeconds = 12      # längste Sprachstücke für die Erkennung
 SupervisorWs = "ws://supervisor/core/websocket"
+SupervisorApi = "http://supervisor/core/api"
+NotifyId = "mcp_video_analysis_speicher"
 
 JobQueue = None  # asyncio.Queue, wird im Lifespan angelegt
 
@@ -149,6 +161,60 @@ async def RunProcess(Cmd, Timeout=1800):
     return Proc.returncode, Out.decode(errors="replace"), Err.decode(errors="replace")
 
 
+# ── Speicherschutz ──────────────────────────────────────────
+
+def FreeGb():
+    return shutil.disk_usage(DataDir).free / 1024 ** 3
+
+
+def DirSizeBytes(Path_):
+    Total = 0
+    for Root, _, Files in os.walk(Path_):
+        for Name in Files:
+            with contextlib.suppress(OSError):
+                Total += os.path.getsize(os.path.join(Root, Name))
+    return Total
+
+
+async def NotifyHa(Title, Message):
+    """Meldung in Home Assistant (Benachrichtigung in der Seitenleiste)."""
+    Token = os.environ.get("SUPERVISOR_TOKEN")
+    if not Token:
+        return
+    try:
+        async with aiohttp.ClientSession() as Session:
+            await Session.post(
+                f"{SupervisorApi}/services/persistent_notification/create",
+                headers={"Authorization": f"Bearer {Token}"},
+                json={"title": Title, "message": Message, "notification_id": NotifyId},
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+    except Exception as Error:  # noqa: BLE001
+        print(f"[Notify] fehlgeschlagen: {Error}", flush=True)
+
+
+def DeleteJob(Job):
+    shutil.rmtree(JobDir(Job["JobId"]), ignore_errors=True)
+
+
+def FinishedJobsOldestFirst(ExceptJobId=None):
+    Jobs = [J for J in AllJobs()
+            if J["Status"] in ("done", "failed") and J["JobId"] != ExceptJobId]
+    Jobs.sort(key=lambda J: J.get("FinishedAt") or J.get("CreatedAt", 0))
+    return Jobs
+
+
+def FreeUpSpace(NeededGb, ExceptJobId=None):
+    """Löscht fertige Jobs von alt nach neu, bis NeededGb frei sind.
+    Rückgabe: True, wenn genug frei ist."""
+    for Job in FinishedJobsOldestFirst(ExceptJobId):
+        if FreeGb() >= NeededGb:
+            break
+        DeleteJob(Job)
+        print(f"[Speicher] Job {Job['JobId']} gelöscht (Platz)", flush=True)
+    return FreeGb() >= NeededGb
+
+
 # ── Pipeline-Schritte ───────────────────────────────────────
 
 async def Download(Job, Dir):
@@ -181,14 +247,10 @@ async def Download(Job, Dir):
 
 
 async def ExtractFrames(Video, Dir):
-    """Bilder bei Szenenwechsel, Dateiname = Zeitstempel in Sekunden."""
+    """Ein Bild alle FrameIntervalSeconds, Dateiname = Zeitstempel in Sekunden."""
     FramesDir = Dir / "frames"
     FramesDir.mkdir(exist_ok=True)
-    Filter = (
-        "select='isnan(prev_selected_t)+gte(t-prev_selected_t,%d)"
-        "+gt(scene,%s)*gte(t-prev_selected_t,%d)',scale=%d:-2,showinfo"
-        % (FrameFallbackSeconds, SceneThreshold, FrameMinGapSeconds, FrameWidth)
-    )
+    Filter = "fps=%s,scale=%d:-2,showinfo" % (1 / FrameIntervalSeconds, FrameWidth)
     Code, _, Err = await RunProcess([
         "ffmpeg", "-v", "info", "-y", "-i", str(Video), "-vf", Filter,
         "-fps_mode", "vfr", "-q:v", "4", str(FramesDir / "tmp_%05d.jpg"),
@@ -203,6 +265,69 @@ async def ExtractFrames(Video, Dir):
         File.rename(FramesDir / Name)
         Frames.append({"Time": round(Time, 2), "File": f"frames/{Name}"})
     return Frames
+
+
+def ParseSrt(Text):
+    """Liest eine SRT-Datei: [{Start, End, Text}] mit Sekunden, ohne Formatierungs-Tags
+    und ohne die doppelten Zeilen, die automatische Untertitel gern enthalten."""
+    Segments = []
+    for Block in re.split(r"\n\s*\n", Text.replace("\r\n", "\n").strip()):
+        Lines = Block.split("\n")
+        TimeLine = next((L for L in Lines if "-->" in L), None)
+        if TimeLine is None:
+            continue
+        Match = re.match(r"\s*(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)", TimeLine)
+        if not Match:
+            continue
+        Parts = Match.groups()
+        Start = int(Parts[0]) * 3600 + int(Parts[1]) * 60 + int(Parts[2]) + int(Parts[3]) / 10 ** len(Parts[3])
+        End = int(Parts[4]) * 3600 + int(Parts[5]) * 60 + int(Parts[6]) + int(Parts[7]) / 10 ** len(Parts[7])
+        Body = " ".join(L.strip() for L in Lines[Lines.index(TimeLine) + 1:] if L.strip())
+        Body = html.unescape(re.sub(r"<[^>]+>", "", Body)).strip()
+        Previous = Segments[-1]["Text"] if Segments else ""
+        if not Body or Body == Previous or Previous.endswith(Body):
+            continue
+        Segments.append({"Start": round(Start, 1), "End": round(End, 1), "Text": Body})
+    return Segments
+
+
+def MergeSegments(Segments, MaxSeconds=10):
+    """Fasst kurze Untertitelzeilen zu Blöcken von höchstens MaxSeconds zusammen."""
+    Merged = []
+    for Segment in Segments:
+        if Merged and Segment["End"] - Merged[-1]["Start"] <= MaxSeconds:
+            Merged[-1]["Text"] += " " + Segment["Text"]
+            Merged[-1]["End"] = Segment["End"]
+        else:
+            Merged.append(dict(Segment))
+    return Merged
+
+
+async def DownloadSubtitles(Job, Dir):
+    """Holt die Untertitelspur (manuell oder automatisch) per yt-dlp.
+    Rückgabe: (Segmente, Sprachkürzel) oder ([], None). Fehler sind unkritisch,
+    ohne Untertitel läuft die Spracherkennung als Rückfall."""
+    Cmd = [
+        sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "--no-playlist",
+        "--skip-download", "--write-subs", "--write-auto-subs",
+        "--sub-langs", "de.*,en.*", "--sub-format", "srt/vtt/best", "--convert-subs", "srt",
+        "-o", str(Dir / "subs.%(ext)s"), "--", Job["Url"],
+    ]
+    try:
+        await RunProcess(Cmd, Timeout=300)
+    except RuntimeError:
+        return [], None
+    Files = {P.name.split(".")[-2]: P for P in Dir.glob("subs.*.srt")}
+    # Die Originalsprache (…-orig) zuerst, damit keine maschinelle Übersetzung gewählt wird
+    Order = ["de-orig", "en-orig", "de", "en"] + sorted(Files)
+    Lang = next((L for L in Order if L in Files), None)
+    if Lang is None:
+        return [], None
+    Segments = ParseSrt(Files[Lang].read_text(encoding="utf-8", errors="replace"))
+    for File in Files.values():
+        with contextlib.suppress(OSError):
+            File.unlink()
+    return MergeSegments(Segments), Lang
 
 
 async def ExtractAudio(Video, Dir):
@@ -318,6 +443,35 @@ async def RecognizeSegment(Ws, MsgId, PipelineId, Pcm):
             return Text
 
 
+class StorageError(RuntimeError):
+    """Zu wenig freier Speicher: Auftrag wird abgebrochen, seine Dateien werden gelöscht."""
+
+
+def EstimateNeededGb(DurationSeconds):
+    """Geschätzter Bedarf: Bilder im 500-ms-Raster plus Ton als WAV (16 kHz, mono, 16 Bit)."""
+    Bytes = DurationSeconds / FrameIntervalSeconds * FrameBytesEstimate + DurationSeconds * 32000
+    return Bytes / 1024 ** 3
+
+
+async def EnsureSpace(Job, DurationSeconds=0):
+    """Stellt sicher, dass nach dem Auftrag noch MinFreeGb frei bleiben. Reicht der Platz nicht,
+    werden fertige Analysen von alt nach neu gelöscht. Hilft das nicht, bricht der Auftrag ab."""
+    Needed = MinFreeGb + EstimateNeededGb(DurationSeconds)
+    if FreeGb() >= Needed:
+        return
+    if FreeUpSpace(Needed, ExceptJobId=Job["JobId"]):
+        return
+    Message = (f"Zu wenig Speicher: {FreeGb():.1f} GB frei, nötig sind {Needed:.1f} GB "
+               f"(Reserve {MinFreeGb:g} GB plus geschätzter Bedarf der Analyse). "
+               "Alle älteren Analysen sind bereits gelöscht.")
+    print(f"[Speicher] {Message} Job {Job['JobId']} wird abgebrochen.", flush=True)
+    await NotifyHa(
+        "Video-Auswertung: zu wenig Speicher",
+        f"{Message}\n\nDer Auftrag {Job['JobId']} wurde abgebrochen und seine Dateien gelöscht.\n{Job['Url']}",
+    )
+    raise StorageError(Message)
+
+
 async def RunJob(JobId):
     Job = LoadJob(JobId)
     if not Job or Job["Status"] not in ("queued", "running"):
@@ -325,14 +479,21 @@ async def RunJob(JobId):
     Dir = JobDir(JobId)
     Update(Job, Status="running", Stage="download", Progress="Download", StartedAt=time.time())
     try:
+        await EnsureSpace(Job)  # Reserve prüfen, bevor etwas geladen wird
         Video = await Download(Job, Dir)
+        await EnsureSpace(Job, Job.get("Duration") or 0)  # jetzt ist die Länge bekannt
         Update(Job, Stage="frames", Progress="Bilder")
         Frames = await ExtractFrames(Video, Dir)
-        Update(Job, Stage="audio", Progress="Ton")
-        Wav = await ExtractAudio(Video, Dir)
-        Segments = await asyncio.to_thread(SplitSpeech, Wav)
-        Update(Job, Stage="speech", Progress=f"Sprache 0/{len(Segments)}")
-        Transcript = await Transcribe(Job, Segments)
+        await EnsureSpace(Job)  # nach dem Schneiden die Reserve erneut prüfen
+        Update(Job, Stage="subtitles", Progress="Untertitel")
+        Transcript, Lang = await DownloadSubtitles(Job, Dir)
+        TranscriptSource = f"YouTube-Untertitel ({Lang})" if Transcript else "Spracherkennung"
+        if not Transcript:
+            Update(Job, Stage="audio", Progress="Ton")
+            Wav = await ExtractAudio(Video, Dir)
+            Segments = await asyncio.to_thread(SplitSpeech, Wav)
+            Update(Job, Stage="speech", Progress=f"Sprache 0/{len(Segments)}")
+            Transcript = await Transcribe(Job, Segments)
         Text = "\n".join(f"[{Clock(S['Start'])}] {S['Text']}" for S in Transcript)
         # Bei Musik liefert die Erkennung vereinzelte Fantasiewörter: Sprache gilt nur
         # als erkannt, wenn genug Wörter pro Minute zusammenkommen
@@ -343,13 +504,25 @@ async def RunJob(JobId):
                        ensure_ascii=False, indent=1), encoding="utf-8")
         Update(Job, Status="done", Stage="done", Progress="fertig", FinishedAt=time.time(),
                FrameCount=len(Frames), SegmentCount=len(Transcript), WordCount=Words,
-               SpeechDetected=SpeechDetected)
+               SpeechDetected=SpeechDetected, TranscriptSource=TranscriptSource,
+               FrameIntervalSeconds=FrameIntervalSeconds,
+               FramesBytes=DirSizeBytes(Dir / "frames"))
     except Exception as Error:  # noqa: BLE001
         Update(Job, Status="failed", Stage="failed", Progress="Fehler",
                Error=str(Error) or type(Error).__name__, FinishedAt=time.time())
+        if isinstance(Error, StorageError):
+            # Alles löschen, nur job.json mit der Fehlermeldung bleibt
+            for Item in Dir.iterdir():
+                if Item.name == "job.json":
+                    continue
+                if Item.is_dir():
+                    shutil.rmtree(Item, ignore_errors=True)
+                else:
+                    with contextlib.suppress(OSError):
+                        Item.unlink()
     finally:
         # Große Zwischendateien entfernen, nur Ergebnis und Bilder bleiben
-        for Pattern in ("video.*", "audio.wav"):
+        for Pattern in ("video.*", "audio.wav", "subs.*"):
             for File in glob.glob(str(Dir / Pattern)):
                 with contextlib.suppress(OSError):
                     os.remove(File)
@@ -379,7 +552,7 @@ async def CleanupLoop():
 # ── MCP-Tools ───────────────────────────────────────────────
 
 mcp = MCPServer(
-    version="0.2.0",
+    version="0.3.0",
     name="MCP Video-Auswertung",
     instructions=(
         "Analyses a video from a link (YouTube etc.). Evaluation takes minutes.\n"
@@ -388,7 +561,10 @@ mcp = MCPServer(
         "Result: Description (the written text of the uploader, often contains amounts/steps),\n"
         "TranscriptText (spoken text with [mm:ss] timestamps, speech recognition errors are possible,\n"
         "SpeechDetected=false means mostly music: do not trust the transcript,\n"
-        "especially technical terms) and Frames (timestamps of extracted images).\n"
+        "especially technical terms; TranscriptSource says whether it comes from YouTube subtitles\n"
+        "or speech recognition), FrameCount (one still every 0.5 s, fixed grid), TranscriptUrl\n"
+        "(plain text download) and FramesZipUrl (all stills as one ZIP, for tools that can fetch HTTP links).\n"
+        "StartVideoAnalysis(Url, ForceNew=true) discards a finished job of the same URL and analyses it again.\n"
         "GetVideoFrames(JobId, FromSeconds, ToSeconds, MaxCount) shows stills so you can look at them;\n"
         "each still has a Url usable as image_url for Grocy recipe pictures.\n"
         f"Results are kept for {RetentionDays} days."
@@ -426,15 +602,22 @@ mcp.tool = _ToolDecorator
 
 
 @mcp.tool()
-async def StartVideoAnalysis(Url: str) -> dict:
+async def StartVideoAnalysis(Url: str, ForceNew: bool = False) -> dict:
     """Start the analysis of a video link as a background job and return its JobId.
-    Poll GetVideoResult(JobId) afterwards. Only http(s) links are accepted."""
+    Poll GetVideoResult(JobId) afterwards. Only http(s) links are accepted.
+    ForceNew=True deletes a finished job of the same URL and analyses it again."""
     Url = Url.strip()
     if not re.match(r"^https?://", Url):
         raise ToolError("Nur http(s)-Links sind erlaubt")
     for Existing in AllJobs():
-        if Existing["Url"] == Url and Existing["Status"] in ("queued", "running", "done"):
+        if Existing["Url"] != Url:
+            continue
+        if Existing["Status"] in ("queued", "running"):
             return {"JobId": Existing["JobId"], "Status": Existing["Status"], "Reused": True}
+        if Existing["Status"] == "done":
+            if not ForceNew:
+                return {"JobId": Existing["JobId"], "Status": Existing["Status"], "Reused": True}
+            DeleteJob(Existing)
     Job = {"JobId": uuid.uuid4().hex[:12], "Url": Url, "Status": "queued",
            "Stage": "queued", "Progress": "wartet", "CreatedAt": time.time()}
     SaveJob(Job)
@@ -444,10 +627,13 @@ async def StartVideoAnalysis(Url: str) -> dict:
 
 
 @mcp.tool()
-async def GetVideoResult(JobId: str, IncludeDescription: bool = True, IncludeSegments: bool = False) -> dict:
+async def GetVideoResult(JobId: str, IncludeDescription: bool = True, IncludeSegments: bool = False,
+                         IncludeFrameList: bool = False) -> dict:
     """Return status/progress of a job, or the full result when it is done
-    (Title, Description, TranscriptText with [mm:ss], Frames, SpeechDetected).
+    (Title, Description, TranscriptText with [mm:ss], TranscriptSource, TranscriptUrl,
+    FrameCount, FramesZipUrl, SpeechDetected).
     IncludeSegments=True adds the transcript as segments with Start/End seconds.
+    IncludeFrameList=True adds Time and Url of every single still (can be thousands).
     If SpeechDetected is false the video has hardly any speech (music): rely on
     the Description and the Frames instead of the transcript."""
     Job = LoadJob(re.sub(r"[^0-9a-f]", "", JobId))
@@ -468,12 +654,19 @@ async def GetVideoResult(JobId: str, IncludeDescription: bool = True, IncludeSeg
         "SpeechDetected": Job["SpeechDetected"] if "SpeechDetected" in Job else HasSpeech(
             sum(len(S["Text"].split()) for S in Result["Transcript"]), Job.get("Duration")),
         "TranscriptText": Result["TranscriptText"],
-        "Frames": [{"Time": F["Time"], "Url": FrameUrl(Job["JobId"], F)} for F in Result["Frames"]],
+        "TranscriptSource": Job.get("TranscriptSource", "Spracherkennung"),
+        "TranscriptUrl": f"{FrameBaseUrl}/jobs/{Job['JobId']}/transcript.txt",
+        "FrameCount": len(Result["Frames"]),
+        "FrameIntervalSeconds": Job.get("FrameIntervalSeconds"),
+        "FramesSizeMB": round(Job.get("FramesBytes", 0) / 1024 ** 2, 1),
+        "FramesZipUrl": f"{FrameBaseUrl}/jobs/{Job['JobId']}/frames.zip",
     })
     if not Info["SpeechDetected"]:
         Info["Hint"] = "Kaum Sprache erkannt (vermutlich Musik): Text ist unzuverlässig, Beschreibung und Bilder nutzen"
     if IncludeSegments:
         Info["Transcript"] = Result["Transcript"]
+    if IncludeFrameList:
+        Info["Frames"] = [{"Time": F["Time"], "Url": FrameUrl(Job["JobId"], F)} for F in Result["Frames"]]
     if IncludeDescription:
         Info["Description"] = Job.get("Description", "")
     return Info
@@ -481,7 +674,7 @@ async def GetVideoResult(JobId: str, IncludeDescription: bool = True, IncludeSeg
 
 @mcp.tool()
 async def GetVideoFrames(JobId: str, FromSeconds: float = 0, ToSeconds: float = 1000000, MaxCount: int = 6):
-    """Show still images of a finished job (taken at scene changes, one at least every 20 s).
+    """Show still images of a finished job (one every 0.5 s, fixed grid).
     Only images between FromSeconds and ToSeconds are returned, at most MaxCount (1-12,
     evenly thinned out). The first part is a text listing Time and Url of every image in the
     same order as the images that follow; the Url can be passed to the recipe tool
@@ -541,6 +734,41 @@ async def FrameFile(Request):
     return FileResponse(File, media_type="image/jpeg")
 
 
+async def TranscriptFile(Request):
+    """Liefert das Transkript eines fertigen Jobs als Textdatei."""
+    JobId = Request.path_params["JobId"]
+    if not re.fullmatch(r"[0-9a-f]{12}", JobId):
+        return Response(status_code=404)
+    Job = LoadJob(JobId)
+    if not Job or Job["Status"] != "done":
+        return Response(status_code=404)
+    Result = json.loads((JobDir(JobId) / "result.json").read_text(encoding="utf-8"))
+    return PlainTextResponse(Result["TranscriptText"])
+
+
+def BuildZip(JobId):
+    """Packt alle Bilder eines Jobs in eine temporäre ZIP-Datei (JPEG, daher ohne Kompression)."""
+    Tmp = tempfile.NamedTemporaryFile(prefix="frames_", suffix=".zip", delete=False)
+    Tmp.close()
+    with zipfile.ZipFile(Tmp.name, "w", zipfile.ZIP_STORED) as Zip:
+        for File in sorted((JobDir(JobId) / "frames").glob("t_*.jpg")):
+            Zip.write(File, File.name)
+    return Tmp.name
+
+
+async def FramesZip(Request):
+    """Liefert alle Bilder eines fertigen Jobs als ein ZIP; die Datei wird nach dem Abruf gelöscht."""
+    JobId = Request.path_params["JobId"]
+    if not re.fullmatch(r"[0-9a-f]{12}", JobId):
+        return Response(status_code=404)
+    Job = LoadJob(JobId)
+    if not Job or Job["Status"] != "done" or not (JobDir(JobId) / "frames").is_dir():
+        return Response(status_code=404)
+    Name = await asyncio.to_thread(BuildZip, JobId)
+    return FileResponse(Name, media_type="application/zip", filename=f"frames_{JobId}.zip",
+                        background=BackgroundTask(os.remove, Name))
+
+
 McpApp = mcp.streamable_http_app(
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     host="0.0.0.0",
@@ -567,7 +795,12 @@ async def Lifespan(App):
 
 
 app = Starlette(
-    routes=[Route("/health", Health), Route("/jobs/{JobId}/frames/{Name}", FrameFile)] + McpApp.routes,
+    routes=[
+        Route("/health", Health),
+        Route("/jobs/{JobId}/frames/{Name}", FrameFile),
+        Route("/jobs/{JobId}/frames.zip", FramesZip),
+        Route("/jobs/{JobId}/transcript.txt", TranscriptFile),
+    ] + McpApp.routes,
     lifespan=Lifespan,
 )
 
