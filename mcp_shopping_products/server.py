@@ -1,63 +1,9 @@
-"""MCP Shopping Products for Home Assistant v3.13.0
+"""MCP Shopping Products (Einkaufsscanner) fuer Home Assistant.
 
-v3.13.0 changes:
-- New tool get_product(product_id): reads one product with group, location,
-  stock/purchase unit, best-before days, stock amount and search_term, so
-  update_product_full() can be called without guessing current values.
-- New tool find_recipes_by_product(product_id): lists all recipes (with
-  recipe_pos_id, amount, unit) that use a product, e.g. before changing the
-  stock unit of a product.
-
-v3.12.0 changes:
-- queue_recipe_image_job(recipe_id, bildname="", image_url="") accepts a direct
-  image URL as alternative to the OneDrive filename. The image worker downloads
-  the URL and sets it as recipe picture (same pipeline, retry and
-  needs_user_decision handling as before). URL jobs are tagged
-  source="claude_web"; the OneDrive path is unchanged.
-
-v3.11.0 changes:
-- Migrated to MCP Python SDK 2.x (FastMCP -> MCPServer). Tool names, schemas
-  and results unchanged; tool error messages stay visible to the model.
-
-v3.10.0 changes:
-- New tool queue_product_image_job(product_id, image_url): lets Claude queue
-  a product image job from ANY direct image URL (e.g. found via web search),
-  not just OpenFoodFacts. Reuses the exact same image_jobs pipeline/worker as
-  the OFF results (type="product_image"), so download, retry, failure and
-  needs_user_decision handling all behave identically.
-- image_jobs now carry a "source" field ("off" for the automatic OpenFoodFacts
-  pipeline, "claude_web" for manually queued jobs) so list_image_jobs() /
-  get_image_job() show where a picture came from. Existing OFF call sites
-  updated to tag their jobs with source="off".
-
-v3.9.0 changes:
-- New tool get_recipe_type_options(): reads the allowed values of the
-  Grocy 'rezeptart' userfield (entity=recipes, preset-list) so recipe
-  categorization stays in sync with what's configured in Grocy.
-- create_or_update_recipe() gained an optional 'rezeptart' parameter that
-  sets the userfield via PUT /api/userfields/recipes/{id} right after
-  creating/updating the recipe.
-
-v3.8.0 changes:
-- Shopping list swipe-to-delete is now a SOFT delete. Swiping an item moves
-  it to a "bald löschen" (pending-delete) list at the bottom instead of
-  deleting it from Grocy immediately.
-- Items sit in pending-delete for PENDING_DELETE_HOURS (2h). A background
-  worker checks every 5min and permanently deletes expired items from Grocy.
-- Swiping an item right within the pending-delete section restores it to
-  the normal shopping list (undo).
-- New endpoint POST /api/shopping-list/restore.
-- api_shopping_list now returns "pending_delete" array with hours_left per item.
-
-v3.7.0: shopping list tab, grouped by category, hard delete on swipe
-v3.6.0: upload_recipe_picture_base64 tool (bypasses OneDrive entirely)
-v3.5.0: needs_user_decision is informational only, worker always retries
-
-v3.4.0: image worker iterates through all active jobs until one succeeds
-v3.3.0: merge_products tool, auto-merge on UNIQUE name conflict
-v3.2.0: failed image job handling (needs_user_decision after 3 attempts)
-v3.1.0: three separate review tools, auto-queue claude_reviewed gate
-v3.0.0: three per-minute workers
+Kern: Grocy-Zugriff, Werkzeuge fuer Produkte, Rezepte, Einkaufsliste und Produktgruppen,
+Bild- und OFF-Lookup-Worker, Ingress-Oberflaeche. Die Pflege-Tags (Rezepte und Produkte)
+liegen in grocy_tags.py, der OneDrive-Abruf in onedrive_client.py, die Rezepte-Ansicht in
+recipes_ui.py; zusammengesetzt und gestartet wird alles in main.py.
 """
 
 import asyncio
@@ -71,14 +17,13 @@ import urllib.parse
 import urllib.request
 
 import httpx
+from onedrive_client import OneDriveClient, OneDriveError
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.server.mcpserver.utilities.types import Image as MCPImage
 from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 from starlette.requests import Request
-import uvicorn
 
 GROCY_HOST = os.environ.get("GROCY_HOST", "57f327aa-grocy-linuxserver")
 GROCY_BASE = f"http://{GROCY_HOST}/api"
@@ -86,14 +31,13 @@ LOCATION_ID = int(os.environ.get("GROCY_LOCATION_ID", "2"))
 QU_PURCHASE = int(os.environ.get("GROCY_QU_PURCHASE", "2"))
 QU_STOCK = int(os.environ.get("GROCY_QU_STOCK", "2"))
 
-ONEDRIVE_PHOTO_URL = "http://57f327aa-onedrive-syncserver:8772/api/photo"
+VERSION = "3.18.0"
 DATA_DIR = "/data"
 IMAGE_JOBS_FILE = f"{DATA_DIR}/image_jobs.json"
 LOOKUP_PENDING_FILE = f"{DATA_DIR}/lookup_pending.json"
 LOOKUP_DONE_FILE = f"{DATA_DIR}/lookup_done.json"
 SEARCH_TERMS_FILE = f"{DATA_DIR}/search_terms.json"
 SHOPPING_PENDING_DELETE_FILE = f"{DATA_DIR}/shopping_pending_delete.json"
-DOWNLOAD_DIR = "/share/onedrive_downloads"
 
 PENDING_DELETE_HOURS = 2  # Items sit here before being permanently removed from Grocy
 
@@ -105,7 +49,6 @@ RECIPE_IMAGE_MAX_BYTES = 5_000_000
 OFF_SEARCH_URL = "https://search.openfoodfacts.org/search"
 OFF_EAN_URL = "https://world.openfoodfacts.org/api/v2/product/{ean}.json"
 
-CLAUDE_REVIEWED_MARKER = "claude_reviewed:"
 NOTIFY_AFTER_ATTEMPTS = 3  # After this many failures, set needs_user_decision=true
                              # Worker still retries - flag is informational only
 
@@ -113,8 +56,11 @@ _image_trigger = threading.Event()
 _lookup_trigger = threading.Event()
 _last_image_result: dict = {}
 
+# Token-API des OneDrive SyncServers (Rezeptfotos per Dateiname)
+onedrive = OneDriveClient(os.environ.get("ONEDRIVE_API_URL", ""), os.environ.get("ONEDRIVE_TOKEN", ""))
 
-# ── File helpers ──────────────────────────────────────────────
+
+# ── File helpers ─────────────────────────────────────────────────
 
 def _load_json(path: str, default):
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -135,7 +81,7 @@ def make_job_id() -> str:
     return f"job_{int(time.time() * 1000)}"
 
 
-# ── image_jobs ─────────────────────────────────────────────────
+# ── image_jobs ─────────────────────────────────────────────────────
 
 def load_image_jobs() -> list:
     return _load_json(IMAGE_JOBS_FILE, [])
@@ -144,10 +90,10 @@ def save_image_jobs(jobs: list):
     _save_json(IMAGE_JOBS_FILE, jobs)
 
 def add_image_job(job: dict):
-    jobs = load_image_jobs()
-    for existing in jobs:
-        if existing.get("grocy_id") == job.get("grocy_id") and existing.get("type") == job.get("type"):
-            return
+    """Reiht einen Job ein. Ein bestehender Job fuer dasselbe Objekt (grocy_id + type)
+    wird ersetzt, damit eine neue Bildquelle nicht stillschweigend verworfen wird."""
+    jobs = [j for j in load_image_jobs()
+            if not (j.get("grocy_id") == job.get("grocy_id") and j.get("type") == job.get("type"))]
     job.setdefault("failed_attempts", 0)
     job.setdefault("needs_user_decision", False)
     job.setdefault("last_error", None)
@@ -159,7 +105,7 @@ def remove_image_job(job_id: str):
     save_image_jobs([j for j in load_image_jobs() if j.get("id") != job_id])
 
 
-# ── lookup helpers ─────────────────────────────────────────────
+# ── lookup helpers ─────────────────────────────────────────────────
 
 def load_lookup_pending() -> list:
     return _load_json(LOOKUP_PENDING_FILE, [])
@@ -202,7 +148,7 @@ def set_search_term_local(product_id: int, term: str):
     save_search_terms(terms)
 
 
-# ── shopping list pending-delete helpers ────────────────────────────
+# ── shopping list pending-delete helpers ────────────────────────────────
 
 def load_shopping_pending_delete() -> list:
     return _load_json(SHOPPING_PENDING_DELETE_FILE, [])
@@ -222,10 +168,6 @@ def unmark_pending_delete(list_item_id: int):
     save_shopping_pending_delete(
         [i for i in load_shopping_pending_delete() if i["list_item_id"] != list_item_id]
     )
-
-def is_pending_delete(list_item_id: int) -> bool:
-    return any(i["list_item_id"] == list_item_id for i in load_shopping_pending_delete())
-
 
 async def _purge_expired_pending_deletes():
     """Permanently delete from Grocy any shopping list items that have sat in
@@ -276,7 +218,7 @@ def start_shopping_purge_worker():
     print("[ShoppingList] Purge-Worker gestartet (Pruefung alle 5min)")
 
 
-# ── Grocy HTTP helpers ─────────────────────────────────────────────
+# ── Grocy HTTP helpers ──────────────────────────────────────────────
 
 async def grocy_get(client, path, params=None):
     return await client.get(f"{GROCY_BASE}{path}", params=params)
@@ -286,13 +228,6 @@ async def grocy_post(client, path, json_body):
 
 async def grocy_put(client, path, json_body=None, content=None, headers=None):
     return await client.put(f"{GROCY_BASE}{path}", json=json_body, content=content, headers=headers)
-
-async def fetch_product_image_mcp(client, picture_file_name):
-    fname_b64 = base64.b64encode(picture_file_name.encode()).decode()
-    r = await grocy_get(client, f"/files/productpictures/{fname_b64}")
-    if r.status_code == 200:
-        return MCPImage(data=r.content, format="jpeg")
-    return None
 
 def text_to_html(text: str) -> str:
     if not text:
@@ -343,7 +278,7 @@ def off_search_text(search_term: str) -> list:
     return []
 
 
-# ── Worker: OFF lookup (1/min) ─────────────────────────────────────────────
+# ── Worker: OFF lookup (1/min) ────────────────────────────────────────────────
 
 def _run_off_lookup_tick():
     pending = load_lookup_pending()
@@ -395,7 +330,7 @@ def start_off_lookup_worker():
     print("[OFF] Lookup-Worker gestartet (1/min)")
 
 
-# ── Worker: image download (1/min) ─────────────────────────────────────────────
+# ── Worker: image download (1/min) ────────────────────────────────────────────────
 
 async def _upload_product_picture(grocy_id: int, image_bytes: bytes, ext: str = "jpg") -> bool:
     filename = f"product_{grocy_id}.{ext}"
@@ -476,24 +411,15 @@ async def _process_one_image_job(job: dict) -> tuple[bool, str | None]:
         bildname = job.get("bildname")
         if not bildname:
             return False, "Kein bildname und keine image_url im Job"
-        local_path = os.path.join(DOWNLOAD_DIR, bildname)
-        if not os.path.exists(local_path):
-            try:
-                async with httpx.AsyncClient(timeout=60) as client:
-                    r = await client.post(ONEDRIVE_PHOTO_URL, json={"filename": bildname})
-                if not r.is_success or not r.json().get("success"):
-                    err = r.json().get("error", r.text[:80]) if r.is_success else r.text[:80]
-                    return False, f"OneDrive: {err}"
-            except Exception as e:
-                return False, f"OneDrive Verbindungsfehler: {e}"
-        if not os.path.exists(local_path):
-            return False, f"Datei nicht gefunden: {bildname}"
-        ext = os.path.splitext(bildname)[1].lstrip(".").lower() or "jpg"
-        with open(local_path, "rb") as f:
-            image_bytes = f.read()
-        success = await _upload_recipe_picture(grocy_id, image_bytes, ext)
-        if success:
-            print(f"[Image] Rezeptbild gesetzt recipe_id={grocy_id}")
+        try:
+            image_bytes, real_name = await onedrive.fetch(bildname)
+        except OneDriveError as e:
+            return False, f"OneDrive: {e}"
+        except Exception as e:
+            return False, f"OneDrive Verbindungsfehler: {type(e).__name__} {e}"
+        ext = os.path.splitext(real_name)[1].lstrip(".").lower() or "jpg"
+        if await _upload_recipe_picture(grocy_id, image_bytes, ext):
+            print(f"[Image] Rezeptbild gesetzt recipe_id={grocy_id} ueber OneDrive (Datei: {real_name})")
             return True, None
         return False, "Grocy Upload fehlgeschlagen"
     return False, f"Unbekannter Job-Typ: {job_type}"
@@ -572,90 +498,39 @@ def start_image_worker():
     print("[Image] Image-Worker gestartet (1/min)")
 
 
-# ── Auto-queue worker (every 5min) ──────────────────────────────────────
-
-async def _auto_queue_products_for_lookup():
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            pr = await grocy_get(client, "/objects/products")
-            if pr.status_code != 200:
-                return
-            products = pr.json()
-            br = await grocy_get(client, "/objects/product_barcodes")
-            barcodes_by_product = {}
-            if br.status_code == 200:
-                for entry in br.json():
-                    barcodes_by_product.setdefault(entry["product_id"], []).append(entry["barcode"])
-        pending_ids = {i["product_id"] for i in load_lookup_pending()}
-        done_ids = {i["product_id"] for i in load_lookup_done()}
-        image_job_ids = {j["grocy_id"] for j in load_image_jobs() if j.get("type") == "product_image"}
-        search_terms = load_search_terms()
-        added = 0
-        for p in products:
-            pid = p["id"]
-            if p.get("picture_file_name"):
-                continue
-            if pid in pending_ids or pid in done_ids or pid in image_job_ids:
-                continue
-            if CLAUDE_REVIEWED_MARKER not in (p.get("description") or ""):
-                continue
-            st = search_terms.get(str(pid))
-            if not st:
-                continue
-            barcodes = barcodes_by_product.get(pid, [])
-            add_lookup_pending(pid, p.get("name", ""), st, barcodes[0] if barcodes else None)
-            added += 1
-        if added:
-            print(f"[AutoQ] {added} Produkt(e) in lookup_pending")
-    except Exception as e:
-        print(f"[AutoQ] Fehler: {e}")
-
-def start_auto_queue_worker():
-    def loop():
-        time.sleep(120)
-        while True:
-            try:
-                asyncio.run(_auto_queue_products_for_lookup())
-            except Exception as e:
-                print(f"[AutoQ] Fehler: {e}")
-            time.sleep(300)
-    threading.Thread(target=loop, daemon=True).start()
-    print("[AutoQ] Auto-Queue-Worker gestartet (alle 5min)")
-
-
 # ── MCP tools ─────────────────────────────────────────────────────
 
 mcp = MCPServer(
-    version="3.13.0",
+    version=VERSION,
     name="MCP Shopping Products",
     instructions=(
         "Tools for Grocy products, recipes, shopping lists, product groups and data maintenance.\n\n"
-        "THREE REVIEW TOOLS:\n"
-        "1. get_products_for_name_review() -> update_product_full()\n"
+        "TAGS: recipes and products carry maintenance tags (see get_tag_definitions). A tag only means\n"
+        "  'step completed / data present'. Derived tags are set automatically; manual tags via set_tags():\n"
+        "  'Eingriff erforderlich' (+ reason) locks an item for the routines until Jonathan acts.\n"
+        "  Task lists: list_recipes_by_tags(), list_products_by_tags(), list_interventions(); counts: get_tag_overview().\n\n"
+        "PRODUCT FLOW:\n"
+        "1. list_products_by_tags(must_not_have=['Stammdaten gepflegt','Eingriff erforderlich']) or\n"
+        "   get_products_for_name_review() -> update_product_full() (sets tag 'Stammdaten gepflegt',\n"
+        "   which queues the product for the image lookup)\n"
         "2. get_products_for_lookup_decision() -> set_lookup_decision() or skip_lookup_job()\n"
-        "3. get_products_pending_lookup() - INFO ONLY\n\n"
-        "MERGE: merge_products(product_id_to_remove, product_id_to_keep)\n"
-        "  - update_product_full() auto-merges on UNIQUE name conflict.\n\n"
-        "STUCK JOBS: list_image_jobs() shows needs_user_decision=true jobs.\n"
-        "  The worker STILL RETRIES these every minute (file may appear on OneDrive).\n"
-        "  When you see needs_user_decision=true: inform the user of the error and\n"
-        "  the bildname, so they can upload the file to OneDrive.\n"
-        "  dismiss_failed_image_job(job_id) only removes a job if user explicitly asks.\n\n"
-        "MANUAL PRODUCT IMAGES: if OFF has no good match, Claude can web_search /\n"
-        "  web_fetch a product page, extract a direct image URL (og:image or <img src>,\n"
-        "  must end in .jpg/.png/.webp - not a webpage link), then call\n"
-        "  queue_product_image_job(product_id, image_url). The add-on downloads and\n"
-        "  attaches it exactly like an OFF result - Claude never handles image bytes.\n"
-        "  These jobs are tagged source='claude_web' vs 'off' so their origin stays visible.\n\n"
-        "RECIPE PICTURES: prefer upload_recipe_picture_base64() when the user shares\n"
-        "  an image directly with Claude - bypasses OneDrive entirely.\n"
-        "  For a picture found on the web use queue_recipe_image_job(recipe_id, image_url=...)\n"
-        "  with a direct link (.jpg/.jpeg/.png/.webp); the add-on downloads it later.\n\n"
-        "RECIPE CATEGORIZATION: call get_recipe_type_options() to see the current list of\n"
-        "  allowed 'Rezeptart' values, then pass one as create_or_update_recipe(rezeptart=...).\n\n"
-        "CHANGING A PRODUCT UNIT: get_product(product_id) shows the current values (use them\n"
-        "  for update_product_full), find_recipes_by_product(product_id) lists every recipe\n"
-        "  position that must be adjusted afterwards with update_recipe_ingredient().\n\n"
+        "3. get_products_pending_lookup() - INFO ONLY\n"
+        "MERGE: merge_products(product_id_to_remove, product_id_to_keep); update_product_full()\n"
+        "  auto-merges on UNIQUE name conflict.\n\n"
+        "STUCK JOBS: list_image_jobs() shows needs_user_decision=true jobs. The worker STILL RETRIES\n"
+        "  these every minute. Inform the user of the error and the bildname/URL.\n"
+        "  dismiss_failed_image_job(job_id) only removes a job if the user explicitly asks.\n"
+        "  A new queue_*_image_job() for the same product/recipe replaces the old job.\n\n"
+        "MANUAL PRODUCT IMAGES: if OFF has no good match, find a direct image URL on the web (must end in\n"
+        "  .jpg/.jpeg/.png/.webp, not a webpage link) and call queue_product_image_job(product_id, image_url).\n"
+        "  The add-on downloads and attaches it; jobs are tagged source='claude_web'.\n\n"
+        "RECIPES: get_recipe(), update_recipe(), create_or_update_recipe(), add/update/remove_recipe_ingredient().\n"
+        "  Pictures: upload_recipe_picture_base64() for an image the user shares directly,\n"
+        "  queue_recipe_image_job(recipe_id, image_url=...) for a web link or bildname=... for a OneDrive photo.\n"
+        "  Category: get_recipe_type_options(), then create_or_update_recipe(rezeptart=...).\n\n"
+        "CHANGING A PRODUCT UNIT: get_product(product_id) shows the current values (use them for\n"
+        "  update_product_full), find_recipes_by_product(product_id) lists every recipe position that\n"
+        "  must be adjusted afterwards with update_recipe_ingredient().\n\n"
         "HELPERS: list_locations(), list_product_groups(), search_quantity_units()"
     ),
 )
@@ -746,100 +621,6 @@ async def upload_recipe_picture_base64(recipe_id: int, image_base64: str, ext: s
     if success:
         return {"success": True, "recipe_id": recipe_id, "bytes": len(image_bytes)}
     return {"success": False, "error": "Grocy Upload fehlgeschlagen"}
-
-
-@mcp.tool()
-async def get_products_for_name_review() -> dict:
-    """CLAUDE'S TASK: Set name, group, location, units, MHD and search_term."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        pr = await grocy_get(client, "/objects/products")
-        if pr.status_code != 200:
-            return {"count": 0, "results": [], "error": f"Grocy returned {pr.status_code}"}
-        products = pr.json()
-        br = await grocy_get(client, "/objects/product_barcodes")
-        barcodes_by_product = {}
-        if br.status_code == 200:
-            for entry in br.json():
-                barcodes_by_product.setdefault(entry["product_id"], []).append(entry["barcode"])
-    search_terms = load_search_terms()
-    results = []
-    for p in products:
-        desc = p.get("description") or ""
-        if CLAUDE_REVIEWED_MARKER in desc:
-            continue
-        pid = p["id"]
-        results.append({
-            "product_id": pid, "name": p.get("name"), "description": desc,
-            "product_group_id": p.get("product_group_id"),
-            "location_id": p.get("location_id"),
-            "qu_id_stock": p.get("qu_id_stock"),
-            "qu_id_purchase": p.get("qu_id_purchase"),
-            "default_best_before_days": p.get("default_best_before_days", 0),
-            "picture_file_name": p.get("picture_file_name"),
-            "barcodes": barcodes_by_product.get(pid, []),
-            "search_term": search_terms.get(str(pid)),
-        })
-    return {"count": len(results), "results": results}
-
-
-@mcp.tool()
-async def update_product_full(
-    product_id: int,
-    name: str,
-    search_term: str,
-    description: str = "",
-    product_group_id: int | None = None,
-    location_id: int | None = None,
-    qu_id_stock: int | None = None,
-    qu_id_purchase: int | None = None,
-    default_best_before_days: int = 0,
-    reviewed: bool = True,
-) -> dict:
-    """Full product update. AUTO-MERGE on UNIQUE name conflict.
-    Locations: 2=Kühlschrank, 3=Vorratsschrank, 4=Gefrierschrank, 5=Lagerschrank"""
-    if search_term:
-        set_search_term_local(product_id, search_term)
-    final_desc = description or ""
-    if reviewed:
-        marker = f"{CLAUDE_REVIEWED_MARKER}{time.strftime('%Y-%m-%d')}"
-        final_desc = f"{final_desc}\n{marker}" if final_desc else marker
-    body = {"name": name, "description": final_desc,
-            "default_best_before_days": default_best_before_days}
-    if product_group_id is not None:
-        body["product_group_id"] = product_group_id
-    if location_id is not None:
-        body["location_id"] = location_id
-    if qu_id_stock is not None:
-        body["qu_id_stock"] = qu_id_stock
-    if qu_id_purchase is not None:
-        body["qu_id_purchase"] = qu_id_purchase
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await grocy_put(client, f"/objects/products/{product_id}", json_body=body)
-        if r.status_code in (200, 204):
-            return {"success": True, "product_id": product_id, "name": name,
-                    "search_term": search_term, "reviewed": reviewed}
-        if r.status_code == 400 and "UNIQUE constraint" in r.text:
-            existing_r = await grocy_get(client, "/objects/products",
-                                         params={"query[]": f"name={name}"})
-            if existing_r.status_code == 200 and existing_r.json():
-                existing_id = existing_r.json()[0]["id"]
-                if existing_id != product_id:
-                    merge_r = await client.post(
-                        f"{GROCY_BASE}/stock/products/{product_id}/merge/{existing_id}"
-                    )
-                    if merge_r.status_code in (200, 204):
-                        terms = load_search_terms()
-                        if str(existing_id) not in terms and search_term:
-                            terms[str(existing_id)] = search_term
-                        terms.pop(str(product_id), None)
-                        save_search_terms(terms)
-                        print(f"[Merge] Auto-merge {product_id} → {existing_id} ('{name}')")
-                        return {"success": True, "merged": True, "product_id": existing_id,
-                                "removed_id": product_id, "name": name, "search_term": search_term,
-                                "note": f"Duplikat {product_id} in {existing_id} zusammengeführt."}
-                    return {"success": False,
-                            "error": f"Auto-merge fehlgeschlagen: {merge_r.status_code}"}
-        return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text[:100]}"}
 
 
 @mcp.tool()
@@ -1097,91 +878,6 @@ async def delete_product_group(group_id: int) -> dict:
         if r.status_code not in (200, 204):
             return {"success": False, "error": f"Grocy returned {r.status_code}"}
         return {"success": True, "group_id": group_id}
-
-
-@mcp.tool()
-async def get_next_unnamed_product() -> list:
-    """Return the next product still using its barcode as placeholder name."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        pr = await grocy_get(client, "/objects/products")
-        if pr.status_code != 200:
-            return [{"found": False}]
-        products = pr.json()
-        br = await grocy_get(client, "/objects/product_barcodes")
-        barcodes_by_product = {}
-        if br.status_code == 200:
-            for entry in br.json():
-                barcodes_by_product.setdefault(entry["product_id"], []).append(entry["barcode"])
-        candidates = [p for p in products if p.get("name") and
-                      p["name"] in barcodes_by_product.get(p["id"], [])]
-        if not candidates:
-            return [{"found": False}]
-        product = candidates[0]
-        info = {"found": True, "product_id": product["id"], "barcode": product["name"]}
-        pfn = product.get("picture_file_name")
-        if pfn:
-            img = await fetch_product_image_mcp(client, pfn)
-            if img:
-                return [info, img]
-            info["picture_error"] = "Could not fetch"
-        else:
-            info["picture_error"] = "No picture"
-        return [info]
-
-
-@mcp.tool()
-async def get_next_product_without_barcode() -> list:
-    """Return the next product with no barcode linked."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        pr = await grocy_get(client, "/objects/products")
-        if pr.status_code != 200:
-            return [{"found": False}]
-        products = pr.json()
-        br = await grocy_get(client, "/objects/product_barcodes")
-        ids_with_bc = {e["product_id"] for e in br.json()} if br.status_code == 200 else set()
-        candidates = [p for p in products if p["id"] not in ids_with_bc]
-        if not candidates:
-            return [{"found": False}]
-        product = candidates[0]
-        info = {"found": True, "product_id": product["id"], "name": product.get("name")}
-        pfn = product.get("picture_file_name")
-        if pfn:
-            img = await fetch_product_image_mcp(client, pfn)
-            if img:
-                return [info, img]
-        return [info]
-
-
-@mcp.tool()
-async def get_next_product_without_picture() -> dict:
-    """Return the next product with no picture_file_name set."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        pr = await grocy_get(client, "/objects/products")
-        if pr.status_code != 200:
-            return {"found": False}
-        candidates = [p for p in pr.json() if not p.get("picture_file_name")]
-        if not candidates:
-            return {"found": False}
-        product = candidates[0]
-        br = await grocy_get(client, "/objects/product_barcodes",
-                             params={"query[]": f"product_id={product['id']}"})
-        barcode = br.json()[0]["barcode"] if br.status_code == 200 and br.json() else None
-        return {"found": True, "product_id": product["id"],
-                "name": product.get("name"), "barcode": barcode}
-
-
-@mcp.tool()
-async def update_product(product_id: int, name: str, description: str = "",
-                         product_group_id: int | None = None) -> dict:
-    """Quick name/description/group update."""
-    body = {"name": name, "description": description}
-    if product_group_id is not None:
-        body["product_group_id"] = product_group_id
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await grocy_put(client, f"/objects/products/{product_id}", json_body=body)
-        if r.status_code not in (200, 204):
-            return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text}"}
-        return {"success": True, "product_id": product_id, "name": name}
 
 
 @mcp.tool()
@@ -1464,7 +1160,7 @@ async def add_recipe_to_shopping_list(recipe_id: int, multiplier: float = 1) -> 
         return {"success": True, "added": added}
 
 
-# ── Ingress web UI ────────────────────────────────────────────────
+# ── Ingress web UI ──────────────────────────────────────────────────
 
 async def index(request: Request):
     with open("/static/index.html") as f:
@@ -1676,10 +1372,3 @@ app = Starlette(
     ] + mcp_app.routes,
     lifespan=mcp_app.router.lifespan_context,
 )
-
-if __name__ == "__main__":
-    start_image_worker()
-    start_off_lookup_worker()
-    start_auto_queue_worker()
-    start_shopping_purge_worker()
-    uvicorn.run(app, host="0.0.0.0", port=8770)
