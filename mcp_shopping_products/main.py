@@ -3,14 +3,22 @@
 Laedt server.py unveraendert, haengt die Rezepte-Routen aus recipes_ui.py vor die
 MCP-Routen und startet danach dieselben Worker und denselben Server wie der
 __main__-Block von server.py (bei neuen Workern dort hier mitpflegen).
+
+Ab 3.15.0: onedrive_client.install() biegt den OneDrive-Weg der Rezept-Jobs (bildname)
+auf den Endpunkt 'scanner' des OneDrive SyncServers um (Token-API statt /api/photo).
+Der alte Zweig in server.py bleibt als ungenutzter Code stehen.
 """
+
+import os
 
 import uvicorn
 
+import onedrive_client
 import server
 from recipes_ui import routes as recipe_routes
 
 server.app.router.routes[0:0] = recipe_routes
+onedrive_client.install(server, os.environ.get("ONEDRIVE_API_URL", ""), os.environ.get("ONEDRIVE_TOKEN", ""))
 
 if __name__ == "__main__":
     server.start_image_worker()

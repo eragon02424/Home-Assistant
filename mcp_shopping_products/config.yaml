@@ -1,6 +1,6 @@
 name: "Einkaufsscanner"
 description: "Scan groceries into Grocy (Ingress camera page) and let Claude fill in missing product names via MCP tools"
-version: "3.14.0"
+version: "3.15.0"
 slug: "mcp_shopping_products"
 init: false
 arch:
@@ -20,11 +20,15 @@ options:
   location_id: 2
   qu_id_purchase: 2
   qu_id_stock: 2
+  onedrive_api_url: "http://192.168.178.76:8776"
+  onedrive_token: ""
 schema:
   grocy_host: str
   location_id: int
   qu_id_purchase: int
   qu_id_stock: int
+  onedrive_api_url: str
+  onedrive_token: "password?"
 map:
   - type: addon_config
     path: /config
