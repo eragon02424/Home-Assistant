@@ -1,0 +1,4 @@
+mcp[cli]>=2.2.0,<3
+uvicorn
+asyncssh
+httpx

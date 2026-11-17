@@ -1,0 +1,34 @@
+name: "MCP Claude Code"
+description: "MCP-Server, der headless Claude-Code-Jobs (claude -p) auf der dauerhaft laufenden Linux-VM im eigenen Netz per SSH startet und überwacht. Prüft regelmäßig die Anmeldung von Claude Code und meldet eine abgelaufene Anmeldung als Benachrichtigung in Home Assistant. Windows/Visual Studio: siehe MCP Visual Studio Connector."
+version: "0.1.0"
+slug: "mcp_claude_code"
+init: false
+arch:
+  - aarch64
+  - amd64
+startup: services
+boot: auto
+host_network: true
+homeassistant_api: true
+ports:
+  8774/tcp: 8774
+options:
+  ssh_host: "192.168.178.113"
+  ssh_port: 22
+  ssh_user: "eragon02424"
+  ssh_key_path: "/config/.ssh/claude_speaker_assistant"
+  workspace_path: "/home/eragon02424/mcp_claude_code"
+  claude_binary: "/home/eragon02424/.npm-global/bin/claude"
+  login_check_minutes: 10
+schema:
+  ssh_host: "str"
+  ssh_port: "port"
+  ssh_user: "str"
+  ssh_key_path: "str"
+  workspace_path: "str"
+  claude_binary: "str"
+  login_check_minutes: "int(1,1440)"
+map:
+  - type: config
+    path: /config
+    read_only: true
