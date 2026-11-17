@@ -1,4 +1,4 @@
-"""Pflege-Tags fuer Rezepte und Produkte (ab 3.16.0, Marker-Ersatz ab 3.17.0).
+"""Pflege-Tags fuer Rezepte und Produkte, Produktpflege und Auto-Queue.
 
 Grocy kennt keine Tags. Die Tags liegen in je einem Zusatzfeld (Checkliste):
   recipes:  rezept_tags  + rezept_eingriff_grund
@@ -10,17 +10,22 @@ Ein Tag bedeutet nur "dieser Schritt ist abgeschlossen" (es ist vorhanden), nich
     bzw. refresh_tags() automatisch gesetzt oder entfernt (kein manuelles Setzen).
   * manuelle Tags: "Eingriff erforderlich" (Rezept und Produkt: Routine darf nichts tun,
     Jonathan muss etwas erledigen) und bei Produkten "Stammdaten gepflegt" (setzt
-    update_product_full, ersetzt seit 3.17.0 den Marker claude_reviewed: in der Beschreibung).
+    update_product_full).
 
 Fehlt bei einem Rezept der Link, bekommt es "Eingriff erforderlich" mit dem Grund
 "Link fehlt"; steht spaeter ein Link in der Beschreibung, entfaellt der Eingriff von selbst.
 
-install(server) registriert die Werkzeuge am bestehenden MCP-Server und ersetzt die
-Werkzeuge get_products_for_name_review und update_product_full sowie den Auto-Queue-Check
-aus server.py durch Tag-Varianten (die alten Funktionen in server.py bleiben ungenutzt).
+install(server) registriert die Werkzeuge am MCP-Server aus server.py:
+  * Tag-Werkzeuge fuer Rezepte und Produkte (Listen, set_tags, Eingriffe, Uebersicht)
+  * Rezept-Werkzeuge get_recipe / update_recipe
+  * Produktpflege get_products_for_name_review / update_product_full (Tor: Tag "Stammdaten gepflegt")
+und liefert die Funktion zurueck, die den Auto-Queue-Worker startet (Produkte mit dem Tag
+"Stammdaten gepflegt", ohne Bild und mit Suchbegriff kommen in den Bild-Lookup).
 """
 
+import asyncio
 import re
+import threading
 import time
 
 import httpx
@@ -37,10 +42,7 @@ TAG_AMOUNTS = "Mengen hinterlegt"
 TAG_LINK = "Link hinterlegt"
 TAG_MASTERDATA = "Stammdaten gepflegt"
 TAG_INTERVENTION = "Eingriff erforderlich"
-LEGACY_TAG_NO_LINK = "kein Link vorhanden"  # bis 3.16.0; wird zu Eingriff + Grund umgewandelt
 REASON_LINK_MISSING = "Link fehlt"
-
-OLD_REVIEW_MARKER = "claude_reviewed:"
 
 RECIPE_DERIVED = [TAG_IMAGE, TAG_INSTRUCTION, TAG_PRODUCTS, TAG_AMOUNTS, TAG_LINK]
 RECIPE_MANUAL = [TAG_INTERVENTION]
@@ -60,6 +62,7 @@ ENTITIES = {
 
 PLACEHOLDER_MAX = 0.0001  # Menge 0,00001 = bewusst vage Angabe (Prise, etwas)
 MIN_INSTRUCTION_CHARS = 40
+AUTO_QUEUE_INTERVAL = 300  # Sekunden
 
 
 def _split(value) -> list:
@@ -80,12 +83,8 @@ def _all_tags(entity: str) -> list:
     return cfg["derived"] + cfg["manual"]
 
 
-def _strip_marker(desc: str) -> str:
-    """Entfernt den alten Marker claude_reviewed:<Datum> aus einer Beschreibung."""
-    return re.sub(r"\n?claude_reviewed:\S*", "", desc or "").strip()
-
-
 def install(server):
+    """Registriert die Werkzeuge am MCP-Server und gibt start_auto_queue_worker zurueck."""
     mcp = server.mcp
     grocy_get = server.grocy_get
     grocy_put = server.grocy_put
@@ -151,19 +150,24 @@ def install(server):
                 out.setdefault(p["recipe_id"], []).append(p)
         return out
 
+    async def barcodes_by_product(client):
+        r = await grocy_get(client, "/objects/product_barcodes")
+        out = {}
+        if r.status_code == 200:
+            for entry in r.json():
+                out.setdefault(entry["product_id"], []).append(entry["barcode"])
+        return out
+
     def target_state(entity, item, positions_map):
         """Gibt (aktuelle Tags, Ziel-Tags, neuer Grund oder None) zurueck."""
         cfg = ENTITIES[entity]
         uf = item.get("userfields") or {}
         current = _split(uf.get(cfg["field"]))
-        cur_reason = (uf.get(cfg["reason"]) or "").strip()
         manual = [t for t in current if t in cfg["manual"]]
         new_reason = None
         if entity == "recipes":
             derived = derive_recipe(item, positions_map.get(item["id"], []))
-            if LEGACY_TAG_NO_LINK in current and TAG_LINK not in derived and TAG_INTERVENTION not in manual:
-                manual.append(TAG_INTERVENTION)
-                new_reason = REASON_LINK_MISSING
+            cur_reason = (uf.get(cfg["reason"]) or "").strip()
             if TAG_LINK in derived and TAG_INTERVENTION in manual and cur_reason == REASON_LINK_MISSING:
                 manual.remove(TAG_INTERVENTION)  # Link ist da, Eingriff erledigt
                 new_reason = ""
@@ -228,50 +232,47 @@ def install(server):
         ordered = [t for t in _all_tags("products") if t in tags]
         await grocy_put(client, f"/userfields/products/{product_id}", json_body={PRODUCT_FIELD: _join(ordered)})
 
-    # ── Ersatz fuer die Marker-Logik aus server.py ───────────────────────────
+    # ── Auto-Queue: Produkte mit Stammdaten, ohne Bild, in den OFF-Lookup ────
     async def auto_queue_by_tag():
-        """Wie server._auto_queue_products_for_lookup, aber Tor ist der Tag 'Stammdaten gepflegt'."""
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 pr = await grocy_get(client, "/objects/products")
                 if pr.status_code != 200:
                     return
                 products = pr.json()
-                br = await grocy_get(client, "/objects/product_barcodes")
-                barcodes_by_product = {}
-                if br.status_code == 200:
-                    for entry in br.json():
-                        barcodes_by_product.setdefault(entry["product_id"], []).append(entry["barcode"])
-            pending_ids = {i["product_id"] for i in server.load_lookup_pending()}
-            done_ids = {i["product_id"] for i in server.load_lookup_done()}
-            image_job_ids = {j["grocy_id"] for j in server.load_image_jobs() if j.get("type") == "product_image"}
+                barcodes = await barcodes_by_product(client)
+            known = ({i["product_id"] for i in server.load_lookup_pending()}
+                     | {i["product_id"] for i in server.load_lookup_done()}
+                     | {j["grocy_id"] for j in server.load_image_jobs() if j.get("type") == "product_image"})
             search_terms = server.load_search_terms()
             added = 0
             for p in products:
                 pid = p["id"]
-                if p.get("picture_file_name"):
+                if p.get("picture_file_name") or pid in known:
                     continue
-                if pid in pending_ids or pid in done_ids or pid in image_job_ids:
+                if TAG_MASTERDATA not in _split((p.get("userfields") or {}).get(PRODUCT_FIELD)):
                     continue
-                tags = _split((p.get("userfields") or {}).get(PRODUCT_FIELD))
-                if TAG_MASTERDATA not in tags:
+                term = search_terms.get(str(pid))
+                if not term:
                     continue
-                st = search_terms.get(str(pid))
-                if not st:
-                    continue
-                barcodes = barcodes_by_product.get(pid, [])
-                server.add_lookup_pending(pid, p.get("name", ""), st, barcodes[0] if barcodes else None)
+                codes = barcodes.get(pid, [])
+                server.add_lookup_pending(pid, p.get("name", ""), term, codes[0] if codes else None)
                 added += 1
             if added:
                 print(f"[AutoQ] {added} Produkt(e) in lookup_pending")
         except Exception as e:
             print(f"[AutoQ] Fehler: {e}")
 
-    server._auto_queue_products_for_lookup = auto_queue_by_tag  # der Worker ruft den Namen global auf
+    def start_auto_queue_worker():
+        def loop():
+            time.sleep(120)
+            while True:
+                asyncio.run(auto_queue_by_tag())
+                time.sleep(AUTO_QUEUE_INTERVAL)
+        threading.Thread(target=loop, daemon=True).start()
+        print(f"[AutoQ] Auto-Queue-Worker gestartet (alle {AUTO_QUEUE_INTERVAL // 60}min)")
 
-    mcp.remove_tool("get_products_for_name_review")
-    mcp.remove_tool("update_product_full")
-
+    # ── Produktpflege ────────────────────────────────────────────────────────
     @mcp.tool()
     async def get_products_for_name_review() -> dict:
         """CLAUDE'S TASK: Set name, group, location, units, MHD and search_term.
@@ -281,11 +282,7 @@ def install(server):
             if pr.status_code != 200:
                 return {"count": 0, "results": [], "error": f"Grocy returned {pr.status_code}"}
             products = pr.json()
-            br = await grocy_get(client, "/objects/product_barcodes")
-            barcodes_by_product = {}
-            if br.status_code == 200:
-                for entry in br.json():
-                    barcodes_by_product.setdefault(entry["product_id"], []).append(entry["barcode"])
+            barcodes = await barcodes_by_product(client)
         search_terms = server.load_search_terms()
         results = []
         for p in products:
@@ -294,14 +291,14 @@ def install(server):
                 continue
             pid = p["id"]
             results.append({
-                "product_id": pid, "name": p.get("name"), "description": _strip_marker(p.get("description")),
+                "product_id": pid, "name": p.get("name"), "description": p.get("description"),
                 "product_group_id": p.get("product_group_id"),
                 "location_id": p.get("location_id"),
                 "qu_id_stock": p.get("qu_id_stock"),
                 "qu_id_purchase": p.get("qu_id_purchase"),
                 "default_best_before_days": p.get("default_best_before_days", 0),
                 "picture_file_name": p.get("picture_file_name"),
-                "barcodes": barcodes_by_product.get(pid, []),
+                "barcodes": barcodes.get(pid, []),
                 "search_term": search_terms.get(str(pid)),
             })
         return {"count": len(results), "results": results}
@@ -321,20 +318,16 @@ def install(server):
     ) -> dict:
         """Full product update. AUTO-MERGE on UNIQUE name conflict.
         reviewed=true setzt den Tag 'Stammdaten gepflegt' (reiht das Produkt fuer den Bild-Lookup ein),
-        reviewed=false entfernt ihn. Die Beschreibung bleibt frei von Markern.
+        reviewed=false entfernt ihn.
         Locations: 2=Kuehlschrank, 3=Vorratsschrank, 4=Gefrierschrank, 5=Lagerschrank"""
         if search_term:
             server.set_search_term_local(product_id, search_term)
-        body = {"name": name, "description": _strip_marker(description),
+        body = {"name": name, "description": description,
                 "default_best_before_days": default_best_before_days}
-        if product_group_id is not None:
-            body["product_group_id"] = product_group_id
-        if location_id is not None:
-            body["location_id"] = location_id
-        if qu_id_stock is not None:
-            body["qu_id_stock"] = qu_id_stock
-        if qu_id_purchase is not None:
-            body["qu_id_purchase"] = qu_id_purchase
+        for key, value in (("product_group_id", product_group_id), ("location_id", location_id),
+                           ("qu_id_stock", qu_id_stock), ("qu_id_purchase", qu_id_purchase)):
+            if value is not None:
+                body[key] = value
         async with httpx.AsyncClient(timeout=30) as client:
             r = await grocy_put(client, f"/objects/products/{product_id}", json_body=body)
             if r.status_code in (200, 204):
@@ -364,7 +357,7 @@ def install(server):
                                 "error": f"Auto-merge fehlgeschlagen: {merge_r.status_code}"}
             return {"success": False, "error": f"Grocy returned {r.status_code}: {r.text[:100]}"}
 
-    # ── Werkzeuge ────────────────────────────────────────────────────────────
+    # ── Tag-Werkzeuge ────────────────────────────────────────────────────────
     @mcp.tool()
     async def get_tag_definitions() -> dict:
         """Alle Pflege-Tags je Entitaet (recipes, products). 'derived' werden automatisch aus
@@ -453,15 +446,15 @@ def install(server):
         for prod, tags, reason in rows[:max(limit, 0)]:
             pid = prod["id"]
             if pid in jobs:
-                state = "image_job_active"
+                image_state = "image_job_active"
             elif pid in done and done[pid].get("decision") is None:
-                state = "decision_open"
+                image_state = "decision_open"
             elif pid in pending:
-                state = "lookup_pending"
+                image_state = "lookup_pending"
             else:
-                state = "none"
+                image_state = "none"
             items.append({"product_id": pid, "name": prod.get("name"), "tags": tags,
-                          "intervention_reason": reason or None, "image_state": state,
+                          "intervention_reason": reason or None, "image_state": image_state,
                           "search_term": terms.get(str(pid))})
         return {"count": len(rows), "shown": len(items), "products": items}
 
@@ -519,6 +512,7 @@ def install(server):
                 "products": [{"product_id": p["id"], "name": p.get("name"), "reason": reason}
                              for p, _, reason in sorted(prod, key=lambda x: x[0]["id"])]}
 
+    # ── Rezept-Werkzeuge ─────────────────────────────────────────────────────
     @mcp.tool()
     async def get_recipe(recipe_id: int) -> dict:
         """Ein Rezept komplett: Name, Portionen, Beschreibung (Klartext und HTML), Links,
@@ -569,3 +563,5 @@ def install(server):
             await refresh(client, "recipes")
             tags = _split((await grocy_get(client, f"/userfields/recipes/{recipe_id}")).json().get(RECIPE_FIELD))
         return {"success": True, "recipe_id": recipe_id, "tags": tags}
+
+    return start_auto_queue_worker
