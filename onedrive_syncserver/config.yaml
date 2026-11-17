@@ -1,6 +1,6 @@
 name: "OneDrive SyncServer"
-description: "Synchronisiert Ordner zwischen Home Assistant und Microsoft OneDrive. Zwei-Pass-Architektur mit Dry-Run Vorab-Check und Integritaetspruefung. Atomarer Sync-Lock verhindert parallele Laeufe. Gezielte Remote-Loeschung pro Ordner inkl. Unterordner mit Notbremse und Trockenlauf (nur nach erfolgreichem Download). Pro-Ordner Filter und automatisches lokales Loeschen nach Zeit."
-version: "1.43.0"
+description: "Synchronisiert Ordner zwischen Home Assistant und Microsoft OneDrive. Zwei-Pass-Architektur mit Dry-Run Vorab-Check und Integritaetspruefung. Atomarer Sync-Lock verhindert parallele Laeufe. Gezielte Remote-Loeschung pro Ordner inkl. Unterordner mit Notbremse und Trockenlauf (nur nach erfolgreichem Download). Pro-Ordner Filter und automatisches lokales Loeschen nach Zeit. Neu: Bildabruf mit Token-Endpunkten, Freigabe-Seite und Download-Links fuer einzelne Dateien."
+version: "1.44.0"
 slug: "onedrive_syncserver"
 init: false
 arch:
@@ -13,8 +13,14 @@ ingress_port: 8772
 host_network: true
 options:
   sync_interval: 300
+  download_base_url: "http://192.168.178.76:8776"
+  api_port: 8776
+  gallery_days: 10
 schema:
   sync_interval: int
+  download_base_url: str
+  api_port: port
+  gallery_days: "int(1,60)"
 map:
   - type: share
     path: /share

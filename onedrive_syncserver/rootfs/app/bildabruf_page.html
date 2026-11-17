@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bildabruf</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:0;padding:16px;background:#f5f6f8;color:#1b1f24}
+ h1{font-size:20px;margin:0 0 12px} h2{font-size:16px;margin:24px 0 8px}
+ .card{background:#fff;border-radius:10px;padding:12px;margin:8px 0;box-shadow:0 1px 3px rgba(0,0,0,.12);display:flex;gap:12px;align-items:flex-start}
+ .card img.prev{width:140px;max-height:140px;object-fit:contain;background:#eee;border-radius:6px}
+ .grow{flex:1;min-width:0;word-break:break-all}
+ button{border:0;border-radius:6px;padding:8px 14px;font-size:14px;cursor:pointer;margin-right:6px}
+ .ok{background:#2e7d32;color:#fff} .no{background:#c62828;color:#fff} .pl{background:#dde3ea}
+ .muted{color:#667;font-size:13px}
+ .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px}
+ .tile{background:#fff;border-radius:8px;padding:4px;cursor:pointer;font-size:11px;word-break:break-all}
+ .tile img{width:100%;height:90px;object-fit:cover;border-radius:6px;background:#ddd}
+ table{border-collapse:collapse;width:100%;background:#fff;border-radius:8px} td,th{padding:6px 8px;border-bottom:1px solid #eee;text-align:left;font-size:13px}
+ .toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#222;color:#fff;padding:8px 14px;border-radius:8px;display:none}
+ @media (prefers-color-scheme:dark){body{background:#14171a;color:#e6e9ed}.card,table,.tile{background:#1f242a}.pl{background:#39424c;color:#fff}.muted{color:#9aa4ae}td,th{border-color:#333}}
+</style></head><body>
+<h1>Bildabruf</h1>
+<h2>Freigaben</h2><div id="approvals" class="muted">Lade ...</div>
+<h2>Auftraege</h2><div id="jobs" class="muted"></div>
+<h2>Letzte Bilder <span id="gstate" class="muted"></span> <button class="pl" onclick="refreshGallery()">Jetzt pruefen</button></h2>
+<div class="muted">Klick auf ein Bild kopiert den Dateinamen.</div><div id="gallery" class="grid"></div>
+<h2>Endpunkte und Berechtigungen</h2><div id="endpoints"></div>
+<div class="toast" id="toast"></div>
+<script>
+const BASE = "__BASE__";
+const LABEL = {blocked:"gesperrt", always:"immer erlaubt", confirm:"nur mit Bestaetigung"};
+const STATE = {waiting_for_approval:"wartet auf Bestaetigung", processing:"wird bearbeitet", ready:"bereit", rejected:"abgelehnt", expired:"abgelaufen", failed:"fehlgeschlagen"};
+function el(tag, props, kids){const e=document.createElement(tag);for(const k in (props||{})){if(k==='text')e.textContent=props[k];else if(k.startsWith('on'))e.addEventListener(k.slice(2),props[k]);else e.setAttribute(k,props[k]);}(kids||[]).forEach(c=>e.appendChild(c));return e;}
+function fmt(n){if(n==null)return "";if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(0)+' KB';return (n/1048576).toFixed(1)+' MB';}
+function toast(t){const x=document.getElementById('toast');x.textContent=t;x.style.display='block';setTimeout(()=>{x.style.display='none';},2000);}
+async function post(path, body){const r=await fetch(BASE+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});return r.json();}
+async function decide(id, d){const r=await post('/bildabruf/api/decide',{job_id:id,decision:d});if(!r.success)toast(r.error);load(true);}
+async function setPerm(ep, action, mode){const r=await post('/bildabruf/api/permissions',{endpoint:ep,action:action,mode:mode});toast(r.success?'Gespeichert':r.error);load(true);}
+async function refreshGallery(){await post('/bildabruf/api/gallery_refresh');toast('Pruefung gestartet');setTimeout(()=>load(true),1500);}
+function copyName(n){const t=document.createElement('textarea');t.value=n;document.body.appendChild(t);t.select();try{document.execCommand('copy');toast('Kopiert: '+n);}catch(e){window.prompt('Dateiname:',n);}document.body.removeChild(t);}
+function render(s){
+ const ap=document.getElementById('approvals');ap.textContent='';
+ const waiting=s.jobs.filter(j=>j.state==='waiting_for_approval');
+ if(!waiting.length)ap.appendChild(el('div',{class:'muted',text:'Keine offenen Anfragen.'}));
+ waiting.forEach(j=>{const left=Math.max(0,Math.round(s.approval_timeout-(s.now-j.created)));
+  const kids=[];if(j.preview)kids.push(el('img',{class:'prev',src:BASE+'/bildabruf/preview/'+j.id}));
+  kids.push(el('div',{class:'grow'},[el('div',{text:j.endpoint_name+': Herunterladen'}),el('div',{text:j.path}),el('div',{class:'muted',text:fmt(j.size)+' - noch '+left+' s'}),
+   el('div',{style:'margin-top:8px'},[el('button',{class:'ok',text:'Zulassen',onclick:()=>decide(j.id,'allow')}),el('button',{class:'no',text:'Ablehnen',onclick:()=>decide(j.id,'reject')})])]));
+  ap.appendChild(el('div',{class:'card'},kids));});
+ const jb=document.getElementById('jobs');jb.textContent='';
+ const others=s.jobs.filter(j=>j.state!=='waiting_for_approval');
+ if(!others.length)jb.appendChild(el('div',{class:'muted',text:'Keine Auftraege.'}));
+ others.forEach(j=>{let t=STATE[j.state]||j.state;if(j.state==='processing')t+=' ('+fmt(j.bytes)+' von '+fmt(j.size)+')';if(j.error)t+=': '+j.error;
+  jb.appendChild(el('div',{class:'card'},[el('div',{class:'grow'},[el('div',{text:j.path}),el('div',{class:'muted',text:t}),el('button',{class:'pl',text:'Entfernen',onclick:async()=>{await post('/bildabruf/api/delete_job',{job_id:j.id});load(true);}})])]));});
+ const g=s.gallery;document.getElementById('gstate').textContent=g.refreshing?'(Abgleich laeuft ...)':((g.updated?'(Stand '+new Date(g.updated*1000).toLocaleTimeString()+')':'')+(g.error?' Fehler: '+g.error:''));
+ const gr=document.getElementById('gallery');gr.textContent='';
+ g.items.forEach(i=>{const kids=[];if(i.thumb)kids.push(el('img',{src:i.thumb,loading:'lazy'}));kids.push(el('div',{text:i.name}));gr.appendChild(el('div',{class:'tile',onclick:()=>copyName(i.name)},kids));});
+ const ep=document.getElementById('endpoints');ep.textContent='';
+ const rows=[el('tr',{},['Endpunkt','Ordner','Ansehen','Herunterladen','Schreiben','Loeschen'].map(h=>el('th',{text:h})))];
+ s.endpoints.forEach(e=>{const sel=(action,modes)=>{const x=el('select',{},modes.map(m=>{const o=el('option',{value:m,text:LABEL[m]});if(e.permissions[action]===m)o.selected=true;return o;}));x.addEventListener('change',()=>setPerm(e.id,action,x.value));return x;};
+  rows.push(el('tr',{},[el('td',{text:e.name}),el('td',{text:e.folders.join(', ')}),el('td',{},[sel('list',['always','blocked'])]),el('td',{},[sel('download',['confirm','always','blocked'])]),el('td',{text:'gesperrt'}),el('td',{text:'gesperrt'})]));});
+ ep.appendChild(el('table',{},rows));
+}
+// Waehrend ein Auswahlfeld offen ist, wird die Seite nicht neu gezeichnet.
+async function load(force){if(!force&&document.activeElement&&document.activeElement.tagName==='SELECT')return;try{const r=await fetch(BASE+'/bildabruf/api/state');render(await r.json());}catch(e){}}
+load(true);setInterval(()=>load(false),4000);
+</script></body></html>

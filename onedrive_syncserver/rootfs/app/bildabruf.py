@@ -19,9 +19,10 @@ Enthaelt:
       GET  /v1/jobs/<id>         Status (mit Wartezeit in Sekunden)
       GET  /v1/dl/<token>[/name] Datei ausliefern (eigener Download-Token je Datei)
       GET  /v1/info              Endpunkt-Infos
-  - Ingress-Seite /bildabruf: Freigaben (Zulassen/Ablehnen mit Vorschau),
-    Aufträge, Galerie der letzten Bilder, Berechtigungen. Nur erreichbar
-    ueber Ingress (Supervisor-Netz) oder lokal (Loopback).
+  - Ingress-Seite /bildabruf (HTML in bildabruf_page.html): Freigaben
+    (Zulassen/Ablehnen mit Vorschau), Auftraege, Galerie der letzten Bilder,
+    Berechtigungen. Nur erreichbar ueber Ingress (Supervisor-Netz) oder
+    lokal (Loopback), nicht aus dem Heimnetz.
   - Worker mit Lebenszeichen-Pruefung: ohne Byte-Fortschritt seit 2 Minuten
     wird der Download einmal neu gestartet; nach 60 Minuten gesamt gilt der
     Auftrag als fehlgeschlagen.
@@ -44,7 +45,10 @@ import urllib.request
 
 from flask import Blueprint, Flask, Response, jsonify, request, send_file
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PAGE_FILE = os.path.join(APP_DIR, "bildabruf_page.html")
 
 DATA_DIR = "/data/bildabruf"
 ENDPOINTS_FILE = f"{DATA_DIR}/endpoints.json"
@@ -55,7 +59,7 @@ OPTIONS_FILE = "/data/options.json"
 
 APPROVAL_TIMEOUT = 600          # Bestaetigung verfaellt nach 10 Minuten
 PROCESSING_MAX = 3600           # harte Obergrenze fuer "wird bearbeitet"
-STALL_SECONDS = 120             # kein Byte-Fortschritt seit 2 Minuten -> pruefen/neu starten
+STALL_SECONDS = 120             # kein Byte-Fortschritt seit 2 Minuten -> abbrechen und neu starten
 READY_RETENTION = 86400         # fertige Datei bleibt einen Tag bereit
 FETCHED_KEEP = 600              # Endzustand nach einmaligem Abholen noch 10 Minuten sichtbar
 MAX_WAITING_PER_ENDPOINT = 50
@@ -199,7 +203,7 @@ def _is_404(exc):
     return str(exc).startswith("Graph 404")
 
 
-# ── Endpunkte, Token, Berechtigungen ───────────────────────────────────────
+# ── Endpunkte, Token ───────────────────────────────────────────────────────────────
 
 def _auth_endpoint():
     auth = request.headers.get("Authorization", "")
@@ -223,9 +227,9 @@ def _item_by_path(path):
     return _graph_get(_get_token(), f"/me/drive/root:/{_q(path)}")
 
 
-def _children_pages(token, folder_path, select="id,name,size,folder,file,lastModifiedDateTime", extra=""):
+def _children_pages(token, folder_path, select="id,name,size,folder,file,lastModifiedDateTime", extra="", top=999):
     """Liefert alle Kinder eines Ordners seitenweise (Generator ueber Einzelelemente)."""
-    path = f"/me/drive/root:/{_q(folder_path)}:/children?$select={select}&$top=999{extra}"
+    path = f"/me/drive/root:/{_q(folder_path)}:/children?$select={select}&$top={top}{extra}"
     while path:
         result = _graph_get(token, path)
         for item in result.get("value", []):
@@ -235,7 +239,7 @@ def _children_pages(token, folder_path, select="id,name,size,folder,file,lastMod
 
 
 def _search(endpoint, filename):
-    """Sucht einen Dateinamen rekursiv in den festen Ordnern (direkt bei OneDrive)."""
+    """Sucht einen Dateinamen rekursiv in den festen Ordnern (direkt bei OneDrive, ohne Suchindex)."""
     token = _get_token()
     needle = filename.lower()
     found = {}
@@ -359,6 +363,7 @@ def decide(job_id, decision):
             raise ValueError("Auftrag wartet nicht (mehr) auf Bestaetigung")
         if _now() - job["created"] > APPROVAL_TIMEOUT:
             job["state"] = "expired"
+            job["ended"] = _now()
             _save_jobs()
             raise ValueError("Die Bestaetigung ist abgelaufen")
         if decision == "allow":
@@ -369,6 +374,7 @@ def decide(job_id, decision):
         else:
             job["state"] = "rejected"
             job["decided"] = _now()
+            job["ended"] = _now()
         _save_jobs()
         result = job["state"]
     _delete_preview(job_id)
@@ -397,7 +403,7 @@ def _handle_failure(job_id, exc):
         shutil.rmtree(f"{FILES_DIR}/{job_id}", ignore_errors=True)
         if job["state"] != "processing":
             return
-        message = "Kein Fortschritt (haengt)" if isinstance(exc, _Stalled) else str(exc) or type(exc).__name__
+        message = "Kein Fortschritt (haengt)" if isinstance(exc, _Stalled) else (str(exc) or type(exc).__name__)
         if job.get("restarts", 0) < 1:
             job["restarts"] = job.get("restarts", 0) + 1
             job["last_progress"] = _now()
@@ -491,7 +497,7 @@ def _worker_loop():
 
 
 def _watchdog_loop():
-    """Lebenszeichen-Pruefung: haengende Auftraege erkennen (Neustart/Abbruch)."""
+    """Lebenszeichen-Pruefung: haengende Auftraege erkennen (Abbruch und einmaliger Neustart)."""
     while True:
         time.sleep(20)
         try:
@@ -528,7 +534,8 @@ def _cleanup_loop():
                         log(f"Auftrag {j['id']}: Datei nach einem Tag geloescht")
                     elif st in ("rejected", "expired", "failed"):
                         fetched = j.get("fetched_at")
-                        if (fetched and now - fetched > FETCHED_KEEP) or now - j.get("ended", j.get("decided", j["created"])) > READY_RETENTION:
+                        ended = j.get("ended", j.get("decided", j["created"]))
+                        if (fetched and now - fetched > FETCHED_KEEP) or now - ended > READY_RETENTION:
                             del _jobs[j["id"]]
                 _save_jobs()
                 known = set(_jobs)
@@ -553,31 +560,18 @@ def _to_epoch(s):
         return 0
 
 
-def _gallery_refresh():
-    with _lock:
-        if _gallery["refreshing"]:
-            return
-        _gallery["refreshing"] = True
-    try:
-        days = int(_options.get("gallery_days", 10) or 10)
-        cutoff = _now() - days * 86400
-        folders = sorted({f.strip("/") for ep in _endpoints.values() for f in ep["folders"]})
-        token = _get_token()
+def _gallery_folder(token, folder, cutoff):
+    """Bilder eines Ordners (ohne Unterordner), die juenger als cutoff sind."""
+    select = "id,name,size,file,folder,lastModifiedDateTime,thumbnails"
+    attempts = (
+        (True, "&$orderby=lastModifiedDateTime%20desc&$expand=thumbnails"),
+        (False, "&$expand=thumbnails"),
+    )
+    last_error = None
+    for sorted_ok, extra in attempts:
         items = []
-        select = "id,name,size,file,folder,lastModifiedDateTime,thumbnails"
-        for folder in folders:
-            sorted_ok = True
-            try:
-                gen = _children_pages(token, folder, select, "&$orderby=lastModifiedDateTime%20desc&$expand=thumbnails")
-                first = next(gen, None)
-                stream = ([first] if first else []) + list(gen) if False else None
-            except Exception:
-                sorted_ok = False
-            if sorted_ok:
-                gen = _children_pages(token, folder, select, "&$orderby=lastModifiedDateTime%20desc&$expand=thumbnails")
-            else:
-                gen = _children_pages(token, folder, select, "&$expand=thumbnails")
-            for item in gen:
+        try:
+            for item in _children_pages(token, folder, select, extra, top=100):
                 if "folder" in item:
                     continue
                 mtime = _to_epoch(item.get("lastModifiedDateTime", ""))
@@ -597,6 +591,27 @@ def _gallery_refresh():
                             thumb = th[0][size]["url"]
                             break
                 items.append({"name": name, "path": f"{folder}/{name}", "mtime": mtime, "thumb": thumb, "size": item.get("size", 0)})
+            return items
+        except Exception as e:
+            last_error = e
+            if _is_404(e):
+                raise
+    raise last_error
+
+
+def _gallery_refresh():
+    with _lock:
+        if _gallery["refreshing"]:
+            return
+        _gallery["refreshing"] = True
+    try:
+        days = int(_options.get("gallery_days", 10) or 10)
+        cutoff = _now() - days * 86400
+        folders = sorted({f.strip("/") for ep in _endpoints.values() for f in ep["folders"]})
+        token = _get_token()
+        items = []
+        for folder in folders:
+            items.extend(_gallery_folder(token, folder, cutoff))
         items.sort(key=lambda x: x["mtime"], reverse=True)
         with _lock:
             _gallery.update(items=items[:300], updated=_now(), error=None)
@@ -771,7 +786,9 @@ def _ui_base():
 @bp.route("/bildabruf")
 def page():
     threading.Thread(target=_gallery_refresh, daemon=True).start()
-    return Response(PAGE_HTML.replace("__BASE__", _ui_base()), mimetype="text/html")
+    with open(PAGE_FILE, encoding="utf-8") as f:
+        html = f.read()
+    return Response(html.replace("__BASE__", _ui_base()), mimetype="text/html")
 
 
 @bp.route("/bildabruf/api/state")
@@ -842,8 +859,9 @@ def ui_delete_job():
     job_id = str((request.get_json(silent=True) or {}).get("job_id", ""))
     with _lock:
         job = _jobs.pop(job_id, None)
-        _cancel.add(job_id)
-        _save_jobs()
+        if job:
+            _cancel.add(job_id)
+            _save_jobs()
     if not job:
         return jsonify({"success": False, "error": "Auftrag nicht gefunden"}), 404
     _delete_job_files(job_id)
@@ -865,72 +883,6 @@ def _inject_link(resp):
     except Exception:
         pass
     return resp
-
-
-PAGE_HTML = r'''<!DOCTYPE html>
-<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bildabruf</title>
-<style>
- body{font-family:system-ui,sans-serif;margin:0;padding:16px;background:#f5f6f8;color:#1b1f24}
- h1{font-size:20px;margin:0 0 12px} h2{font-size:16px;margin:24px 0 8px}
- .card{background:#fff;border-radius:10px;padding:12px;margin:8px 0;box-shadow:0 1px 3px rgba(0,0,0,.12);display:flex;gap:12px;align-items:flex-start}
- .card img.prev{width:140px;max-height:140px;object-fit:contain;background:#eee;border-radius:6px}
- .grow{flex:1;min-width:0;word-break:break-all}
- button{border:0;border-radius:6px;padding:8px 14px;font-size:14px;cursor:pointer;margin-right:6px}
- .ok{background:#2e7d32;color:#fff} .no{background:#c62828;color:#fff} .pl{background:#dde3ea}
- .muted{color:#667;font-size:13px}
- .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px}
- .tile{background:#fff;border-radius:8px;padding:4px;cursor:pointer;font-size:11px;word-break:break-all}
- .tile img{width:100%;height:90px;object-fit:cover;border-radius:6px;background:#ddd}
- table{border-collapse:collapse;width:100%;background:#fff;border-radius:8px} td,th{padding:6px 8px;border-bottom:1px solid #eee;text-align:left;font-size:13px}
- .toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#222;color:#fff;padding:8px 14px;border-radius:8px;display:none}
- @media (prefers-color-scheme:dark){body{background:#14171a;color:#e6e9ed}.card,table,.tile{background:#1f242a}.pl{background:#39424c;color:#fff}.muted{color:#9aa4ae}td,th{border-color:#333}}
-</style></head><body>
-<h1>Bildabruf</h1>
-<h2>Freigaben</h2><div id="approvals" class="muted">Lade ...</div>
-<h2>Auftraege</h2><div id="jobs" class="muted"></div>
-<h2>Letzte Bilder <span id="gstate" class="muted"></span> <button class="pl" onclick="refreshGallery()">Jetzt pruefen</button></h2>
-<div class="muted">Klick auf ein Bild kopiert den Dateinamen.</div><div id="gallery" class="grid"></div>
-<h2>Endpunkte und Berechtigungen</h2><div id="endpoints"></div>
-<div class="toast" id="toast"></div>
-<script>
-const BASE = "__BASE__";
-const LABEL = {blocked:"gesperrt", always:"immer erlaubt", confirm:"nur mit Bestaetigung"};
-const STATE = {waiting_for_approval:"wartet auf Bestaetigung", processing:"wird bearbeitet", ready:"bereit", rejected:"abgelehnt", expired:"abgelaufen", failed:"fehlgeschlagen"};
-function el(tag, props, kids){const e=document.createElement(tag);for(const k in (props||{})){if(k==='text')e.textContent=props[k];else if(k.startsWith('on'))e.addEventListener(k.slice(2),props[k]);else e.setAttribute(k,props[k]);}(kids||[]).forEach(c=>e.appendChild(c));return e;}
-function fmt(n){if(n==null)return '';if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(0)+' KB';return (n/1048576).toFixed(1)+' MB';}
-function toast(t){const x=document.getElementById('toast');x.textContent=t;x.style.display='block';setTimeout(()=>x.style.display='none',2000);}
-async function post(path, body){const r=await fetch(BASE+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});return r.json();}
-async function decide(id, d){const r=await post('/bildabruf/api/decide',{job_id:id,decision:d});if(!r.success)toast(r.error);load();}
-async function setPerm(ep, action, mode){const r=await post('/bildabruf/api/permissions',{endpoint:ep,action:action,mode:mode});toast(r.success?'Gespeichert':r.error);load();}
-async function refreshGallery(){await post('/bildabruf/api/gallery_refresh');toast('Pruefung gestartet');setTimeout(load,1500);}
-function copyName(n){const t=document.createElement('textarea');t.value=n;document.body.appendChild(t);t.select();try{document.execCommand('copy');toast('Kopiert: '+n);}catch(e){window.prompt('Dateiname:',n);}document.body.removeChild(t);}
-function render(s){
- const ap=document.getElementById('approvals');ap.textContent='';
- const waiting=s.jobs.filter(j=>j.state==='waiting_for_approval');
- if(!waiting.length)ap.appendChild(el('div',{class:'muted',text:'Keine offenen Anfragen.'}));
- waiting.forEach(j=>{const left=Math.max(0,Math.round(s.approval_timeout-(s.now-j.created)));
-  const kids=[];if(j.preview)kids.push(el('img',{class:'prev',src:BASE+'/bildabruf/preview/'+j.id}));
-  kids.push(el('div',{class:'grow'},[el('div',{text:j.endpoint_name+': Herunterladen'}),el('div',{text:j.path}),el('div',{class:'muted',text:fmt(j.size)+' - noch '+left+' s'}),
-   el('div',{style:'margin-top:8px'},[el('button',{class:'ok',text:'Zulassen',onclick:()=>decide(j.id,'allow')}),el('button',{class:'no',text:'Ablehnen',onclick:()=>decide(j.id,'reject')})])]));
-  ap.appendChild(el('div',{class:'card'},kids));});
- const jb=document.getElementById('jobs');jb.textContent='';
- const others=s.jobs.filter(j=>j.state!=='waiting_for_approval');
- if(!others.length)jb.appendChild(el('div',{class:'muted',text:'Keine Auftraege.'}));
- others.forEach(j=>{let t=STATE[j.state]||j.state;if(j.state==='processing')t+=' ('+fmt(j.bytes)+' von '+fmt(j.size)+')';if(j.error)t+=': '+j.error;
-  jb.appendChild(el('div',{class:'card'},[el('div',{class:'grow'},[el('div',{text:j.path}),el('div',{class:'muted',text:t}),el('button',{class:'pl',text:'Entfernen',onclick:async()=>{await post('/bildabruf/api/delete_job',{job_id:j.id});load();}})])]));});
- const g=s.gallery;document.getElementById('gstate').textContent=g.refreshing?'(Abgleich laeuft ...)':(g.updated?'(Stand '+new Date(g.updated*1000).toLocaleTimeString()+')':'')+(g.error?' Fehler: '+g.error:'');
- const gr=document.getElementById('gallery');gr.textContent='';
- g.items.forEach(i=>{const kids=[];if(i.thumb)kids.push(el('img',{src:i.thumb,loading:'lazy'}));kids.push(el('div',{text:i.name}));gr.appendChild(el('div',{class:'tile',onclick:()=>copyName(i.name)},kids));});
- const ep=document.getElementById('endpoints');ep.textContent='';
- const rows=[el('tr',{},['Endpunkt','Ordner','Ansehen','Herunterladen','Schreiben','Loeschen'].map(h=>el('th',{text:h})))];
- s.endpoints.forEach(e=>{const sel=(action,modes)=>{const x=el('select',{},modes.map(m=>{const o=el('option',{value:m,text:LABEL[m]});if(e.permissions[action]===m)o.selected=true;return o;}));x.addEventListener('change',()=>setPerm(e.id,action,x.value));return x;};
-  rows.push(el('tr',{},[el('td',{text:e.name}),el('td',{text:e.folders.join(', ')}),el('td',{},[sel('list',['always','blocked'])]),el('td',{},[sel('download',['confirm','always','blocked'])]),el('td',{text:'gesperrt'}),el('td',{text:'gesperrt'})]));});
- ep.appendChild(el('table',{},rows));
-}
-async function load(){try{const r=await fetch(BASE+'/bildabruf/api/state');render(await r.json());}catch(e){}}
-load();setInterval(load,4000);
-</script></body></html>'''
 
 
 # ── Einstieg ───────────────────────────────────────────────────────────────────────
