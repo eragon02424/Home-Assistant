@@ -6,6 +6,10 @@ SYNC_CONFIG="${CONFIG_DIR}/sync_config.json"
 ONEDRIVE_CONFIG_DIR="${CONFIG_DIR}/onedrive"
 SHARE_DIR="/share/onedrive"
 LOCK_FILE="${CONFIG_DIR}/sync.lock"
+LOG_FILE="${CONFIG_DIR}/sync.log"
+# Logdatei begrenzen: ueber 400 MB wird auf die letzten 300 MB gekuerzt
+LOG_MAX_BYTES=$((400 * 1024 * 1024))
+LOG_KEEP_BYTES=$((300 * 1024 * 1024))
 
 mkdir -p "${SHARE_DIR}" "${ONEDRIVE_CONFIG_DIR}" "${CONFIG_DIR}"
 
@@ -45,6 +49,20 @@ else
   SYNC_INTERVAL=300
 fi
 
+# Kuerzt die Logdatei auf die letzten LOG_KEEP_BYTES (an einer Zeilengrenze), sobald sie
+# groesser als LOG_MAX_BYTES ist. Laeuft zwischen den Syncs, wenn tee die Datei nicht offen hat.
+trim_log() {
+  [ -f "${LOG_FILE}" ] || return 0
+  local size
+  size=$(stat -c %s "${LOG_FILE}")
+  if [ "${size}" -gt "${LOG_MAX_BYTES}" ]; then
+    echo "[OneDrive SyncServer] Logdatei ${size} Bytes - kuerze auf ${LOG_KEEP_BYTES} Bytes..."
+    tail -c "${LOG_KEEP_BYTES}" "${LOG_FILE}" | tail -n +2 > "${LOG_FILE}.tmp" \
+      && mv "${LOG_FILE}.tmp" "${LOG_FILE}" || rm -f "${LOG_FILE}.tmp"
+  fi
+}
+trim_log
+
 # Der Starter laedt server.py unveraendert und haengt das Bildabruf-Modul ein
 # (bildabruf.py: Token-API, Freigabe-Seite, Galerie). Scheitert das Modul,
 # laeuft die Sync-Oberflaeche trotzdem weiter.
@@ -63,11 +81,12 @@ echo "[OneDrive SyncServer] Auth token found. Running initial sync via sync_mana
 # direkt nach einem Container-Neustart greift, statt kurzzeitig alles
 # ungefiltert herunterzuladen bevor der periodische Timer das erste Mal
 # sync_manager.py aufruft.
-python3 /app/sync_manager.py 2>&1 | tee -a /data/sync.log
+python3 /app/sync_manager.py 2>&1 | tee -a "${LOG_FILE}"
 
 echo "[OneDrive SyncServer] Initial sync complete."
 
 while true; do
   sleep "${SYNC_INTERVAL}"
-  python3 /app/sync_manager.py 2>&1 | tee -a /data/sync.log
+  trim_log
+  python3 /app/sync_manager.py 2>&1 | tee -a "${LOG_FILE}"
 done

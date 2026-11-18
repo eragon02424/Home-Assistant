@@ -193,6 +193,17 @@ def load_progress():
 def is_authenticated():
     return os.path.exists(f"{ONEDRIVE_CONFIG_DIR}/refresh_token")
 
+def read_log_tail(path, max_lines=50, max_bytes=65536):
+    """Liest nur das Dateiende (letzte max_lines Zeilen). Die Logdatei kann sehr gross
+    werden und darf nicht komplett geladen werden."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - max_bytes))
+        data = f.read()
+    lines = data.decode("utf-8", errors="replace").splitlines(keepends=True)
+    return "".join(lines[-max_lines:])
+
 def get_onedrive_folder_children(path=""):
     """
     Listet NUR die direkten Unterordner eines Pfades per Graph API
@@ -738,8 +749,7 @@ def index():
                 debug_log = f.read()
     log = ""
     if os.path.exists(LOG_FILE):
-        with open(LOG_FILE) as f:
-            log = "".join(f.readlines()[-50:])
+        log = read_log_tail(LOG_FILE)
     return render_template_string(
         HTML_TEMPLATE,
         config=config, status=status, authenticated=authenticated,
