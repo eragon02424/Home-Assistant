@@ -1,6 +1,6 @@
 name: "MCP Second Brain"
 description: "MCP Server für getrennte Second Brains (LLM-Wiki: privat, beruf) - Zugriff ausschließlich auf den Second-Brain-Ordner"
-version: "3.0.0"
+version: "3.1.0"
 slug: "mcp_second_brain"
 url: "https://github.com/eragon02424/Home-Assistant"
 init: false
