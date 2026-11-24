@@ -1,28 +1,36 @@
 """
-MCP Second Brain Server for Home Assistant v3.0.0 (MCP Python SDK 2.x)
+MCP Second Brain Server for Home Assistant v3.1.0 (MCP Python SDK 2.x)
 
 Mehrere voneinander getrennte "Brains" (Standard: privat, beruf) unter einem
 Stammordner (Standard /share/second_brain). Jedes Brain folgt dem LLM-Wiki-Muster:
 
     <brain>/CLAUDE.md          Regeln (Schema)
-    <brain>/raw/inbox/         Eingangskorb für neue Quellen
-    <brain>/raw/...            Originale (unveränderlich)
+    <brain>/raw/inbox/         Eingangskorb fuer neue Quellen
+    <brain>/raw/...            Originale (unveraenderlich)
     <brain>/wiki/start.md      Cockpit
     <brain>/wiki/index.md      Katalog aller Seiten
-    <brain>/wiki/log.md        Chronik (nur anhängen)
+    <brain>/wiki/log.md        Chronik (nur anhaengen)
     <brain>/wiki/{personen,projekte,themen,konzepte,quellen}/
+    <brain>/.stats/            Zaehlerstaende (ausserhalb von wiki/, nicht Teil des Wikis)
+    <brain>/.locks/            Lock-Dateien fuer nebenlaeufiges Schreiben
 
-Jeder Tool-Aufruf nennt sein Brain; nichts ist brainübergreifend erreichbar.
-Gelöschtes wandert in <brain>/.trash.
+Jeder Tool-Aufruf nennt sein Brain; nichts ist brainuebergreifend erreichbar.
+Geloeschtes wandert in <brain>/.trash.
+
+Wissenszeilen (Kennzeichen "💡 Wissen:") werden bei sb_search hervorgehoben und gezaehlt
+(sb_wissen_stats); offene Fragen ("❓ Offene Frage:") und einzelne Abschnitte einer Seite
+lassen sich gezielt mit sb_section abrufen.
 """
 
 import base64
+import fcntl
 import io
 import json
 import os
 import re
 import shutil
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, date
 from pathlib import Path
 
@@ -34,9 +42,9 @@ from starlette.requests import Request
 from starlette.responses import Response
 import uvicorn
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 
-# ── Konfiguration ─────────────────────────────────────────────────────────────
+# ── Konfiguration ─────────────────────────────────────────────────
 
 TOKEN = os.environ.get("MCP_TOKEN", "")
 BASE = Path(os.environ.get("SB_ROOT", "/share/second_brain")).resolve()
@@ -51,10 +59,16 @@ IMPORT_DIR = os.environ.get("SB_IMPORT_DIR", "").strip()
 TEXT_EXT = {".md", ".txt", ".json", ".yaml", ".yml", ".csv"}
 EXTRACT_EXT = {".pdf", ".docx", ".xlsx", ".html", ".htm"}
 TRASH_DIR = ".trash"
+STATS_DIR = ".stats"
+LOCKS_DIR = ".locks"
+WISSEN_STATS_FILE = "wissen.json"
 RULES = "CLAUDE.md"
 WIKI_DIRS = ["personen", "projekte", "themen", "konzepte", "quellen"]
 LINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
 STAND_RE = re.compile(r"^stand:\s*(\d{4}-\d{2}-\d{2})", re.M)
+HEADING_RE = re.compile(r"^(#+)\s+(.*)$")
+WISSEN_MARK = "💡 Wissen:"
+FRAGE_MARK = "❓ Offene Frage:"
 
 BASE.mkdir(parents=True, exist_ok=True)
 
@@ -72,26 +86,26 @@ if not READ_ONLY:
 print(f"[Second Brain] v{VERSION} base={BASE} brains={BRAINS} read_only={READ_ONLY} "
       f"import_dir={IMPORT_DIR or '-'} token={'enabled' if TOKEN else 'DISABLED'}", flush=True)
 
-# ── Server ────────────────────────────────────────────────────────────────────
+# ── Server ───────────────────────────────────────────────────────────
 
 INSTRUCTIONS = (
-    "Second Brain: Jonathans persönliches Wissens-Wiki nach dem LLM-Wiki-Muster (Karpathy). "
+    "Second Brain: Jonathans persoenliches Wissens-Wiki nach dem LLM-Wiki-Muster (Karpathy). "
     f"Es gibt getrennte Brains: {', '.join(BRAINS)}. Jeder Aufruf braucht den Parameter brain; "
-    "Inhalte werden NIE zwischen Brains kopiert oder verknüpft. Wahl: Berufliches (SPS, TIA, Ceracon, "
+    "Inhalte werden NIE zwischen Brains kopiert oder verknuepft. Wahl: Berufliches (SPS, TIA, Ceracon, "
     "Kollegen) -> beruf, alles andere -> privat. Im Brain beruf nie Firmeninterna aus Notion/Outlook/Teams "
     "ablegen, nur Wissen aus den Chats. "
-    "ABLAUF: 1) Zu Beginn jeder Aufgabe, die Jonathans Projekte, Geräte, Entscheidungen, Ziele oder "
+    "ABLAUF: 1) Zu Beginn jeder Aufgabe, die Jonathans Projekte, Geraete, Entscheidungen, Ziele oder "
     "Vorlieben betrifft, ZUERST sb_start(brain) aufrufen: liefert Regeln (CLAUDE.md), Cockpit, Index, "
-    "Eingangskorb und letzte Log-Einträge. Die Regeln in CLAUDE.md sind verbindlich. "
+    "Eingangskorb und letzte Log-Eintraege. Die Regeln in CLAUDE.md sind verbindlich. "
     "2) Liegt etwas im Eingangskorb, das zuerst verarbeiten (Ingest). "
-    "3) Vor dem Ende jeder Unterhaltung mit neuen Fakten, Entscheidungen, Plänen oder Vorlieben die "
+    "3) Vor dem Ende jeder Unterhaltung mit neuen Fakten, Entscheidungen, Plaenen oder Vorlieben die "
     "betroffenen Wiki-Seiten aktualisieren und sb_log aufrufen - ohne dass Jonathan daran erinnert. "
-    "Mehrere Seiten auf einmal: sb_read_many / sb_write_many. Keine Passwörter, Tokens oder Zugangsdaten speichern."
+    "Mehrere Seiten auf einmal: sb_read_many / sb_write_many. Keine Passwoerter, Tokens oder Zugangsdaten speichern."
 )
 
 mcp = MCPServer(name="Second Brain", instructions=INSTRUCTIONS, version=VERSION)
 
-# ── Hilfsfunktionen ───────────────────────────────────────────────────────────
+# ── Hilfsfunktionen ──────────────────────────────────────────────────
 
 
 def _root(brain: str) -> Path:
@@ -112,7 +126,7 @@ def _resolve(root: Path, path: str) -> Path:
     path = path.lstrip("/")
     resolved = (root / path).resolve()
     if resolved != root and root not in resolved.parents:
-        raise ToolError(f"Pfad '{path}' liegt außerhalb dieses Brains.")
+        raise ToolError(f"Pfad '{path}' liegt ausserhalb dieses Brains.")
     return resolved
 
 
@@ -137,7 +151,7 @@ def _check_text_file(root: Path, path: str) -> Path:
 
 
 def _check_any_file(root: Path, path: str) -> Path:
-    """Beliebiger Dateityp - aber nur unter raw/ (für Originale). Text überall."""
+    """Beliebiger Dateityp - aber nur unter raw/ (fuer Originale). Text ueberall."""
     p = _resolve(root, path)
     if p == root:
         raise ToolError("Pfad zeigt auf den Stammordner, nicht auf eine Datei.")
@@ -153,7 +167,7 @@ def _check_writable() -> None:
 
 def _check_size(content: str) -> None:
     if len(content.encode("utf-8")) > MAX_FILE_BYTES:
-        raise ToolError(f"Inhalt größer als {MAX_FILE_BYTES // 1024} KB - bitte aufteilen.")
+        raise ToolError(f"Inhalt groesser als {MAX_FILE_BYTES // 1024} KB - bitte aufteilen.")
 
 
 def _mtime(p: Path) -> str:
@@ -206,7 +220,7 @@ def _extract(p: Path) -> str:
         t = re.sub(r"(?is)<(script|style).*?</\1>", "", t)
         t = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>|</h\d>", "\n", t)
         return re.sub(r"<[^>]+>", "", t)
-    raise ToolError(f"Kein Textauszug für '{ext}' möglich.")
+    raise ToolError(f"Kein Textauszug fuer '{ext}' moeglich.")
 
 
 def _frontmatter(text: str) -> dict:
@@ -224,7 +238,7 @@ def _frontmatter(text: str) -> dict:
 
 
 def _wiki_pages(root: Path) -> dict:
-    """name -> Pfad; Schlüssel: 'projekte/x' und 'x'."""
+    """name -> Pfad; Schluessel: 'projekte/x' und 'x'."""
     wiki = root / "wiki"
     pages = {}
     for f in _iter_files(root, wiki, exts={".md"}):
@@ -245,14 +259,88 @@ def _slice(text: str, offset: int, limit: int) -> dict:
     return {"content": chunk, "total_chars": total, "offset": offset,
             "next_offset": offset + len(chunk) if offset + len(chunk) < total else None}
 
-# ── Tools: Einstieg ───────────────────────────────────────────────────────────
+
+# ── Nebenlaeufiges Schreiben (Datei-Locks) ─────────────────────────────────
+
+
+def _lock_path(root: Path, name: str) -> Path:
+    """Lock-Datei fuer 'name' (z. B. 'wiki__log.md') unter <brain>/.locks/ - dort
+    ausserhalb des Wikis, daher nie Teil von Listungen/Suche/Lint."""
+    d = root / LOCKS_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{name}.lock"
+
+
+@contextmanager
+def _locked(lock_file: Path):
+    """Prozess- und thread-sicherer kritischer Abschnitt via flock (Linux)."""
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_file, "a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _stats_path(root: Path) -> Path:
+    d = root / STATS_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d / WISSEN_STATS_FILE
+
+
+def _record_wissen_hits(root: Path, rel_path: str, lines: list) -> None:
+    """Erhoeht je Wissenszeile (Schluessel = Datei + Zeilentext) den Zaehler +1 und setzt das
+    Datum des letzten Treffers. Gespeichert ausserhalb von wiki/ unter .stats/wissen.json.
+    Thread-/prozesssicher ueber Datei-Lock (_locked)."""
+    if not lines:
+        return
+    sp = _stats_path(root)
+    now = datetime.now().isoformat(timespec="seconds")
+    with _locked(_lock_path(root, STATS_DIR + "__" + WISSEN_STATS_FILE)):
+        try:
+            data = json.loads(sp.read_text(encoding="utf-8")) if sp.exists() else {}
+        except Exception:  # noqa: BLE001
+            data = {}
+        file_entry = data.setdefault(rel_path, {})
+        for line in lines:
+            rec = file_entry.setdefault(line, {"count": 0, "last": None})
+            rec["count"] = rec.get("count", 0) + 1
+            rec["last"] = now
+        sp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def _section_by_heading(text: str, heading: str):
+    """Text zwischen einer Ueberschrift (beliebige Ebene, Name ohne '#') und der naechsten
+    Ueberschrift gleicher oder hoeherer Ebene. None, wenn die Ueberschrift fehlt."""
+    target = heading.strip().lstrip("#").strip().lower()
+    if not target:
+        return None
+    lines = text.splitlines()
+    start = level = None
+    for i, ln in enumerate(lines):
+        m = HEADING_RE.match(ln.strip())
+        if m and m.group(2).strip().lower() == target:
+            start, level = i + 1, len(m.group(1))
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start, len(lines)):
+        m = HEADING_RE.match(lines[j].strip())
+        if m and len(m.group(1)) <= level:
+            end = j
+            break
+    return "\n".join(lines[start:end]).strip()
+
+# ── Tools: Einstieg ─────────────────────────────────────────────────
 
 
 @mcp.tool()
 def sb_start(brain: str) -> dict:
     """ZUERST aufrufen. Liefert in EINEM Aufruf: Regeln (CLAUDE.md), Cockpit (wiki/start.md),
     Index (wiki/index.md), Dateien im Eingangskorb (raw/inbox + externer Eingang),
-    die letzten Log-Einträge und Seitenzahlen. Args: brain ('privat' | 'beruf')."""
+    die letzten Log-Eintraege und Seitenzahlen. Args: brain ('privat' | 'beruf')."""
     root = _root(brain)
 
     def rd(rel):
@@ -272,13 +360,13 @@ def sb_start(brain: str) -> dict:
         "wiki_pages": pages,
     }
 
-# ── Tools: Lesen ──────────────────────────────────────────────────────────────
+# ── Tools: Lesen ─────────────────────────────────────────────────────
 
 
 @mcp.tool()
 def sb_read(brain: str, path: str, offset: int = 0, limit: int = 60000) -> dict:
     """Liest eine Datei. Text direkt; PDF/DOCX/XLSX/HTML unter raw/ als extrahierter Text.
-    Große Inhalte seitenweise über offset/limit (Zeichen); next_offset zeigt, ob mehr kommt.
+    Grosse Inhalte seitenweise ueber offset/limit (Zeichen); next_offset zeigt, ob mehr kommt.
     Args: brain, path (relativ, z. B. 'wiki/projekte/hundebox.md'), offset, limit."""
     root = _root(brain)
     p = _resolve(root, path)
@@ -287,7 +375,7 @@ def sb_read(brain: str, path: str, offset: int = 0, limit: int = 60000) -> dict:
     ext = p.suffix.lower()
     if ext not in TEXT_EXT and ext not in EXTRACT_EXT:
         return {"success": False, "path": _rel(root, p), "size": p.stat().st_size,
-                "error": f"Binärdatei '{ext}' ohne Textauszug (Original bleibt unter raw/)."}
+                "error": f"Binaerdatei '{ext}' ohne Textauszug (Original bleibt unter raw/)."}
     text = _extract(p)
     return {"success": True, "path": _rel(root, p), "modified": _mtime(p), **_slice(text, offset, limit)}
 
@@ -295,7 +383,7 @@ def sb_read(brain: str, path: str, offset: int = 0, limit: int = 60000) -> dict:
 @mcp.tool()
 def sb_read_many(brain: str, paths: list[str], max_chars_each: int = 20000) -> dict:
     """Liest mehrere Dateien in einem Aufruf (schneller als viele sb_read).
-    Args: brain, paths (Liste), max_chars_each (Kürzung je Datei)."""
+    Args: brain, paths (Liste), max_chars_each (Kuerzung je Datei)."""
     root = _root(brain)
     out = []
     for path in paths[:40]:
@@ -310,6 +398,37 @@ def sb_read_many(brain: str, paths: list[str], max_chars_each: int = 20000) -> d
         except Exception as e:  # noqa: BLE001
             out.append({"path": path, "error": str(e)})
     return {"success": True, "files": out}
+
+
+@mcp.tool()
+def sb_section(brain: str, path: str, section: str) -> dict:
+    """Liefert nur einen Abschnitt einer Seite, nicht die ganze Datei (zaehlt nicht als
+    Wissenstreffer, nur sb_search zaehlt). section = Ueberschrift (z. B. 'Kurzfassung',
+    'Aufgaben'): Text bis zur naechsten Ueberschrift gleicher/hoeherer Ebene. section='fragen':
+    alle Zeilen mit '❓ Offene Frage:'. section='wissen': alle Zeilen mit '💡 Wissen:'. Fehlt
+    der Abschnitt, liefert es leeren Inhalt mit Hinweis statt eines Fehlers.
+    Args: brain, path, section."""
+    root = _root(brain)
+    p = _resolve(root, path)
+    if not p.is_file():
+        return {"success": False, "error": f"Datei existiert nicht: {path}"}
+    text = _extract(p)
+    sec = section.strip().lower()
+    if sec in ("fragen", "frage", "offene frage", "offene fragen"):
+        lines = [ln.strip() for ln in text.splitlines() if FRAGE_MARK in ln]
+        hinweis = None if lines else f"Keine Zeilen mit '{FRAGE_MARK}' gefunden."
+        return {"success": True, "path": _rel(root, p), "section": "fragen",
+                "content": "\n".join(lines), **({"hinweis": hinweis} if hinweis else {})}
+    if sec == "wissen":
+        lines = [ln.strip() for ln in text.splitlines() if WISSEN_MARK in ln]
+        hinweis = None if lines else f"Keine Zeilen mit '{WISSEN_MARK}' gefunden."
+        return {"success": True, "path": _rel(root, p), "section": "wissen",
+                "content": "\n".join(lines), **({"hinweis": hinweis} if hinweis else {})}
+    content = _section_by_heading(text, section)
+    if content is None:
+        return {"success": True, "path": _rel(root, p), "section": section, "content": "",
+                "hinweis": f"Abschnitt '{section}' nicht gefunden."}
+    return {"success": True, "path": _rel(root, p), "section": section, "content": content}
 
 
 @mcp.tool()
@@ -334,8 +453,12 @@ def sb_list(brain: str, folder: str = "", recursive: bool = False) -> dict:
 
 @mcp.tool()
 def sb_search(brain: str, query: str, folder: str = "wiki", max_results: int = 20) -> dict:
-    """Volltextsuche (Groß/Klein egal) über Dateinamen und Inhalte der Textdateien.
-    Alle Wörter müssen vorkommen. Treffer im Titel/Dateinamen zählen mehr.
+    """Volltextsuche (Gross/Klein egal) ueber Dateinamen und Inhalte der Textdateien.
+    Alle Woerter muessen vorkommen. Treffer im Titel/Dateinamen zaehlen mehr.
+    Wissenstreffer: enthaelt eine Zeile mit '💡 Wissen:' selbst alle Suchwoerter, steht das
+    Ergebnis weiter oben, die Wissenszeile wird mit ausgegeben (Feld 'wissen_treffer') und
+    ihr Zaehler in .stats/wissen.json erhoeht (sb_wissen_stats zeigt die Zaehlerstaende; reines
+    Seitenlesen ueber sb_read/sb_read_many/sb_section zaehlt nicht).
     Args: brain, query, folder (Standard 'wiki'; '' = ganzes Brain inkl. raw), max_results."""
     root = _root(brain)
     terms = [t.lower() for t in query.split() if t.strip()]
@@ -353,12 +476,41 @@ def sb_search(brain: str, query: str, folder: str = "wiki", max_results: int = 2
         lines = text.splitlines()
         hits = [{"line": i + 1, "text": ln.strip()[:240]}
                 for i, ln in enumerate(lines) if any(t in ln.lower() for t in terms)][:5]
+        wissen_hits = list(dict.fromkeys(
+            ln.strip() for ln in lines if WISSEN_MARK in ln and all(t in ln.lower() for t in terms)
+        ))
+        if wissen_hits:
+            _record_wissen_hits(root, rel, wissen_hits)
         title = next((ln for ln in lines if ln.startswith("# ")), "").lower()
         score = (sum(min(low.count(t), 20) for t in terms)
                  + 8 * sum(t in rel.lower() for t in terms) + 6 * sum(t in title for t in terms))
-        results.append({"path": rel, "modified": _mtime(f), "score": score, "hits": hits})
-    results.sort(key=lambda r: r["score"], reverse=True)
+        results.append({"path": rel, "modified": _mtime(f), "score": score, "hits": hits,
+                        "wissen_treffer": wissen_hits})
+    results.sort(key=lambda r: (bool(r["wissen_treffer"]), r["score"]), reverse=True)
     return {"success": True, "query": query, "total": len(results), "results": results[:max(1, max_results)]}
+
+
+@mcp.tool()
+def sb_wissen_stats(brain: str, limit: int = 20, sort: str = "anzahl") -> dict:
+    """Zeigt die Zaehlerstaende der Wissenszeilen ('💡 Wissen:'), die sb_search als Wissenstreffer
+    gezaehlt hat (Datei, Wissenszeile, Anzahl, letzter Treffer). sort='anzahl' (Standard,
+    absteigend) oder sort='datum' (letzter Treffer, neueste zuerst). Args: brain, limit, sort."""
+    root = _root(brain)
+    sp = _stats_path(root)
+    try:
+        data = json.loads(sp.read_text(encoding="utf-8")) if sp.exists() else {}
+    except Exception:  # noqa: BLE001
+        data = {}
+    entries = []
+    for rel_path, by_line in data.items():
+        for line_text, rec in by_line.items():
+            entries.append({"datei": rel_path, "wissenszeile": line_text,
+                            "anzahl": rec.get("count", 0), "zuletzt": rec.get("last")})
+    if sort.strip().lower() in ("datum", "date", "zuletzt"):
+        entries.sort(key=lambda e: e["zuletzt"] or "", reverse=True)
+    else:
+        entries.sort(key=lambda e: e["anzahl"], reverse=True)
+    return {"success": True, "total": len(entries), "entries": entries[:max(1, limit)]}
 
 
 @mcp.tool()
@@ -377,18 +529,18 @@ def sb_backlinks(brain: str, page: str) -> dict:
 
 @mcp.tool()
 def sb_recent(brain: str, limit: int = 15) -> dict:
-    """Zuletzt geänderte Dateien (neueste zuerst). Args: brain, limit."""
+    """Zuletzt geaenderte Dateien (neueste zuerst). Args: brain, limit."""
     root = _root(brain)
     files = sorted(_iter_files(root, root), key=lambda f: f.stat().st_mtime, reverse=True)
     return {"success": True, "files": [{"path": _rel(root, f), "modified": _mtime(f)} for f in files[:max(1, limit)]]}
 
-# ── Tools: Schreiben ──────────────────────────────────────────────────────────
+# ── Tools: Schreiben ──────────────────────────────────────────────────
 
 
 def _write(root: Path, path: str, content: str, overwrite: bool) -> dict:
     p = _check_text_file(root, path)
     if _is_raw(root, p) and p.exists():
-        raise ToolError("Originale unter raw/ werden nie überschrieben.")
+        raise ToolError("Originale unter raw/ werden nie ueberschrieben.")
     _check_size(content)
     if p.exists() and not overwrite:
         return {"success": False, "path": _rel(root, p),
@@ -423,8 +575,8 @@ def sb_write_many(brain: str, files: list[dict]) -> dict:
 
 @mcp.tool()
 def sb_append(brain: str, path: str, content: str, heading: str = "") -> dict:
-    """Hängt Text an (legt die Datei an, falls nötig). Mit heading (z. B. '## Verlauf') wird am Ende
-    dieses Abschnitts eingefügt; fehlt er, wird er am Dateiende angelegt. Args: brain, path, content, heading."""
+    """Haengt Text an (legt die Datei an, falls noetig). Mit heading (z. B. '## Verlauf') wird am Ende
+    dieses Abschnitts eingefuegt; fehlt er, wird er am Dateiende angelegt. Args: brain, path, content, heading."""
     _check_writable()
     root = _root(brain)
     p = _check_text_file(root, path)
@@ -459,7 +611,7 @@ def sb_append(brain: str, path: str, content: str, heading: str = "") -> dict:
 
 @mcp.tool()
 def sb_edit(brain: str, path: str, old_text: str, new_text: str) -> dict:
-    """Ersetzt eine genau einmal vorkommende Textstelle (leerer new_text löscht sie).
+    """Ersetzt eine genau einmal vorkommende Textstelle (leerer new_text loescht sie).
     Args: brain, path, old_text, new_text."""
     _check_writable()
     root = _root(brain)
@@ -467,7 +619,7 @@ def sb_edit(brain: str, path: str, old_text: str, new_text: str) -> dict:
     if not p.is_file():
         return {"success": False, "error": f"Datei existiert nicht: {path}"}
     if _is_raw(root, p) and not p.relative_to(root).parts[1:2] == ("inbox",):
-        raise ToolError("Originale unter raw/ werden nicht verändert.")
+        raise ToolError("Originale unter raw/ werden nicht veraendert.")
     text = _read_text(p)
     n = text.count(old_text) if old_text else 0
     if n != 1:
@@ -480,25 +632,27 @@ def sb_edit(brain: str, path: str, old_text: str, new_text: str) -> dict:
 
 @mcp.tool()
 def sb_log(brain: str, kind: str, text: str) -> dict:
-    """Hängt einen Eintrag an wiki/log.md an: '## [JJJJ-MM-TT HH:MM] kind | text'.
-    kind: ingest | query | update | lint | setup. Args: brain, kind, text."""
+    """Haengt einen Eintrag an wiki/log.md an: '## [JJJJ-MM-TT HH:MM] kind | text'.
+    Nebenlaeufige Aufrufe (parallele Laeufe) sind ueber einen Datei-Lock serialisiert, damit
+    kein Eintrag verloren geht. kind: ingest | query | update | lint | setup. Args: brain, kind, text."""
     _check_writable()
     root = _root(brain)
     p = root / "wiki" / "log.md"
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     first, *rest = text.strip().splitlines() or [""]
     entry = f"## [{stamp}] {kind.strip().lower()} | {first}\n" + ("\n".join(rest) + "\n" if rest else "")
-    old = _read_text(p) if p.exists() else "# Log\n"
-    new = old.rstrip("\n") + "\n\n" + entry
-    _check_size(new)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(new, encoding="utf-8")
+    with _locked(_lock_path(root, "wiki__log.md")):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        old = _read_text(p) if p.exists() else "# Log\n"
+        new = old.rstrip("\n") + "\n\n" + entry
+        _check_size(new)
+        p.write_text(new, encoding="utf-8")
     return {"success": True, "entry": entry.strip()}
 
 
 @mcp.tool()
 def sb_move(brain: str, source: str, destination: str) -> dict:
-    """Verschiebt/benennt um (überschreibt nie). Nicht-Text-Dateien nur innerhalb raw/
+    """Verschiebt/benennt um (ueberschreibt nie). Nicht-Text-Dateien nur innerhalb raw/
     (z. B. raw/inbox/x.pdf -> raw/2026/x.pdf nach dem Ingest). Args: brain, source, destination."""
     _check_writable()
     root = _root(brain)
@@ -516,7 +670,7 @@ def sb_move(brain: str, source: str, destination: str) -> dict:
 @mcp.tool()
 def sb_delete(brain: str, path: str) -> dict:
     """Verschiebt eine Datei in den Papierkorb (<brain>/.trash/<Zeitstempel>/...). Nichts wird
-    endgültig gelöscht. Args: brain, path."""
+    endgueltig geloescht. Args: brain, path."""
     _check_writable()
     root = _root(brain)
     p = _check_any_file(root, path)
@@ -533,8 +687,8 @@ def sb_delete(brain: str, path: str) -> dict:
 
 @mcp.tool()
 def sb_upload(brain: str, path: str, data_base64: str, append: bool = False) -> dict:
-    """Legt eine Originaldatei (auch binär, z. B. PDF) unter raw/ ab, typischerweise raw/inbox/.
-    Große Dateien in Stücken: erstes Stück append=false, weitere append=true.
+    """Legt eine Originaldatei (auch binaer, z. B. PDF) unter raw/ ab, typischerweise raw/inbox/.
+    Grosse Dateien in Stuecken: erstes Stueck append=false, weitere append=true.
     Args: brain, path (muss mit 'raw/' beginnen), data_base64, append."""
     _check_writable()
     root = _root(brain)
@@ -544,12 +698,12 @@ def sb_upload(brain: str, path: str, data_base64: str, append: bool = False) -> 
     try:
         data = base64.b64decode(data_base64, validate=True)
     except Exception as e:  # noqa: BLE001
-        raise ToolError(f"Ungültiges Base64: {e}")
+        raise ToolError(f"Ungueltiges Base64: {e}")
     if p.exists() and not append:
-        return {"success": False, "error": "Datei existiert bereits (Originale werden nie überschrieben)."}
+        return {"success": False, "error": "Datei existiert bereits (Originale werden nie ueberschrieben)."}
     size = (p.stat().st_size if p.exists() else 0) + len(data)
     if size > MAX_UPLOAD_BYTES:
-        raise ToolError(f"Datei größer als {MAX_UPLOAD_BYTES // 1024 // 1024} MB.")
+        raise ToolError(f"Datei groesser als {MAX_UPLOAD_BYTES // 1024 // 1024} MB.")
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "ab" if append else "wb") as fh:
         fh.write(data)
@@ -558,7 +712,7 @@ def sb_upload(brain: str, path: str, data_base64: str, append: bool = False) -> 
 # ── Externer Eingang (optional, z. B. OneDrive-Sync) ──────────────────────────
 
 
-def _import_state(brain: str) -> tuple[Path, dict]:
+def _import_state(brain: str) -> tuple:
     sp = _root(brain) / ".imported.json"
     try:
         return sp, json.loads(sp.read_text(encoding="utf-8"))
@@ -606,14 +760,14 @@ def sb_import(brain: str, name: str) -> dict:
     sp.write_text(json.dumps(state, indent=1), encoding="utf-8")
     return {"success": True, "copied_to": _rel(root, dst)}
 
-# ── Aufräumen (Lint) ──────────────────────────────────────────────────────────
+# ── Aufraeumen (Lint) ──────────────────────────────────────────────────
 
 
 @mcp.tool()
 def sb_lint(brain: str, stale_days: int = 180) -> dict:
-    """Mechanische Gesundheitsprüfung des Wikis: kaputte Links, verwaiste Seiten (ohne eingehende
+    """Mechanische Gesundheitspruefung des Wikis: kaputte Links, verwaiste Seiten (ohne eingehende
     Links), Seiten fehlen im Index, Seiten ohne Quellen, veraltetes 'stand:', offene Fragen,
-    markierte Widersprüche, volle Eingangskörbe. Inhaltliche Prüfung macht Claude danach.
+    markierte Widersprueche, volle Eingangskoerbe. Inhaltliche Pruefung macht Claude danach.
     Args: brain, stale_days."""
     root = _root(brain)
     wiki = root / "wiki"
@@ -666,7 +820,7 @@ def sb_lint(brain: str, stale_days: int = 180) -> dict:
         "external_inbox_waiting": len(_external_inbox(brain)),
     }
 
-# ── Token-Middleware ──────────────────────────────────────────────────────────
+# ── Token-Middleware ──────────────────────────────────────────────────
 
 
 class TokenAuthMiddleware(BaseHTTPMiddleware):
@@ -680,7 +834,7 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
         return Response("Unauthorized", status_code=401)
 
 
-# DNS-Rebinding-Schutz aus: Anfragen kommen über LAN-IP / MCP-Proxy mit fremdem Host-Header
+# DNS-Rebinding-Schutz aus: Anfragen kommen ueber LAN-IP / MCP-Proxy mit fremdem Host-Header
 app = mcp.streamable_http_app(
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     host="0.0.0.0",
